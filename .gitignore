@@ -1,0 +1,9 @@
+__pycache__
+*.egg-info
+.DS_Store
+pipeline/kivi/quant/build/*
+kivi_gemv.cpython*
+output
+
+**/scbench/
+processed_dataset/

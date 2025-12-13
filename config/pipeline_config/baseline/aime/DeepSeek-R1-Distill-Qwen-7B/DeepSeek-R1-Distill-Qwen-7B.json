@@ -1,0 +1,29 @@
+{
+    "pipeline_params": {
+        "lade": false,
+        "method": "baseline",
+        "kv_cache_method": "stream-llm",
+        "model_name": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+        "use_flash_attn": false,
+        "cache-dir": "",
+        "level": 6,
+        "window": 40,
+        "num_guesses": 10,
+        "n_new_tokens": 1024,
+        "max_model_len": 3072,
+        "truncation_mode": "middle",
+        "num_init": 2000,
+        "num_local": 7000,
+        "num_gpus_per_model": 1,
+        "num_gpus_total": 1,
+        "local_rank": 0,
+        "use_tp": false,
+        "use_pp": false,
+        "use_tp_ds": false,
+        "use_flash": false,
+        "max_gpu_memory": null,
+        "do_sample": 1,
+        "temperature": 0.6,
+        "top_p": 0.95
+    }
+}
