@@ -48,11 +48,7 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 
-from pipeline.train_quest.modeling.selector import TopkMasker
-from pipeline.train_quest.modeling.utils import (
-    _build_chunk_summaries,
-    _kl_full_over_chunks,
-)
+from pipeline.train_quest.modeling.selector import FullAttentionEstimator
 from deepspeed.runtime.activation_checkpointing.checkpointing import checkpoint as ds_checkpoint
 
 
@@ -206,19 +202,18 @@ def eager_attention_forward(
 
 class LlamaAttention(nn.Module):
     """
-    Multi-headed attention with TopkMasker routing and KL warm-up.
+    Multi-headed attention equipped with a lightweight token-level attention estimator.
 
     Behavior:
-      • Returns the **Top-K masked** attention output (the "topk" pass).
-      • Reuses the teacher (dense) attention weights from an initial pass.
-      • KL objective defaults to DeepSeek v3.2 style over FULL chunk support:
+      • Runs the standard dense attention pass, reusing those weights as supervision.
+      • KL objective defaults to DeepSeek v3.2 style over full token support:
           L_I = sum_t KL( p_t,:  ||  softmax(I_t,:) )
-        where p_t,: is teacher prob over chunks and I_t,: are the masker logits over chunks.
+        where p_t,: is teacher attention over tokens and I_t,: are estimator logits.
 
-    Modes for parameter training (same as before):
-      - "only_selector": train ONLY the TopkMasker
-      - "joint":        train TopkMasker + attention params
-      - "inference_only": no KL, but mask applied at eval if enabled
+    Modes for parameter training:
+      - "only_selector": train ONLY the estimator
+      - "joint":        train estimator + attention params
+      - "inference_only": no KL regularization
     """
 
     def __init__(self, config: "LlamaConfig", layer_idx: int):
@@ -237,30 +232,63 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
 
-        # ---- TopkMasker controls (TopkMasker itself is unchanged) ----
-        self.enable_topk_masker: bool = getattr(config, "use_topk_masker", True)
-        self.apply_masking_in_eval: bool = getattr(config, "topk_masker_apply_in_eval", True)
-
-        # KL controls
+        # ---- Token attention estimator controls ----
         self.masker_kl_weight: float = getattr(config, "topk_masker_kl_weight", 1.0)
-        self.chunk_len: int = getattr(config, "topk_chunk_len", 64)
 
-        topk = getattr(config, "topk_k", 32)
         hidden_gate = getattr(config, "topk_hidden", max(256, self.head_dim))
-        masker_tau = getattr(config, "topk_tau", 1.0)
-        masker_soft_alpha = getattr(config, "topk_soft_alpha", 8.0)
-        masker_use_soft_warmup = getattr(config, "topk_masker_use_soft_warmup", True)
-        self.masker_mode = 'joint'
+        self.masker_mode = "joint"
+        self.random_walk_alpha = getattr(config, "random_walk_alpha", 0.3)
 
-        # Feed hidden_states directly -> q_dim = k_dim = hidden_size
-        self.topk_masker = TopkMasker(
+        self.attention_estimator = FullAttentionEstimator(
             q_dim=config.hidden_size,
             k_dim=config.hidden_size,
             hidden=hidden_gate,
-            topk=topk,
         )
-        self.topk_masker.set_warmup(on=masker_use_soft_warmup, tau=masker_tau, soft_alpha=masker_soft_alpha)
-        self.masker_mode = "joint"
+
+    def _get_random_walk_states(self, past_key_values, runtime_states):
+        if past_key_values is not None:
+            states = getattr(past_key_values, "random_walk_states", None)
+            if states is None:
+                states = {}
+                setattr(past_key_values, "random_walk_states", states)
+            return states
+        return runtime_states
+
+    def _prepare_random_walk_state(self, prev, target_len, batch_size, dtype, device):
+        if prev is None or prev.size(0) != batch_size:
+            base = torch.eye(target_len, device=device, dtype=dtype).unsqueeze(0)
+            if batch_size > 1:
+                base = base.repeat(batch_size, 1, 1)
+            prev = base
+        else:
+            prev = prev.to(device=device, dtype=dtype)
+            prev_len = prev.size(-1)
+            if prev_len < target_len:
+                pad = target_len - prev_len
+                base = torch.eye(target_len, device=device, dtype=dtype).unsqueeze(0)
+                if batch_size > 1:
+                    base = base.repeat(batch_size, 1, 1)
+                base[:, :prev_len, :prev_len] = prev
+                prev = base
+            elif prev_len > target_len:
+                prev = prev[:, :target_len, :target_len]
+        return prev
+
+    def _update_random_walk(self, attention_probs, past_key_values, runtime_states):
+        B, T_q, T_k = attention_probs.shape
+        states = self._get_random_walk_states(past_key_values, runtime_states)
+        prev = states.get(self.layer_idx - 1, None) if states is not None else None
+        state = self._prepare_random_walk_state(
+            prev=prev,
+            target_len=T_k,
+            batch_size=B,
+            dtype=attention_probs.dtype,
+            device=attention_probs.device,
+        )
+        walk = torch.matmul(attention_probs, state)
+        if states is not None:
+            states[self.layer_idx] = walk.detach()
+        return walk
 
     def forward(
         self,
@@ -269,6 +297,7 @@ class LlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional["Cache"] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        random_walk_states: Optional[dict] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         input_shape = hidden_states.shape[:-1]
@@ -289,8 +318,6 @@ class LlamaAttention(nn.Module):
             B, H_kv, T_k, D = key_states.shape
             H = query_states.size(1)
             # repeat = H // H_kv
-            # key_states   = key_states.repeat_interleave(repeat, dim=1)
-            # value_states = value_states.repeat_interleave(repeat, dim=1)
         else:
             B, H, T_k, D = key_states.shape
             H = query_states.size(1)
@@ -298,10 +325,35 @@ class LlamaAttention(nn.Module):
         B, H, T_q, D = query_states.shape
         device = hidden_states.device
 
-        # ===== Pass 1 (teacher, DENSE – no Top-K bias) =====
+        # ===== Attention Score Estimator =====
+        Q_tokens = hidden_states
+        K_tokens = hidden_states
+        logits_tokens = self.attention_estimator(Q_tokens, K_tokens)  # (B,T_q,T_k)
+        estimator_log_probs = torch.log_softmax(logits_tokens, dim=-1)
+        estimator_probs = estimator_log_probs.exp()
+
+        rw_bias = None
+        if self.masker_mode == "inference_only" and self.random_walk_alpha is not None:
+            random_walk_probs = self._update_random_walk(
+                estimator_probs.detach(), past_key_values, random_walk_states
+            )
+            allow = random_walk_probs >= self.random_walk_alpha
+            rw_bias = torch.zeros(
+                allow.size(0),
+                1,
+                allow.size(1),
+                allow.size(2),
+                device=allow.device,
+                dtype=query_states.dtype,
+            )
+            rw_bias.masked_fill_(~allow.unsqueeze(1), torch.finfo(query_states.dtype).min)
+            if attention_mask is None:
+                attention_mask = rw_bias
+            else:
+                attention_mask = attention_mask + rw_bias
+
+        # ===== (teacher, DENSE) =====
         attention_interface: Callable = eager_attention_forward
-        # if getattr(self.config, "_attn_implementation", "eager") != "eager":
-        #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_out_dense, attn_weights_dense = attention_interface(
             self,
@@ -316,57 +368,16 @@ class LlamaAttention(nn.Module):
 
         # Teacher token-level probs over keys: (B,T_q,T_k)
         pt_tok = attn_weights_dense.sum(dim=1) if attn_weights_dense.dim() == 4 else attn_weights_dense
-        pt_tok = pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
-
-        # ===== Build chunked K summaries for the masker =====
-        K_chunks, J = _build_chunk_summaries(hidden_states, self.chunk_len)      # (B,J,hidden)
-        Q_mask = hidden_states                                                   # (B,T_q,hidden)
-
-        # ===== Run TopkMasker -> logits over chunks AND token-level bias =====
-        logits_chunks, bias_tok, learnable_k_logits = self.topk_masker(
-            Q_mask, 
-            K_chunks, 
-            self.chunk_len, 
-            T_k, 
-            use_learnable_k = self.masker_mode == "train_k"
-        )   # (B,T_q,J), (B,T_q,T_k)
-
-        # Student distribution over chunks (THIS is pm_chunks you asked about)
-        pm_chunks = torch.softmax(logits_chunks / max(1e-6, float(self.topk_masker.tau.item())), dim=-1)  # (B,T_q,J)
-
-        # ===== Aggregate teacher to chunk space: pt_chunks (B,T_q,J) =====
-        token_ids = torch.arange(T_k, device=device)  # 0..T_k-1
-        chunk_id  = torch.div(token_ids, self.chunk_len, rounding_mode='floor').clamp_max(J-1)
-        M = F.one_hot(chunk_id, num_classes=J).to(pt_tok.dtype)              # (T_k,J)
-        pt_chunks = torch.matmul(pt_tok, M)                                       # (B,T_q,J)
-
-        # ===== Pass 2 (TOP-K masked): this output is returned =====
-        if attention_mask is None:
-            attention_mask_topk = bias_tok.unsqueeze(1)                           # (B,1,T_q,T_k)
-        else:
-            attention_mask_topk = (attention_mask.unsqueeze(1) if attention_mask.dim() == 3 else attention_mask) \
-                                   + bias_tok.unsqueeze(1)
-        
-        attn_out_topk, attn_weights_topk = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask_topk,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-        attn_out = attn_out_dense.reshape(*input_shape, -1).contiguous() if self.masker_mode == 'only_selector' else attn_out_topk.reshape(*input_shape, -1).contiguous()
-        # attn_out = attn_out_dense.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_out)
+        teacher_attention_probs = pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
 
         extra = {
-            "pt_chunks": pt_chunks,
-            "logits_chunks": logits_chunks,
-            "learnable_k_logits": learnable_k_logits
+            "estimator_log_probs": estimator_log_probs,
+            "teacher_attention_probs": teacher_attention_probs,
         }
-        return attn_output, attn_weights_topk, extra
+        attn_out = attn_out_dense.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_out)
+
+        return attn_output, attn_weights_dense, extra
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
@@ -390,21 +401,23 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        random_walk_states: Optional[dict] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, _, extra = self.self_attn(
-            hidden_states=hidden_states.detach().requires_grad_(True) if self.masker_mode == 'only_selector' or self.masker_mode == "train_k" else hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+            hidden_states, _, extra = self.self_attn(
+                hidden_states=hidden_states.detach().requires_grad_(True) if self.masker_mode == "only_selector" else hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                random_walk_states=random_walk_states,
+                **kwargs,
+            )
         hidden_states = residual + hidden_states
         # Fully Connected
         residual = hidden_states
@@ -513,7 +526,6 @@ class LlamaModel(LlamaPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        is_long_context: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -546,6 +558,8 @@ class LlamaModel(LlamaPreTrainedModel):
         total_selector_loss = torch.tensor(0.0, device=loss_device, dtype=loss_dtype)
         num_contrib = 0
 
+        runtime_random_walk_states = {} if past_key_values is None else None
+
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states, extra = decoder_layer(
                 hidden_states,
@@ -554,17 +568,15 @@ class LlamaModel(LlamaPreTrainedModel):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                random_walk_states=runtime_random_walk_states,
                 **kwargs,
             )
-            logits_chunks = extra.get("logits_chunks", None)
-            pt_chunks     = extra.get("pt_chunks", None)
-            learnable_k_logits = extra.get("learnable_k_logits", None)
+            log_p = extra.get("estimator_log_probs", None)
+            pt_attn = extra.get("teacher_attention_probs", None)
 
-            if logits_chunks is not None and pt_chunks is not None and self.masker_mode != "train_k":
-                log_p = torch.log_softmax(logits_chunks, dim=-1)
-                pt_chunks = pt_chunks / (pt_chunks.sum(dim=-1, keepdim=True) + 1e-12)
-                log_pt = (pt_chunks.clamp_min(1e-12)).log()
-                layer_loss = (pt_chunks * (log_pt - log_p)).sum(dim=-1).mean()
+            if log_p is not None and pt_attn is not None:
+                log_pt = (pt_attn.clamp_min(1e-12)).log()
+                layer_loss = (pt_attn * (log_pt - log_p)).sum(dim=-1).mean()
 
                 # dtype/device adapt without disabling grad
                 if layer_loss.dtype != loss_dtype:
@@ -572,161 +584,19 @@ class LlamaModel(LlamaPreTrainedModel):
                 if layer_loss.device != loss_device:
                     layer_loss = layer_loss.to(loss_device)
 
-                total_selector_loss = layer_loss if total_selector_loss is None else total_selector_loss + layer_loss
-                num_contrib += 1
-            elif learnable_k_logits is not None and self.masker_mode == "train_k":
-                # target = is_long_context.to(dtype=learnable_k_logits.dtype, device=learnable_k_logits.device)
-                target = is_long_context
-                logits_ce   = torch.stack([-learnable_k_logits, learnable_k_logits], dim=-1)  # (B,T,2)
-                target_flat = target.reshape(-1)       
-                loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="mean")
-                traink_loss = loss_fct(logits_ce.reshape(-1, 2), target_flat.long())
-
-                total_selector_loss = (
-                    traink_loss if total_selector_loss is None else total_selector_loss + traink_loss
-                )
+                total_selector_loss = total_selector_loss + layer_loss
                 num_contrib += 1
 
         if num_contrib > 0:
             total_selector_loss = total_selector_loss / num_contrib
+        else:
+            total_selector_loss = torch.zeros(1, device=loss_device, dtype=loss_dtype).squeeze(0)
 
         hidden_states = self.norm(hidden_states)
         return total_selector_loss, BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
-
-    # def forward(
-    #     self,
-    #     input_ids: Optional[torch.LongTensor] = None,
-    #     attention_mask: Optional[torch.Tensor] = None,
-    #     position_ids: Optional[torch.LongTensor] = None,
-    #     past_key_values: Optional[Cache] = None,
-    #     inputs_embeds: Optional[torch.FloatTensor] = None,
-    #     cache_position: Optional[torch.LongTensor] = None,
-    #     use_cache: Optional[bool] = None,
-    #     is_long_context: Optional[torch.LongTensor] = None,
-    #     **kwargs: Unpack[TransformersKwargs],
-    # ) -> BaseModelOutputWithPast:
-    #     if (input_ids is None) ^ (inputs_embeds is not None):
-    #         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-    #     if inputs_embeds is None:
-    #         inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
-
-    #     if self.training and self.gradient_checkpointing:
-    #         use_cache = False
-
-    #     if use_cache and past_key_values is None:
-    #         past_key_values = DynamicCache(config=self.config)
-
-    #     if cache_position is None:
-    #         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-    #         cache_position: torch.Tensor = torch.arange(
-    #             past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-    #         )
-
-    #     if position_ids is None:
-    #         position_ids = cache_position.unsqueeze(0)
-
-    #     causal_mask = self._causal_mask(
-    #         attention_mask=attention_mask,
-    #         input_embeds=inputs_embeds,
-    #         past_key_values=past_key_values,
-    #     )
-
-    #     hidden_states = inputs_embeds
-    #     position_embeddings = self.rotary_emb(hidden_states, position_ids) 
-
-    #     loss_dtype  = hidden_states.dtype
-    #     loss_device = hidden_states.device
-    #     total_selector_loss = None
-    #     num_contrib = 0
-
-    #     pos0, pos1 = position_embeddings 
-    #     hs_ckpt = hidden_states
-
-    #     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-    #         if self.training and self.gradient_checkpointing:
-    #             def layer_fn(hs, cmask, pids, cpos, p0, p1):
-    #                 position_embeddings_local = (p0, p1)
-    #                 out_hs, extra = decoder_layer(
-    #                     hidden_states=hs,
-    #                     attention_mask=cmask,
-    #                     position_ids=pids,
-    #                     past_key_values=None,       
-    #                     cache_position=cpos,
-    #                     position_embeddings=position_embeddings_local,
-    #                     **kwargs,
-    #                 )
-    #                 pt_chunks          = extra.get("pt_chunks")
-    #                 logits_chunks      = extra.get("logits_chunks")
-    #                 learnable_k_logits = extra.get("learnable_k_logits")
-    #                 if pt_chunks is None:          pt_chunks = _empty_like_3d(hs)
-    #                 if logits_chunks is None:      logits_chunks = _empty_like_3d(hs)
-    #                 if learnable_k_logits is None: learnable_k_logits = _empty_like_2d(hs)
-    #                 return out_hs, pt_chunks, logits_chunks, learnable_k_logits
-
-    #             if not hs_ckpt.requires_grad:
-    #                 hs_ckpt = hidden_states.detach().requires_grad_(True)
-    #             hidden_states, pt_chunks, logits_chunks, learnable_k_logits = ds_checkpoint(
-    #                 layer_fn,
-    #                 hs_ckpt, causal_mask, position_ids, cache_position, pos0, pos1
-    #             )
-
-    #             extra = {
-    #                 "pt_chunks": pt_chunks,
-    #                 "logits_chunks": logits_chunks,
-    #                 "learnable_k_logits": learnable_k_logits,
-    #             }
-    #         else:
-    #             hidden_states, extra = decoder_layer(
-    #                 hidden_states=hidden_states,
-    #                 attention_mask=causal_mask,
-    #                 position_ids=position_ids,
-    #                 past_key_values=past_key_values if use_cache else None,
-    #                 cache_position=cache_position,
-    #                 position_embeddings=position_embeddings, 
-    #                 **kwargs,
-    #             )
-
-    #         logits_chunks      = extra.get("logits_chunks", None)
-    #         pt_chunks          = extra.get("pt_chunks", None)
-    #         learnable_k_logits = extra.get("learnable_k_logits", None)
-
-    #         if logits_chunks is not None and pt_chunks is not None and self.masker_mode != "train_k":
-    #             log_p = torch.log_softmax(logits_chunks, dim=-1)
-    #             pt_chunks = pt_chunks / (pt_chunks.sum(dim=-1, keepdim=True) + 1e-12)
-    #             log_pt = (pt_chunks.clamp_min(1e-12)).log()
-    #             layer_loss = (pt_chunks * (log_pt - log_p)).sum(dim=-1).mean()
-
-    #             if layer_loss.dtype != loss_dtype:
-    #                 layer_loss = layer_loss.to(loss_dtype)
-    #             if layer_loss.device != loss_device:
-    #                 layer_loss = layer_loss.to(loss_device)
-
-    #             total_selector_loss = layer_loss if num_contrib == 0 else total_selector_loss + layer_loss
-    #             num_contrib += 1
-
-    #         elif learnable_k_logits is not None and self.masker_mode == "train_k":
-    #             target = is_long_context
-    #             logits_ce   = torch.stack([-learnable_k_logits, learnable_k_logits], dim=-1)  # (B,T,2) or (B,0,2)
-    #             target_flat = target.reshape(-1)
-    #             loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="mean")
-    #             traink_loss = loss_fct(logits_ce.reshape(-1, 2), target_flat.long())
-
-    #             total_selector_loss = traink_loss if num_contrib == 0 else total_selector_loss + traink_loss
-    #             num_contrib += 1
-
-    #     if num_contrib > 0:
-    #         total_selector_loss = total_selector_loss / num_contrib
-
-    #     hidden_states = self.norm(hidden_states)
-
-    #     return total_selector_loss, BaseModelOutputWithPast(
-    #         last_hidden_state=hidden_states,
-    #         past_key_values=past_key_values if use_cache else None,
-    #     )
 
 
 @auto_docstring
@@ -749,7 +619,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         mode: str,
         unfreeze_ln_and_embed: bool = False,
     ):
-        assert mode in {"joint", "only_selector", "train_k", "inference_only"}
+        assert mode in {"joint", "only_selector", "inference_only"}
         self.config.topk_masker_mode = mode
         self._apply_mode_param_grads_model(mode, unfreeze_ln_and_embed=unfreeze_ln_and_embed)
 
@@ -762,30 +632,23 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
                 mod.masker_mode = mode
 
         try:
-            TopkMaskerType = TopkMasker
+            EstimatorType = FullAttentionEstimator
         except NameError:
-            TopkMaskerType = None
+            EstimatorType = None
 
-        def is_topkmasker(m):
-            return ((TopkMaskerType is not None and isinstance(m, TopkMaskerType))
-                    or getattr(m, "_is_topk_masker", False))
+        def is_attention_estimator(m):
+            return ((EstimatorType is not None and isinstance(m, EstimatorType))
+                    or getattr(m, "_is_attention_estimator", False))
 
         if mode == "joint":
             for p in self.parameters():
                 p.requires_grad = True
-            for mod in self.modules():
-                if is_topkmasker(mod) and hasattr(mod, "gate_head"):
-                    for p in mod.gate_head.parameters():
-                        p.requires_grad = False
 
         elif mode == "only_selector":
             for mod in self.modules():
-                if is_topkmasker(mod):
+                if is_attention_estimator(mod):
                     for p in mod.parameters():
                         p.requires_grad = True
-                    if hasattr(mod, "gate_head"):
-                        for p in mod.gate_head.parameters():
-                            p.requires_grad = False
 
             if unfreeze_ln_and_embed:
                 for mod in self.modules():
@@ -793,18 +656,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
                         for p in mod.parameters():
                             p.requires_grad = True
 
-        elif mode == "train_k":
-            for mod in self.modules():
-                if is_topkmasker(mod):
-                    for p in mod.parameters():
-                        p.requires_grad = False
-                    if hasattr(mod, "gate_head"):
-                        for p in mod.gate_head.parameters():
-                            p.requires_grad = True
-
         elif mode == "inference_only":
             pass
-
 
     @can_return_tuple
     @auto_docstring
@@ -815,7 +668,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         prompt_lens: Optional[torch.LongTensor] = None,
-        is_long_context: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -848,7 +700,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
-            is_long_context=is_long_context,
             **kwargs,
         )
 
@@ -867,4 +718,3 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-

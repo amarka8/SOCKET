@@ -124,4 +124,3 @@ def is_longctx_token(
         "lsd": lsd,
         "is_long_context": is_long_context,
     }
-

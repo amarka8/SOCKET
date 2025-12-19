@@ -12,25 +12,15 @@ import torch
 import torch.distributed as dist
 from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
-from datasets import load_dataset, Dataset, load_from_disk
+from datasets import load_dataset, Dataset
 
 from tqdm import tqdm
 
 import eval.longbench_utils.eval_long_bench as longbench_eval
 from eval.longbench_utils.constants import LONGBENCH_DATASET
-from pipeline.train_quest.mask_gen.stream_mask import gen_stream_mask
-from pipeline.train_quest.data.long_ctx_tokens_gen import is_longctx_token
 from pipeline.baseline.utils import initialize_model_tokenizer
 
 def load_longctx_dataset(pipeline_config, dataset_config):
-    save_dir = dataset_config.get("save_dir", "./processed_dataset")
-
-    if os.path.exists(save_dir):
-        print(f"[INFO] Loading preprocessed dataset from {save_dir} ...")
-        ds = load_from_disk(save_dir)
-        return ds
-
-    os.makedirs(save_dir, exist_ok=True)
     print(f"[INFO] Loading raw dataset: {dataset_config['dataset_path']} ...")
 
     if dataset_config['dataset'] == "LongAlpaca-12k":
@@ -39,7 +29,7 @@ def load_longctx_dataset(pipeline_config, dataset_config):
         ds = longbench_eval.load_data(dataset_config['dataset'])
     else:
         raise ValueError(f"Unknown dataset: {dataset_config['dataset']}")
-    model, tokenizer = initialize_model_tokenizer(
+    _model, tokenizer = initialize_model_tokenizer(
         {
             'model_name': "meta-llama/Llama-3.2-3B-Instruct",
             "use_flash_attn": False
@@ -63,42 +53,6 @@ def load_longctx_dataset(pipeline_config, dataset_config):
                 "idx": len(data)
             })
     ds = Dataset.from_list(data)
-
-    print(f"[INFO] Computing long-context token labels (LSD>2, LCL>-2) ...")
-
-    def compute_features(batch):
-        # text = batch["prompt"] + " " + batch["answer"] if dataset_config['dataset'] == "LongAlpaca-12k" else batch["answer"][0]
-        conversation = [{"role": "system", "content": "You are a useful assistant."}]
-        conversation.append({"role": "user", "content": batch["prompt"]})
-        conversation.append({"role": "assistant", "content": batch["answer"]})
-        input_text = tokenizer.apply_chat_template(conversation[:-1], tokenize=False, add_generation_prompt=False)
-        text = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
-        inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False).to(model.device)
-        context_len = tokenizer(input_text, return_tensors="pt", add_special_tokens=False).input_ids.shape[1]
-
-        res = is_longctx_token(
-            model=model,
-            tokenizer=tokenizer,
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            config=pipeline_config,
-            dtype=torch.float16,
-            context_len=context_len,
-            alpha=2.0,
-            beta=-2.0,
-        )
-        return {
-            "prompt": batch["prompt"],
-            "answer": batch["answer"],
-            "is_long_context": res["is_long_context"].cpu().int().tolist(),
-            "idx": batch["idx"]
-        }
-
-    ds = ds.map(compute_features, batched=False, desc="Annotating LSD features")
-    print(f"[INFO] Saving annotated dataset to {save_dir} ...")
-    ds.save_to_disk(save_dir)
-
-    print(f"[INFO] Dataset successfully saved to {save_dir}.")
     return ds
 
 
@@ -111,12 +65,10 @@ def get_dataset(tokenizer, pipeline_config, dataset_config, max_size=1000000000)
         elif dataset_config['dataset'] == "LongAlpaca-12k":
             prompt = sample['prompt']
             answer = sample["answer"]
-        is_long_context = sample.get("is_long_context", None)
 
         sample = {
             "prompt": prompt,
             "answer": answer,
-            "is_long_context": is_long_context,
             "idx": sample["idx"],
         }
         return sample
@@ -138,7 +90,6 @@ def get_dataset(tokenizer, pipeline_config, dataset_config, max_size=1000000000)
                 data.append({
                     "prompt": ex.get("prompt", ""),
                     "answer": ex.get("answer", ""),
-                    "is_long_context": ex.get("is_long_context", None),
                     "idx": len(data),  # ensures sequential idx
                 })
 
@@ -199,8 +150,6 @@ class MyCollator:
             feature["input_ids"] = [self.tokenizer.pad_token_id] * n_tok_pad + feature["input_ids"]
             if "labels" in feature:
                 feature["labels"] = [self.label_pad_token_id] * n_tok_pad + feature["labels"]
-            if "is_long_context" in feature and feature["is_long_context"] is not None:
-                feature["is_long_context"] = [0] * n_tok_pad + feature["is_long_context"]
             feature["attention_mask"] = [0] * n_tok_pad + feature["attention_mask"]
 
         return_tensors = "pt"
@@ -326,10 +275,6 @@ def get_train_dataset(
         labels = [-100] * len(prefix_ids) + input_ids[len(prefix_ids):]
 
         attention_mask = [1] * len(input_ids)
-        is_long_context = sample.get("is_long_context", None)
-        if is_long_context is not None:
-            is_long_context = [-100] * len(prefix_ids) + is_long_context[len(prefix_ids):]
-
         sample = {
             "input_ids": input_ids,
             "labels": labels,
@@ -338,8 +283,6 @@ def get_train_dataset(
             "prompt_len": len(prefix_ids),
             "idx": sample["idx"],
         }
-        if is_long_context is not None:
-            sample["is_long_context"] = is_long_context
         
         return sample
 

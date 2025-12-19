@@ -38,7 +38,6 @@ class CE(nn.Module):
             labels, 
             position_ids, 
             prompt_len,
-            is_long_context,
             config, 
             **kwargs
         ):
@@ -60,19 +59,10 @@ class CE(nn.Module):
             past_key_values=past_key_values,
             output_hidden_states=output_hidden_states,
             prompt_lens=prompt_len,
-            is_long_context=is_long_context
+            config=config
         )
         logits.append(outputs.logits)
         loss = outputs.loss
-
-        if config['pipeline_params']["train_mode"] == 'joint' or config['pipeline_params']["train_mode"] == 'train_k':
-            logits = torch.cat(logits, dim=-2)
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = CrossEntropyLoss()
-            loss += loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
 
         return Outputs(loss=loss)
 
