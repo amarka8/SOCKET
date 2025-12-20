@@ -73,6 +73,10 @@ def save_base_causallm(ds_engine, save_path, sub_prefix="base_causallm."):
     print(f"[rank0] Saved {save_path}")
 
 
+def _model_device(mod):
+    return next(mod.parameters()).device
+
+
 def run(configs, args, logger):
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
@@ -80,8 +84,12 @@ def run(configs, args, logger):
     pipeline_params = configs['pipeline_params']
     train_params = configs['train_params']
     n_gpu = torch.cuda.device_count()
+    use_deepspeed = not pipeline_params["only_eval"]
     # init distributed environment
-    deepspeed.init_distributed(dist_backend='nccl')
+    if use_deepspeed:
+        deepspeed.init_distributed(dist_backend='nccl')
+    elif dist.is_available() and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
 
     ground_truth = None
     if eval_params['dataset'] in LONGBENCH_DATASET:
@@ -142,8 +150,7 @@ def run(configs, args, logger):
         llama_config.topk_tau          = 1.5
         llama_config.topk_soft_alpha   = 8.0
         model = LlamaForCausalLM(config=llama_config)
-        if not pipeline_params["only_eval"]:
-            model.set_masker_mode(configs['pipeline_params']["train_mode"])
+        model.set_masker_mode(configs['pipeline_params']["train_mode"])
     else:
         model = AutoModelForCausalLM.from_pretrained(pipeline_params["model_name"], device_map=None)
     tokenizer = AutoTokenizer.from_pretrained(pipeline_params["model_name"])
@@ -164,8 +171,8 @@ def run(configs, args, logger):
         loaded = True
         print(model.load_state_dict(saved_weights, strict=False))
 
-    model = CE(model, tokenizer)
-    model.train()
+    raw_model = CE(model, tokenizer)
+    raw_model.train()
     # Prepare optimizer
     def _unique_named_params(mod):
         seen, out = set(), []
@@ -179,55 +186,62 @@ def run(configs, args, logger):
             out.append((n, p))
         return out
 
-    # 1) find the base LM inside CE(model, tokenizer)
-    base = getattr(model, "base_causallm", None) or getattr(model, "model", None)
-    if base is None:
-        base = model  # fallback
+    if use_deepspeed:
+        # 1) find the base LM inside CE(model, tokenizer)
+        base = getattr(raw_model, "base_causallm", None) or getattr(raw_model, "model", None)
+        if base is None:
+            base = raw_model  # fallback
 
-    # 2) unique params from the BASE model
-    base_named = _unique_named_params(base)
-    base_ids   = {id(p) for _, p in base_named}
+        # 2) unique params from the BASE model
+        base_named = _unique_named_params(base)
+        base_ids   = {id(p) for _, p in base_named}
 
-    # 3) include CE-specific trainables (if any) that are NOT the same Parameter objects
-    ce_extras = []
-    for n, p in model.named_parameters():
-        if p.requires_grad and id(p) not in base_ids:
-            ce_extras.append((f"CE.{n}", p))
-            base_ids.add(id(p))
+        # 3) include CE-specific trainables (if any) that are NOT the same Parameter objects
+        ce_extras = []
+        for n, p in raw_model.named_parameters():
+            if p.requires_grad and id(p) not in base_ids:
+                ce_extras.append((f"CE.{n}", p))
+                base_ids.add(id(p))
 
-    uniq = base_named + ce_extras
+        uniq = base_named + ce_extras
 
-    # 4) split decay / no_decay (bias and 1D params → no_decay)
-    no_decay_keys = ('bias',)
-    decay = [p for n, p in uniq if not (p.ndim == 1 or any(k in n for k in no_decay_keys))]
-    nodec = [p for n, p in uniq if      (p.ndim == 1 or any(k in n for k in no_decay_keys))]
+        # 4) split decay / no_decay (bias and 1D params → no_decay)
+        no_decay_keys = ('bias',)
+        decay = [p for n, p in uniq if not (p.ndim == 1 or any(k in n for k in no_decay_keys))]
+        nodec = [p for n, p in uniq if      (p.ndim == 1 or any(k in n for k in no_decay_keys))]
 
-    optimizer_grouped_parameters = [
-        {"params": decay, "weight_decay": 0.01},
-        {"params": nodec, "weight_decay": 0.0},
-    ]
+        optimizer_grouped_parameters = [
+            {"params": decay, "weight_decay": 0.01},
+            {"params": nodec, "weight_decay": 0.0},
+        ]
 
-    ids = []
-    for g in optimizer_grouped_parameters:
-        ids.extend([id(p) for p in g["params"]])
-    assert len(ids) == len(set(ids)), "[fatal] duplicate Parameter objects in optimizer_grouped_parameters"
+        ids = []
+        for g in optimizer_grouped_parameters:
+            ids.extend([id(p) for p in g["params"]])
+        assert len(ids) == len(set(ids)), "[fatal] duplicate Parameter objects in optimizer_grouped_parameters"
 
-    model, optimizer, _, _ = deepspeed.initialize(
-        args=args,
-        model=model,
-        model_parameters=optimizer_grouped_parameters,
-        dist_init_required=True)
+        model_engine, optimizer, _, _ = deepspeed.initialize(
+            args=args,
+            model=raw_model,
+            model_parameters=optimizer_grouped_parameters,
+            dist_init_required=True)
 
-    print("propagate deepspeed-config settings to client settings")
-    args.train_batch_size = pipeline_params["batch_size_training"] = model.train_micro_batch_size_per_gpu()
-    args.gradient_accumulation_steps = model.gradient_accumulation_steps()
-    args.fp16 = model.fp16_enabled()
-    args.print_steps = model.steps_per_print()
-    args.learning_rate = model.get_lr()[0]
-    args.wall_clock_breakdown = model.wall_clock_breakdown()
+        print("propagate deepspeed-config settings to client settings")
+        args.train_batch_size = pipeline_params["batch_size_training"] = model_engine.train_micro_batch_size_per_gpu()
+        args.gradient_accumulation_steps = model_engine.gradient_accumulation_steps()
+        args.fp16 = model_engine.fp16_enabled()
+        args.print_steps = model_engine.steps_per_print()
+        args.learning_rate = model_engine.get_lr()[0]
+        args.wall_clock_breakdown = model_engine.wall_clock_breakdown()
 
-    if rank == 0:
-        print(model)
+        model_module = model_engine.module
+        if rank == 0:
+            print(model_engine)
+    else:
+        model_engine = raw_model
+        model_module = raw_model
+        optimizer = None
+        model_module.to(torch.device(f"cuda:{local_rank}"))
 
     base_dataset_valid = get_dataset(
         tokenizer, pipeline_params, eval_params, max_size=100000000
@@ -285,7 +299,7 @@ def run(configs, args, logger):
                 total=total_length,
                 dynamic_ncols=True,
             )
-            model.module.train()
+            model_module.train()
             num_step = 0
             # Set up for training
             for step, batch in enumerate(train_dataloader):
@@ -309,21 +323,21 @@ def run(configs, args, logger):
                         text_str += "====" * 10 + "\n"
 
                 total_train_steps += 1
-                device = model.device
+                device = _model_device(model_module)
                 batch = {
                     key: batch[key].to(device) for key in batch.keys() if key != "idx"
                 }
-                outputs = model(**batch, config=configs)
+                outputs = model_engine(**batch, config=configs)
                 loss = outputs.loss
                 if n_gpu > 1:
                     loss = loss.mean()
 
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
-                model.backward(loss)
+                model_engine.backward(loss)
 
                 if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                    model.step()
+                    model_engine.step()
                     pbar.update(num_step)
                     num_step = 0
 
@@ -337,7 +351,7 @@ def run(configs, args, logger):
 
             if not pipeline_params["only_eval"] and ((epoch + 1) % pipeline_params['eval_period'] == 0 or epoch == pipeline_params["num_epochs"] - 1):
                 save_path = os.path.join(save_dir, f"checkpoint_{epoch+1}")
-                save_base_causallm(model, save_path)
+                save_base_causallm(model_engine, save_path)
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
 
@@ -347,15 +361,15 @@ def run(configs, args, logger):
             total_length = len(valid_gen_dataloader)
 
             pbar = tqdm(colour="blue", desc=f"Test Accuracy", total=total_length, dynamic_ncols=True)
-            score = torch.tensor(0.0, device=model.device)
-            total = torch.tensor(0.0, device=model.device)
+            score = torch.tensor(0.0, device=_model_device(model_module))
+            total = torch.tensor(0.0, device=_model_device(model_module))
             with torch.no_grad():
-                model.module.eval()
+                model_module.eval()
                 for idx, batch in enumerate(valid_gen_dataloader):
                     test_idx = batch["idx"][0]
 
                     batch = {
-                        k: v.to(rank)
+                        k: v.to(_model_device(model_module))
                         for k, v in batch.items()
                         if v != None and k not in ["idx", "position_ids"]
                     }
@@ -365,11 +379,11 @@ def run(configs, args, logger):
 
                     # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
                     # Inference has bug: after generate the first token, attention_mask is not correctly generated
-                    answer = model.module.generate(
+                    answer = model_module.generate(
                         **batch,
                         config=configs,
                         max_new_tokens=max_new_tokens,
-                        synced_gpus=not pipeline_params["only_eval"],
+                        synced_gpus=use_deepspeed,
                     )
                     score += longbench_eval.scorer(
                         eval_params['dataset'],
@@ -413,6 +427,6 @@ def run(configs, args, logger):
 
             if (round(final_score, 2) > best_acc and not pipeline_params["only_eval"]):
                 save_path = os.path.join(save_dir, f"checkpoint_{epoch+1}")
-                save_base_causallm(model, save_path)
+                save_base_causallm(model_engine, save_path)
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()

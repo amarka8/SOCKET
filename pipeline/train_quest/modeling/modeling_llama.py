@@ -237,7 +237,7 @@ class LlamaAttention(nn.Module):
 
         hidden_gate = getattr(config, "topk_hidden", max(256, self.head_dim))
         self.masker_mode = "joint"
-        self.random_walk_alpha = getattr(config, "random_walk_alpha", 0.3)
+        self.random_walk_alpha = getattr(config, "random_walk_alpha", 0.001)
 
         self.attention_estimator = FullAttentionEstimator(
             q_dim=config.hidden_size,
@@ -278,13 +278,16 @@ class LlamaAttention(nn.Module):
         B, T_q, T_k = attention_probs.shape
         states = self._get_random_walk_states(past_key_values, runtime_states)
         prev = states.get(self.layer_idx - 1, None) if states is not None else None
-        state = self._prepare_random_walk_state(
-            prev=prev,
-            target_len=T_k,
-            batch_size=B,
-            dtype=attention_probs.dtype,
-            device=attention_probs.device,
-        )
+        if prev is None:
+            state = attention_probs
+        else:
+            state = self._prepare_random_walk_state(
+                prev=prev,
+                target_len=T_k,
+                batch_size=B,
+                dtype=attention_probs.dtype,
+                device=attention_probs.device,
+            )
         walk = torch.matmul(attention_probs, state)
         if states is not None:
             states[self.layer_idx] = walk.detach()
@@ -326,10 +329,11 @@ class LlamaAttention(nn.Module):
         device = hidden_states.device
 
         # ===== Attention Score Estimator =====
-        Q_tokens = hidden_states
-        K_tokens = hidden_states
-        logits_tokens = self.attention_estimator(Q_tokens, K_tokens)  # (B,T_q,T_k)
-        estimator_log_probs = torch.log_softmax(logits_tokens, dim=-1)
+        estimator_log_probs = None
+        # Q_tokens = hidden_states
+        # K_tokens = hidden_states
+        # logits_tokens = self.attention_estimator(Q_tokens, K_tokens)  # (B,T_q,T_k)
+        # estimator_log_probs = torch.log_softmax(logits_tokens, dim=-1)
 
         # ===== (teacher, DENSE) =====
         attention_interface: Callable = eager_attention_forward
@@ -357,6 +361,12 @@ class LlamaAttention(nn.Module):
                 teacher_attention_probs.detach(), past_key_values, random_walk_states
             )
             allow = random_walk_probs >= self.random_walk_alpha
+            # import pdb
+            # import torch.distributed as dist
+            # dist.barrier()
+            # if dist.get_rank() == 0:
+            #     import pdb; pdb.set_trace()
+            # dist.barrier()
             rw_bias = torch.zeros(
                 allow.size(0),
                 1,
