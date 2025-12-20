@@ -330,27 +330,6 @@ class LlamaAttention(nn.Module):
         K_tokens = hidden_states
         logits_tokens = self.attention_estimator(Q_tokens, K_tokens)  # (B,T_q,T_k)
         estimator_log_probs = torch.log_softmax(logits_tokens, dim=-1)
-        estimator_probs = estimator_log_probs.exp()
-
-        rw_bias = None
-        if self.masker_mode == "inference_only" and self.random_walk_alpha is not None:
-            random_walk_probs = self._update_random_walk(
-                estimator_probs.detach(), past_key_values, random_walk_states
-            )
-            allow = random_walk_probs >= self.random_walk_alpha
-            rw_bias = torch.zeros(
-                allow.size(0),
-                1,
-                allow.size(1),
-                allow.size(2),
-                device=allow.device,
-                dtype=query_states.dtype,
-            )
-            rw_bias.masked_fill_(~allow.unsqueeze(1), torch.finfo(query_states.dtype).min)
-            if attention_mask is None:
-                attention_mask = rw_bias
-            else:
-                attention_mask = attention_mask + rw_bias
 
         # ===== (teacher, DENSE) =====
         attention_interface: Callable = eager_attention_forward
@@ -370,14 +349,45 @@ class LlamaAttention(nn.Module):
         pt_tok = attn_weights_dense.sum(dim=1) if attn_weights_dense.dim() == 4 else attn_weights_dense
         teacher_attention_probs = pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
 
+        attn_out_masked = attn_out_dense
+        attn_weights_masked = attn_weights_dense
+
+        if self.masker_mode == "inference_only" and self.random_walk_alpha is not None:
+            random_walk_probs = self._update_random_walk(
+                teacher_attention_probs.detach(), past_key_values, random_walk_states
+            )
+            allow = random_walk_probs >= self.random_walk_alpha
+            rw_bias = torch.zeros(
+                allow.size(0),
+                1,
+                allow.size(1),
+                allow.size(2),
+                device=allow.device,
+                dtype=query_states.dtype,
+            )
+            rw_bias.masked_fill_(~allow.unsqueeze(1), torch.finfo(query_states.dtype).min)
+            attn_mask_for_second = (
+                rw_bias if attention_mask is None else attention_mask + rw_bias
+            )
+            attn_out_masked, attn_weights_masked = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attn_mask_for_second,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+
         extra = {
             "estimator_log_probs": estimator_log_probs,
             "teacher_attention_probs": teacher_attention_probs,
         }
-        attn_out = attn_out_dense.reshape(*input_shape, -1).contiguous()
+        attn_out = attn_out_masked.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_out)
 
-        return attn_output, attn_weights_dense, extra
+        return attn_output, attn_weights_masked, extra
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
@@ -407,17 +417,17 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-            hidden_states, _, extra = self.self_attn(
-                hidden_states=hidden_states.detach().requires_grad_(True) if self.masker_mode == "only_selector" else hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                random_walk_states=random_walk_states,
-                **kwargs,
-            )
+        hidden_states, _, extra = self.self_attn(
+            hidden_states=hidden_states.detach().requires_grad_(True) if self.masker_mode == "only_selector" else hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            random_walk_states=random_walk_states,
+            **kwargs,
+        )
         hidden_states = residual + hidden_states
         # Fully Connected
         residual = hidden_states
