@@ -7,6 +7,7 @@ import random
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 from collections import namedtuple
+from transformers import AutoModelForCausalLM
 from transformers.models.gpt2 import GPT2LMHeadModel
 
 Outputs = namedtuple("Outputs", ["loss"])
@@ -17,7 +18,7 @@ class CE(nn.Module):
     def __init__(
         self,
         base_causallm,
-        tokenizer
+        tokenizer,
     ):
 
         super(CE, self).__init__()
@@ -25,6 +26,14 @@ class CE(nn.Module):
         self.base_causallm = base_causallm
         self.tokenizer = tokenizer
         self.eos_token_id = tokenizer.eos_token_id
+        # self.compare_model = AutoModelForCausalLM.from_pretrained(
+        #     "meta-llama/Llama-3.2-1B-Instruct"
+        # )
+        # self.compare_model.eval()
+        # for p in self.compare_model.parameters():
+        #     p.requires_grad = False
+        # self.last_base_logits = None
+        # self.last_compare_logits = None
         # tested with GPT2 and Llama3
         if isinstance(self.base_causallm, GPT2LMHeadModel):
             self.embedding = self.base_causallm.transformer.get_input_embeddings()
@@ -65,6 +74,31 @@ class CE(nn.Module):
         loss = outputs.loss
 
         return Outputs(loss=loss)
+
+    # def compare_weights(self, max_items: int = 5):
+    #     base_sd = self.base_causallm.state_dict()
+    #     compare_sd = self.compare_model.state_dict()
+
+    #     shared_keys = [k for k in base_sd.keys() if k in compare_sd]
+    #     missing_in_compare = [k for k in base_sd.keys() if k not in compare_sd]
+    #     missing_in_base = [k for k in compare_sd.keys() if k not in base_sd]
+
+    #     diffs = []
+    #     for k in shared_keys:
+    #         if base_sd[k].shape != compare_sd[k].shape:
+    #             continue
+    #         d = (base_sd[k].float() - compare_sd[k].float()).abs().max().item()
+    #         diffs.append((d, k))
+
+    #     diffs.sort(reverse=True)
+    #     top_diffs = diffs[:max_items]
+    #     summary = {
+    #         "shared": len(shared_keys),
+    #         "missing_in_compare": missing_in_compare[:max_items],
+    #         "missing_in_base": missing_in_base[:max_items],
+    #         "top_diffs": top_diffs,
+    #     }
+    #     return summary
 
     def train(self):
         self.base_causallm.config.use_cache = False
@@ -119,10 +153,28 @@ class CE(nn.Module):
                 synced_gpus=synced_gpus
             )
             kv_cache = outputs.past_key_values
+            # with torch.no_grad():
+            #     if next(self.compare_model.parameters()).device != input_ids.device:
+            #         self.compare_model.to(input_ids.device)
+            #     compare_input_ids = torch.tensor(tokens, device=input_ids.device).view(1, -1)
+            #     compare_outputs = self.compare_model(
+            #         input_ids=compare_input_ids,
+            #         attention_mask=attention_mask,
+            #         position_ids=position_ids,
+            #         use_cache=False,
+            #     )
+            #     self.last_base_logits = outputs.logits[:, -1, :].detach().cpu()
+            #     self.last_compare_logits = compare_outputs.logits[:, -1, :].detach().cpu()
 
             # get the first token using the current hidden state
             next_token = torch.argmax(outputs.logits[0, -1]).item()
             tokens.append(next_token)
+            # import pdb
+            # import torch.distributed as dist
+            # dist.barrier()
+            # if dist.get_rank() == 0:
+            #     import pdb; pdb.set_trace()
+            # dist.barrier()
             new_token_embed = self.embedding(
                 torch.tensor(next_token, device=input_ids.device)
             ).view(1, 1, -1)

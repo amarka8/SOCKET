@@ -149,7 +149,7 @@ def run(configs, args, logger):
         llama_config.topk_hidden       = 256
         llama_config.topk_tau          = 1.5
         llama_config.topk_soft_alpha   = 8.0
-        model = LlamaForCausalLM(config=llama_config)
+        model = LlamaForCausalLM.from_pretrained(model_name, config=llama_config)
         model.set_masker_mode(configs['pipeline_params']["train_mode"])
     else:
         model = AutoModelForCausalLM.from_pretrained(pipeline_params["model_name"], device_map=None)
@@ -391,8 +391,7 @@ def run(configs, args, logger):
                         [ground_truth[idx]],
                         all_classes
                         )
-
-                    if idx < 5 and rank == 0:
+                    if idx < 50 and rank == 0:
                         # print some examples
                         print(
                             f"Question {test_idx}: Answer = '{answer}'"
@@ -400,7 +399,7 @@ def run(configs, args, logger):
                         print(f"Extracted Output: '{answer}'")
 
                     pbar.update(1)
-                    curr_score = 100 * score / total
+                    curr_score = score / total
                     curr_score = curr_score.detach().cpu().item()
                     pbar.set_description(
                         f"Test accuracy: {round(curr_score, 2)}"

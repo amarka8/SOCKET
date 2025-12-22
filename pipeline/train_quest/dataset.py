@@ -217,19 +217,14 @@ def get_val_dataset(
     tokenizer
 ):
     def process_dataset(sample):
-        # Trim if exceed max_len
-        prompt_ids = tokenizer(sample["prompt"], add_special_tokens=False)["input_ids"]
-        if len(prompt_ids) > config['pipeline_params']['max_model_len']:
-            max_len = config['pipeline_params']['max_model_len']
-            prompt_ids = prompt_ids[:max_len // 2] + prompt_ids[-max_len // 2:]
-            sample['prompt'] = tokenizer.decode(prompt_ids)
-        
         conversation = [{"role": "system", "content": "You are a useful assistant."}]
         conversation.append({"role": "user", "content": sample["prompt"]})
-        prompt = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
-        input_ids = tokenizer.encode(
-            prompt, add_special_tokens=False
+        input_ids = tokenizer.apply_chat_template(
+            conversation, tokenize=True, add_generation_prompt=True
         )
+        max_len = config['pipeline_params']['max_model_len']
+        if len(input_ids) > max_len:
+            input_ids = input_ids[:max_len // 2] + input_ids[-max_len // 2:]
         attention_mask = [1] * len(input_ids)
 
         return {

@@ -356,39 +356,39 @@ class LlamaAttention(nn.Module):
         attn_out_masked = attn_out_dense
         attn_weights_masked = attn_weights_dense
 
-        if self.masker_mode == "inference_only" and self.random_walk_alpha is not None:
-            random_walk_probs = self._update_random_walk(
-                teacher_attention_probs.detach(), past_key_values, random_walk_states
-            )
-            allow = random_walk_probs >= self.random_walk_alpha
-            # import pdb
-            # import torch.distributed as dist
-            # dist.barrier()
-            # if dist.get_rank() == 0:
-            #     import pdb; pdb.set_trace()
-            # dist.barrier()
-            rw_bias = torch.zeros(
-                allow.size(0),
-                1,
-                allow.size(1),
-                allow.size(2),
-                device=allow.device,
-                dtype=query_states.dtype,
-            )
-            rw_bias.masked_fill_(~allow.unsqueeze(1), torch.finfo(query_states.dtype).min)
-            attn_mask_for_second = (
-                rw_bias if attention_mask is None else attention_mask + rw_bias
-            )
-            attn_out_masked, attn_weights_masked = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attn_mask_for_second,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                **kwargs,
-            )
+        # if self.masker_mode == "inference_only" and self.random_walk_alpha is not None:
+        #     random_walk_probs = self._update_random_walk(
+        #         teacher_attention_probs.detach(), past_key_values, random_walk_states
+        #     )
+        #     allow = random_walk_probs > 0
+        #     rw_bias = torch.zeros(
+        #         allow.size(0),
+        #         1,
+        #         allow.size(1),
+        #         allow.size(2),
+        #         device=allow.device,
+        #         dtype=query_states.dtype,
+        #     )
+        #     rw_bias.masked_fill_(~allow.unsqueeze(1), torch.finfo(query_states.dtype).min)
+        #     attn_mask_for_second = (
+        #         rw_bias if attention_mask is None else attention_mask + rw_bias
+        #     )
+        #     # import pdb
+        #     # import torch.distributed as dist
+        #     # dist.barrier()
+        #     # if dist.get_rank() == 0:
+        #     #     import pdb; pdb.set_trace()
+        #     # dist.barrier()
+        #     attn_out_masked, attn_weights_masked = attention_interface(
+        #         self,
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #         attn_mask_for_second,
+        #         dropout=0.0 if not self.training else self.attention_dropout,
+        #         scaling=self.scaling,
+        #         **kwargs,
+        #     )
 
         extra = {
             "estimator_log_probs": estimator_log_probs,
@@ -494,6 +494,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.config._attn_implementation = "eager"
 
     def _causal_mask(self, attention_mask, input_embeds, past_key_values=None):
         """
@@ -548,12 +549,12 @@ class LlamaModel(LlamaPreTrainedModel):
         use_cache: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
-
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
@@ -712,6 +713,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        if use_cache is None:
+            use_cache = self.config.use_cache
+
         loss, outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
