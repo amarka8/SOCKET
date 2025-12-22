@@ -238,6 +238,7 @@ class LlamaAttention(nn.Module):
         hidden_gate = getattr(config, "topk_hidden", max(256, self.head_dim))
         self.masker_mode = "joint"
         self.random_walk_alpha = getattr(config, "random_walk_alpha", 0.001)
+        self.random_walk_window = getattr(config, "random_walk_window", None)
 
         self.attention_estimator = FullAttentionEstimator(
             q_dim=config.hidden_size,
@@ -368,8 +369,17 @@ class LlamaAttention(nn.Module):
             random_walk_probs = self._update_random_walk(
                 teacher_attention_probs.detach(), past_key_values, random_walk_states
             )
-            th = torch.quantile(random_walk_probs, 0.5, dim=-1, keepdim=True) if self.layer_idx > 2 else 0
+            th = torch.quantile(random_walk_probs, 0.25, dim=-1, keepdim=True) if self.layer_idx > 2 else 0
             allow = random_walk_probs >= th
+            window = 0.2
+            # This only works for prefill
+            if window is not None and 0 < window < 1:
+                window = max(1, int(window * T_k))
+            if window is not None and window > 0:
+                q_idx = torch.arange(T_q, device=device).view(T_q, 1)
+                k_idx = torch.arange(T_k, device=device).view(1, T_k)
+                window_mask = (k_idx <= q_idx) & (k_idx >= (q_idx - window + 1))
+                allow = allow | window_mask.unsqueeze(0)
             rw_bias = torch.zeros(
                 allow.size(0),
                 1,
