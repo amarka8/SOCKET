@@ -9,6 +9,7 @@ from torch.nn import CrossEntropyLoss
 from collections import namedtuple
 from transformers import AutoModelForCausalLM
 from transformers.models.gpt2 import GPT2LMHeadModel
+from pipeline.train_quest.utils import _strip_special_tokens
 
 Outputs = namedtuple("Outputs", ["loss"])
 
@@ -27,7 +28,9 @@ class CE(nn.Module):
         self.tokenizer = tokenizer
         self.eos_token_id = tokenizer.eos_token_id
         # self.compare_model = AutoModelForCausalLM.from_pretrained(
-        #     "meta-llama/Llama-3.2-1B-Instruct"
+        #     "meta-llama/Llama-3.2-1B-Instruct",
+        #     torch_dtype=torch.float16,
+        #     attn_implementation="eager"
         # )
         # self.compare_model.eval()
         # for p in self.compare_model.parameters():
@@ -199,4 +202,9 @@ class CE(nn.Module):
                 _ = self.base_causallm(inputs_embeds=inputs_embeds)
 
         answer = tokens[prompt_len:]
-        return self.tokenizer.decode(answer)
+        output = self.tokenizer.decode(
+            answer,
+            spaces_between_special_tokens=False,
+        )
+        output = _strip_special_tokens(output, self.tokenizer)
+        return output

@@ -77,9 +77,13 @@ def register_args_and_configs(args):
     with open(args.eval_config_dir) as eval_config_f:
         eval_config = json.load(eval_config_f)
         logger.info(f'Input eval config file {args.eval_config_dir} loaded.')
-    with open(args.train_config_dir) as eval_config_f:
-        train_config = json.load(eval_config_f)
-        logger.info(f'Input eval config file {args.train_config_dir} loaded.')
+    train_config = {"train_params": {}}
+    if args.train_config_dir:
+        with open(args.train_config_dir) as eval_config_f:
+            train_config = json.load(eval_config_f)
+            logger.info(f'Input eval config file {args.train_config_dir} loaded.')
+    else:
+        logger.info('No train config provided; using empty train_params.')
     
     # Make subdir under output dir to store input configs.
     input_config_subdir = eval_config['management']['sub_dir']['input_config']
@@ -109,7 +113,7 @@ def register_args_and_configs(args):
     config = dict()
     config['pipeline_params'] = pipeline_config['pipeline_params']
     config['eval_params'] = eval_config['eval_params']
-    config['train_params'] = train_config['train_params']
+    config['train_params'] = train_config.get('train_params', {})
     config['eval_results'] = dict() # processed result
 
     config['management'] = dict()

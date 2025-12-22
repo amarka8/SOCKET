@@ -256,6 +256,8 @@ def run(configs, args, logger):
     total_train_steps = 0
     best_acc = 0
     collator = MyCollator(tokenizer, label_pad_token_id=-100)
+    processed_result = None
+    raw_result = None
 
     for epoch in range(pipeline_params["resume"], pipeline_params["num_epochs"]):
 
@@ -363,6 +365,8 @@ def run(configs, args, logger):
             pbar = tqdm(colour="blue", desc=f"Test Accuracy", total=total_length, dynamic_ncols=True)
             score = torch.tensor(0.0, device=_model_device(model_module))
             total = torch.tensor(0.0, device=_model_device(model_module))
+            predictions = []
+            prediction_indices = []
             with torch.no_grad():
                 model_module.eval()
                 for idx, batch in enumerate(valid_gen_dataloader):
@@ -385,6 +389,8 @@ def run(configs, args, logger):
                         max_new_tokens=max_new_tokens,
                         synced_gpus=use_deepspeed,
                     )
+                    predictions.append(answer)
+                    prediction_indices.append(int(test_idx))
                     score += longbench_eval.scorer(
                         eval_params['dataset'],
                         [answer],
@@ -412,6 +418,25 @@ def run(configs, args, logger):
 
             dist.all_reduce(score, op=dist.ReduceOp.SUM)
             dist.all_reduce(total, op=dist.ReduceOp.SUM)
+            all_predictions = None
+            if dist.is_available() and dist.is_initialized():
+                gathered_preds = [None for _ in range(dist.get_world_size())]
+                gathered_indices = [None for _ in range(dist.get_world_size())]
+                dist.gather_object(predictions, gathered_preds, dst=0)
+                dist.gather_object(prediction_indices, gathered_indices, dst=0)
+                if rank == 0:
+                    pred_map = {}
+                    for preds, indices in zip(gathered_preds, gathered_indices):
+                        for p, i in zip(preds or [], indices or []):
+                            pred_map[int(i)] = p
+                    max_idx = max(pred_map.keys()) if pred_map else -1
+                    all_predictions = [
+                        pred_map.get(i) for i in range(max_idx + 1)
+                    ]
+            else:
+                pred_map = {int(i): p for i, p in zip(prediction_indices, predictions)}
+                max_idx = max(pred_map.keys()) if pred_map else -1
+                all_predictions = [pred_map.get(i) for i in range(max_idx + 1)]
 
             final_score = 100 * score / total
             final_score = final_score.detach().cpu().item()
@@ -420,12 +445,22 @@ def run(configs, args, logger):
             sys.stdout.flush()
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-
+            processed_result = {
+                "dataset": eval_params["dataset"],
+                "score": final_score,
+                "outputs": all_predictions,
+            }
+            raw_result = {
+                "total_score": score.detach().cpu().item(),
+                "total": total.detach().cpu().item(),
+            }
             if pipeline_params["only_eval"]:
-                break
+                return processed_result, raw_result
 
             if (round(final_score, 2) > best_acc and not pipeline_params["only_eval"]):
                 save_path = os.path.join(save_dir, f"checkpoint_{epoch+1}")
                 save_base_causallm(model_engine, save_path)
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
+
+    return processed_result, raw_result

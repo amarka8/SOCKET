@@ -18,3 +18,12 @@ def set_seed(seed_value):
     os.environ["PYTHONHASHSEED"] = str(seed_value)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def _strip_special_tokens(text: str, tokenizer) -> str:
+    for special_token in tokenizer.special_tokens_map.values():
+        if isinstance(special_token, list):
+            for special_tok in special_token:
+                text = text.replace(special_tok, "")
+        else:
+            text = text.replace(special_token, "")
+    return text.strip()

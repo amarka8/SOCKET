@@ -17,6 +17,8 @@ from huggingface_hub import login
 login(token=hf_access_token)
 
 from eval_aime import eval_aime
+from eval_longbench import eval_longbench
+from eval.longbench_utils.constants import LONGBENCH_DATASET
 
 SEED = 42
 main_utils.lock_seed(SEED)
@@ -37,7 +39,9 @@ logger.info(json.dumps(config, indent=4))
 if config['eval_params']['dataset'] == 'aime':
     processed_results, raw_results = eval_aime(config)
     main_utils.register_result(processed_results, raw_results, config)
-    
+elif config['eval_params']['dataset'] in LONGBENCH_DATASET:
+    processed_results, raw_results = eval_longbench(config)
+    main_utils.register_result(processed_results, raw_results, config)
 else:
     logger.error(f"Invalid config['eval_params']['dataset'] input: {config['eval_params']['dataset']}.")
     raise ValueError
