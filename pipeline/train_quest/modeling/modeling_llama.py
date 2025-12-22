@@ -238,7 +238,8 @@ class LlamaAttention(nn.Module):
         hidden_gate = getattr(config, "topk_hidden", max(256, self.head_dim))
         self.masker_mode = "joint"
         self.random_walk_alpha = getattr(config, "random_walk_alpha", 0.001)
-        self.random_walk_window = getattr(config, "random_walk_window", None)
+        self.random_walk_window = getattr(config, "random_walk_window", 0.2)
+        self.random_walk_block_size = getattr(config, "random_walk_block_size", 32)
 
         self.attention_estimator = FullAttentionEstimator(
             q_dim=config.hidden_size,
@@ -369,17 +370,46 @@ class LlamaAttention(nn.Module):
             random_walk_probs = self._update_random_walk(
                 teacher_attention_probs.detach(), past_key_values, random_walk_states
             )
-            th = torch.quantile(random_walk_probs, 0.25, dim=-1, keepdim=True) if self.layer_idx > 2 else 0
-            allow = random_walk_probs >= th
-            window = 0.2
-            # This only works for prefill
-            if window is not None and 0 < window < 1:
-                window = max(1, int(window * T_k))
-            if window is not None and window > 0:
-                q_idx = torch.arange(T_q, device=device).view(T_q, 1)
-                k_idx = torch.arange(T_k, device=device).view(1, T_k)
-                window_mask = (k_idx <= q_idx) & (k_idx >= (q_idx - window + 1))
-                allow = allow | window_mask.unsqueeze(0)
+            block_size = self.random_walk_block_size
+            if block_size is not None and block_size > 1:
+                num_blocks = (T_k + block_size - 1) // block_size
+                pad = num_blocks * block_size - T_k
+                if pad:
+                    random_walk_probs_padded = F.pad(random_walk_probs, (0, pad), value=0.0)
+                else:
+                    random_walk_probs_padded = random_walk_probs
+                # random_walk_probs_padded: (B, T_q, num_blocks * block_size)
+                block_sums = random_walk_probs_padded.view(B, T_q, num_blocks, block_size).sum(dim=-1)  # (B, T_q, num_blocks)
+                block_counts = torch.full((num_blocks,), block_size, device=device, dtype=block_sums.dtype)  # (num_blocks,)
+                block_counts[-1] = T_k - block_size * (num_blocks - 1)  # (num_blocks,), last block may be shorter
+                block_probs = block_sums / block_counts.view(1, 1, -1)  # (B, T_q, num_blocks)
+                th = torch.quantile(block_probs, 0.25, dim=-1, keepdim=True) if self.layer_idx > 2 else 0  # (B, T_q, 1)
+                allow_blocks = block_probs >= th  # (B, T_q, num_blocks)
+
+                # This only works for prefill
+                # SLIDING WINDOW
+                block_window = self.random_walk_window
+                if block_window is not None and 0 < block_window < 1:
+                    block_window = max(1, int(block_window * num_blocks))
+                if block_window is not None and block_window > 0:
+                    q_block = (torch.arange(T_q, device=device) // block_size).view(T_q, 1)  # (T_q, 1)
+                    k_block = torch.arange(num_blocks, device=device).view(1, num_blocks)  # (1, num_blocks)
+                    block_window_mask = (k_block <= q_block) & (k_block >= (q_block - block_window + 1))  # (T_q, num_blocks)
+                    allow_blocks = allow_blocks | block_window_mask.unsqueeze(0)
+                allow = allow_blocks.unsqueeze(-1).expand(-1, -1, -1, block_size)  # (B, T_q, num_blocks, block_size)
+                allow = allow.reshape(B, T_q, num_blocks * block_size)[..., :T_k]  # (B, T_q, T_k)
+            # else:
+            #     th = torch.quantile(random_walk_probs, 0.25, dim=-1, keepdim=True) if self.layer_idx > 2 else 0
+            #     allow = random_walk_probs >= th
+            #     window = self.random_walk_window
+            #     # This only works for prefill
+            #     if window is not None and 0 < window < 1:
+            #         window = max(1, int(window * T_k))
+            #     if window is not None and window > 0:
+            #         q_idx = torch.arange(T_q, device=device).view(T_q, 1)
+            #         k_idx = torch.arange(T_k, device=device).view(1, T_k)
+            #         window_mask = (k_idx <= q_idx) & (k_idx >= (q_idx - window + 1))  # (T_q, T_k)
+            #         allow = allow | window_mask.unsqueeze(0)
             rw_bias = torch.zeros(
                 allow.size(0),
                 1,
