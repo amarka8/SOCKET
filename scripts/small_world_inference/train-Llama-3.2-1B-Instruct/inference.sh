@@ -5,7 +5,7 @@ task="longbench"
 train_dataset="LongAlpaca-12k"
 eval_dataset="qasper"
 model="Llama-3.2-1B-Instruct"
-method="LearnHash"
+method="SnallWorld"
 
 export COLOR_PRINT=1
 export TRITON_CACHE_DIR="/data1/el72"
