@@ -400,7 +400,7 @@ class LlamaAttention(nn.Module):
             query_states,
             key_states,
             value_states,
-            attention_mask=None,                       
+            attention_mask,                       
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             **kwargs,
@@ -408,7 +408,7 @@ class LlamaAttention(nn.Module):
 
         # Teacher token-level probs over keys: (B,T_q,T_k)
         teacher_attention_probs = self._hadamard_attention_probs(
-            query_states, key_states, attention_mask
+            query_states, key_states, attention_mask=None
         )
 
         attn_out_masked = attn_out_dense
@@ -432,7 +432,7 @@ class LlamaAttention(nn.Module):
                 block_counts[-1] = T_k - block_size * (num_blocks - 1)  # (num_blocks,), last block may be shorter
                 # TODO: Consider removing average
                 block_probs = block_sums / block_counts.view(1, 1, -1)  # (B, T_q, num_blocks)
-                th = torch.quantile(block_probs, 0.8, dim=-1, keepdim=True) if self.layer_idx > -1 and self.layer_idx % 2 == 1 else 0  # (B, T_q, 1)
+                th = torch.quantile(block_probs, 0.9, dim=-1, keepdim=True) if self.layer_idx > -1 and self.layer_idx % 2 == 1 else 0  # (B, T_q, 1)
                 allow_blocks = block_probs >= th  # (B, T_q, num_blocks)
 
                 # This only works for prefill
