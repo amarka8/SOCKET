@@ -238,7 +238,7 @@ class LlamaAttention(nn.Module):
         hidden_gate = getattr(config, "topk_hidden", max(256, self.head_dim))
         self.masker_mode = "joint"
         self.random_walk_alpha = getattr(config, "random_walk_alpha", 0.001)
-        self.random_walk_window = getattr(config, "random_walk_window", 0.2)
+        self.random_walk_window = getattr(config, "random_walk_window", 0.1)
         self.random_walk_block_size = getattr(config, "random_walk_block_size", 32)
 
         self.attention_estimator = FullAttentionEstimator(
@@ -298,7 +298,9 @@ class LlamaAttention(nn.Module):
             if dist.get_rank() == 0:
                 import pdb; pdb.set_trace()
             dist.barrier()
-        walk = torch.matmul(attention_probs, state)
+        # for i in range(1):
+        state = torch.matmul(state, attention_probs)
+        walk = state
         if states is not None:
             states[self.layer_idx] = walk.detach()
         return walk
@@ -353,7 +355,7 @@ class LlamaAttention(nn.Module):
             query_states,
             key_states,
             value_states,
-            attention_mask,                       
+            attention_mask=None,                       
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             **kwargs,
@@ -382,8 +384,9 @@ class LlamaAttention(nn.Module):
                 block_sums = random_walk_probs_padded.view(B, T_q, num_blocks, block_size).sum(dim=-1)  # (B, T_q, num_blocks)
                 block_counts = torch.full((num_blocks,), block_size, device=device, dtype=block_sums.dtype)  # (num_blocks,)
                 block_counts[-1] = T_k - block_size * (num_blocks - 1)  # (num_blocks,), last block may be shorter
+                # TODO: Consider removing average
                 block_probs = block_sums / block_counts.view(1, 1, -1)  # (B, T_q, num_blocks)
-                th = torch.quantile(block_probs, 0.25, dim=-1, keepdim=True) if self.layer_idx > 2 else 0  # (B, T_q, 1)
+                th = torch.quantile(block_probs, 0.9, dim=-1, keepdim=True) if self.layer_idx > -1 and self.layer_idx % 2 == 1 else 0  # (B, T_q, 1)
                 allow_blocks = block_probs >= th  # (B, T_q, num_blocks)
 
                 # This only works for prefill
@@ -398,6 +401,13 @@ class LlamaAttention(nn.Module):
                     allow_blocks = allow_blocks | block_window_mask.unsqueeze(0)
                 allow = allow_blocks.unsqueeze(-1).expand(-1, -1, -1, block_size)  # (B, T_q, num_blocks, block_size)
                 allow = allow.reshape(B, T_q, num_blocks * block_size)[..., :T_k]  # (B, T_q, T_k)
+                if not self.training:
+                    q_idx = torch.arange(T_q, device=device).view(1, T_q, 1)
+                    k_idx = torch.arange(T_k, device=device).view(1, 1, T_k)
+                    causal = k_idx <= q_idx
+                    allowed_causal = allow & causal
+                    density = allowed_causal.float().sum() / causal.float().sum()
+                    print(f"Layer {self.layer_idx}, [rw-mask] causal density={density.item():.2f}")
             # else:
             #     th = torch.quantile(random_walk_probs, 0.25, dim=-1, keepdim=True) if self.layer_idx > 2 else 0
             #     allow = random_walk_probs >= th
