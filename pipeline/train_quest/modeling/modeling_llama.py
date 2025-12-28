@@ -240,6 +240,7 @@ class LlamaAttention(nn.Module):
         self.random_walk_alpha = getattr(config, "random_walk_alpha", 0.001)
         self.random_walk_window = getattr(config, "random_walk_window", 0.1)
         self.random_walk_block_size = getattr(config, "random_walk_block_size", 32)
+        self.random_walk_hadamard_dim = getattr(config, "random_walk_hadamard_dim", 128)
 
         self.attention_estimator = FullAttentionEstimator(
             q_dim=config.hidden_size,
@@ -275,6 +276,50 @@ class LlamaAttention(nn.Module):
             elif prev_len > target_len:
                 prev = prev[:, :target_len, :target_len]
         return prev
+
+    def _fwht(self, x: torch.Tensor) -> torch.Tensor:
+        n = x.size(-1)
+        y = x.reshape(-1, n)
+        h = 1
+        while h < n:
+            y = y.view(-1, n // (2 * h), 2 * h)
+            a = y[..., :h].clone()
+            b = y[..., h : 2 * h]
+            y[..., :h] = a + b
+            y[..., h : 2 * h] = a - b
+            h *= 2
+        return y.view(*x.shape)
+
+    def _hadamard_project(self, x: torch.Tensor, proj_dim: int) -> torch.Tensor:
+        n = x.size(-1)
+        n_pow2 = 1 << (n - 1).bit_length()
+        if n_pow2 != n:
+            x = F.pad(x, (0, n_pow2 - n), value=0.0)
+        sign = torch.randint(0, 2, (1, 1, 1, n_pow2), device=x.device, dtype=x.dtype)
+        sign = sign * 2 - 1
+        x = x * sign
+        x = self._fwht(x)
+        x = x / (n_pow2 ** 0.5)
+        proj_dim = min(proj_dim, n_pow2)
+        return x[..., :proj_dim]
+
+    def _hadamard_attention_probs(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if key_states.size(1) != query_states.size(1):
+            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        q = self._hadamard_project(query_states.float(), self.random_walk_hadamard_dim)
+        k = self._hadamard_project(key_states.float(), self.random_walk_hadamard_dim)
+        scale = q.size(-1) ** -0.5
+        logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        if attention_mask is not None:
+            logits = logits + attention_mask
+        attn_probs = torch.softmax(logits, dim=-1)
+        pt_tok = attn_probs.sum(dim=1)
+        return pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
 
     def _update_random_walk(self, attention_probs, past_key_values, runtime_states):
         B, T_q, T_k = attention_probs.shape
@@ -362,8 +407,9 @@ class LlamaAttention(nn.Module):
         )
 
         # Teacher token-level probs over keys: (B,T_q,T_k)
-        pt_tok = attn_weights_dense.sum(dim=1) if attn_weights_dense.dim() == 4 else attn_weights_dense
-        teacher_attention_probs = pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
+        teacher_attention_probs = self._hadamard_attention_probs(
+            query_states, key_states, attention_mask
+        )
 
         attn_out_masked = attn_out_dense
         attn_weights_masked = attn_weights_dense
