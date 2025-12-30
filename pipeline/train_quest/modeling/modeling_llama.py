@@ -295,13 +295,14 @@ class LlamaAttention(nn.Module):
         n_pow2 = 1 << (n - 1).bit_length()
         if n_pow2 != n:
             x = F.pad(x, (0, n_pow2 - n), value=0.0)
-        sign = torch.randint(0, 2, (1, 1, 1, n_pow2), device=x.device, dtype=x.dtype)
-        sign = sign * 2 - 1
+        sign = torch.randint(0, 2, (1, x.size(1), 1, n_pow2), device=x.device, dtype=torch.int8)
+        sign = sign.to(x.dtype) * 2 - 1
         x = x * sign
         x = self._fwht(x)
-        x = x / (n_pow2 ** 0.5)
         proj_dim = min(proj_dim, n_pow2)
-        return x[..., :proj_dim]
+        x = x / ((n_pow2 / proj_dim) ** 0.5)
+        idx = torch.randperm(n_pow2, device=x.device)[:proj_dim]
+        return x.index_select(-1, idx)
 
     def _hadamard_attention_probs(
         self,
@@ -315,6 +316,12 @@ class LlamaAttention(nn.Module):
         k = self._hadamard_project(key_states.float(), self.random_walk_hadamard_dim)
         scale = q.size(-1) ** -0.5
         logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        # import pdb
+        # import torch.distributed as dist
+        # dist.barrier()
+        # if dist.get_rank() == 0:
+        #     import pdb; pdb.set_trace()
+        # dist.barrier()
         if attention_mask is not None:
             logits = logits + attention_mask
         attn_probs = torch.softmax(logits, dim=-1)
@@ -400,7 +407,7 @@ class LlamaAttention(nn.Module):
             query_states,
             key_states,
             value_states,
-            attention_mask,                       
+            attention_mask=None,                       
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             **kwargs,
@@ -454,18 +461,8 @@ class LlamaAttention(nn.Module):
                     allowed_causal = allow & causal
                     density = allowed_causal.float().sum() / causal.float().sum()
                     print(f"Layer {self.layer_idx}, [rw-mask] causal density={density.item():.2f}")
-            # else:
-            #     th = torch.quantile(random_walk_probs, 0.25, dim=-1, keepdim=True) if self.layer_idx > 2 else 0
-            #     allow = random_walk_probs >= th
-            #     window = self.random_walk_window
-            #     # This only works for prefill
-            #     if window is not None and 0 < window < 1:
-            #         window = max(1, int(window * T_k))
-            #     if window is not None and window > 0:
-            #         q_idx = torch.arange(T_q, device=device).view(T_q, 1)
-            #         k_idx = torch.arange(T_k, device=device).view(1, T_k)
-            #         window_mask = (k_idx <= q_idx) & (k_idx >= (q_idx - window + 1))  # (T_q, T_k)
-            #         allow = allow | window_mask.unsqueeze(0)
+
+            
             rw_bias = torch.zeros(
                 allow.size(0),
                 1,

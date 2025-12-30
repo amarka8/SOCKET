@@ -11,7 +11,7 @@ export COLOR_PRINT=1
 export TRITON_CACHE_DIR="/data1/el72"
 export CHAT=1
 
-CUDA_VISIBLE_DEVICES=$1 deepspeed  --master_port 29500 pipeline/train_quest/main.py \
+CUDA_VISIBLE_DEVICES=$1 deepspeed  --master_port 28500 pipeline/train_quest/main.py \
     --exp_desc ${task}_${train_dataset}_${model}_${method} \
     --pipeline_config_dir config/pipeline_config/${method}/${model}/${model}-inference-only.json \
     --eval_config_dir config/eval_config/${task}/${eval_dataset}.json \
