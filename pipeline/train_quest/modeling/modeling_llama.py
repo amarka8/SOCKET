@@ -316,16 +316,17 @@ class LlamaAttention(nn.Module):
         k = self._hadamard_project(key_states.float(), self.random_walk_hadamard_dim)
         scale = q.size(-1) ** -0.5
         logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        if attention_mask is not None:
+            logits = logits + attention_mask
+        # If softmax here, many outliers make most of the numbers become 0
+        attn_probs = torch.softmax(logits.clamp(-10, 10), dim=-1)
+        pt_tok = attn_probs.sum(dim=1)
         # import pdb
         # import torch.distributed as dist
         # dist.barrier()
         # if dist.get_rank() == 0:
         #     import pdb; pdb.set_trace()
         # dist.barrier()
-        if attention_mask is not None:
-            logits = logits + attention_mask
-        attn_probs = torch.softmax(logits, dim=-1)
-        pt_tok = attn_probs.sum(dim=1)
         return pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
 
     def _update_random_walk(self, attention_probs, past_key_values, runtime_states):
@@ -417,6 +418,15 @@ class LlamaAttention(nn.Module):
         teacher_attention_probs = self._hadamard_attention_probs(
             query_states, key_states, attention_mask=None
         )
+
+        # pt_tok = attn_weights_dense.sum(dim=1) if attn_weights_dense.dim() == 4 else attn_weights_dense
+        # teacher_attention_probs1 = pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
+        # import pdb
+        # import torch.distributed as dist
+        # dist.barrier()
+        # if dist.get_rank() == 0:
+        #     import pdb; pdb.set_trace()
+        # dist.barrier()
 
         attn_out_masked = attn_out_dense
         attn_weights_masked = attn_weights_dense

@@ -3,7 +3,7 @@
                 "method": "fafo",
                 "kv_cache_method": "stream-llm",
                 "model_name": "meta-llama/Llama-3.2-1B-Instruct",
-                "save_path": "/data1/el72/ckpts/LIM/Llama-3.2-1B-Instruct-selector",
+                "save_path": "/rhf/allocations/as143/el72/ckpts/LIM/Llama-3.2-1B-Instruct-selector",
                 "load_model_path": null,
                 "train_mode": "inference_only",
                 "n_init": 0.2,
