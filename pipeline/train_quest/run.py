@@ -149,6 +149,7 @@ def run(configs, args, logger):
         llama_config.topk_hidden       = 256
         llama_config.topk_tau          = 1.5
         llama_config.topk_soft_alpha   = 8.0
+        llama_config.random_walk_hadamard_dim = pipeline_params.get("random_walk_hadamard_dim", 128)
         model = LlamaForCausalLM.from_pretrained(model_name, config=llama_config)
         model.set_masker_mode(configs['pipeline_params']["train_mode"])
     else:

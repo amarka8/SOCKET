@@ -239,8 +239,9 @@ class LlamaAttention(nn.Module):
         self.masker_mode = "joint"
         self.random_walk_alpha = getattr(config, "random_walk_alpha", 0.001)
         self.random_walk_window = getattr(config, "random_walk_window", 0.1)
-        self.random_walk_block_size = getattr(config, "random_walk_block_size", 32)
+        self.random_walk_block_size = getattr(config, "random_walk_block_size", 64)
         self.random_walk_hadamard_dim = getattr(config, "random_walk_hadamard_dim", 128)
+        print(f"Hadamard sketching dim is: {self.random_walk_hadamard_dim}")
 
         self.attention_estimator = FullAttentionEstimator(
             q_dim=config.hidden_size,
@@ -318,7 +319,7 @@ class LlamaAttention(nn.Module):
         logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
         if attention_mask is not None:
             logits = logits + attention_mask
-        # If softmax here, many outliers make most of the numbers become 0
+        # If softmax here, many outliers make most of the numbers become 0 -> clamp
         attn_probs = torch.softmax(logits.clamp(-10, 10), dim=-1)
         pt_tok = attn_probs.sum(dim=1)
         # import pdb
@@ -351,8 +352,8 @@ class LlamaAttention(nn.Module):
             if dist.get_rank() == 0:
                 import pdb; pdb.set_trace()
             dist.barrier()
-        # for i in range(1):
-        state = torch.matmul(state, attention_probs)
+        for i in range(3):
+            state = torch.matmul(state, attention_probs)
         walk = state
         if states is not None:
             states[self.layer_idx] = walk.detach()
@@ -450,6 +451,11 @@ class LlamaAttention(nn.Module):
                 # TODO: Consider removing average
                 block_probs = block_sums / block_counts.view(1, 1, -1)  # (B, T_q, num_blocks)
                 th = torch.quantile(block_probs, 0.9, dim=-1, keepdim=True) if self.layer_idx > -1 and self.layer_idx % 2 == 1 else 0  # (B, T_q, 1)
+                if isinstance(th, torch.Tensor):
+                    tail = min(block_size, th.shape[1])
+                    if tail > 0:
+                        th = th.clone()
+                        th[:, -tail:, :] = 0
                 allow_blocks = block_probs >= th  # (B, T_q, num_blocks)
 
                 # This only works for prefill

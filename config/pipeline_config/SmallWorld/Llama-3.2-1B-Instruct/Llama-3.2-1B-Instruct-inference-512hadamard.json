@@ -20,7 +20,7 @@
                 "eval_period": 1,
                 "n_new_tokens": 1024,
                 "max_model_len": 8192,
-                "random_walk_hadamard_dim": 128,
+                "random_walk_hadamard_dim": 512,
                 "truncation_mode": "middle"
         }
 }

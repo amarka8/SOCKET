@@ -3,8 +3,8 @@ output_dir_root=$2
 
 task="longbench"
 train_dataset="LongAlpaca-12k"
-eval_dataset="qasper"
-model="Llama-3.2-1B-Instruct"
+eval_dataset="2wikimqa"
+model="Llama-3.1-8B-Instruct"
 method="SmallWorld"
 
 export COLOR_PRINT=1
