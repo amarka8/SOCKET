@@ -609,7 +609,6 @@ class LlamaAttention(nn.Module):
             use_rw_kernel = (
                 (block_size > 1)
                 and (T_q == T_k)
-                and (past_key_values is None)
                 and query_states.is_cuda
                 and key_states.is_cuda
                 and value_states.is_cuda

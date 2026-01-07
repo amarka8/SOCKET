@@ -150,6 +150,7 @@ def block_mask_to_indices(
     block_n: int,
     K: int | None = None,
     force_include_diagonal: bool = True,
+    enforce_causal_blocks: bool = True,
 ) -> torch.Tensor:
     assert allow_blocks.dim() == 3
     assert allow_blocks.dtype == torch.bool
@@ -158,11 +159,21 @@ def block_mask_to_indices(
     device = allow_blocks.device
 
     mask = allow_blocks
+    if enforce_causal_blocks:
+        k_blks = torch.arange(num_cols, device=device)
+        q_last = torch.minimum(
+            (torch.arange(num_rows, device=device) + 1) * block_m - 1,
+            torch.tensor(num_rows * block_m - 1, device=device),
+        )
+        max_kblk = q_last // block_n
+        valid = k_blks[None, :] <= max_kblk[:, None]
+        mask = mask & valid.unsqueeze(0)
     if force_include_diagonal:
         diag = (torch.arange(num_rows, device=device) * block_m) // block_n
         diag = diag.clamp(0, num_cols - 1)
         mask = mask.clone()
-        mask[torch.arange(num_rows, device=device), diag] = True
+        row_idx = torch.arange(num_rows, device=device)
+        mask[:, row_idx, diag] = True
 
     if K is None or K <= 0:
         K_eff = int(mask.sum(dim=-1).max().item()) if num_cols > 0 else 0
