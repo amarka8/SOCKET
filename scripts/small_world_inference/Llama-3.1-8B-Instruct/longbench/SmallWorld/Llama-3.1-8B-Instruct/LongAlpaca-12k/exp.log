@@ -1,0 +1,67 @@
+2026-01-07 10:05:40,648 | INFO : Experiment longbench_LongAlpaca-12k_Llama-3.1-8B-Instruct_SmallWorld (SEED=42) started at 2026-01-07 10:05:40.618846-06:00 with the following config: 
+2026-01-07 10:05:40,649 | INFO : {
+    "pipeline_params": {
+        "method": "smallworld",
+        "kv_cache_method": "stream-llm",
+        "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "save_path": "/scratch/sj157/checkpoints/Llama-3.2-1B-Instruct-selector",
+        "load_model_path": null,
+        "train_mode": "inference_only",
+        "n_init": 0.2,
+        "n_local": 0.3,
+        "only_eval": true,
+        "resume": 0,
+        "bf16": false,
+        "batch_size_training": 1,
+        "reset_optimizer": true,
+        "lr": 0.0001,
+        "weight_decay": 0.01,
+        "gradient_accumulation_steps": 1,
+        "num_epochs": 2,
+        "eval_period": 1,
+        "n_new_tokens": 1024,
+        "max_model_len": 128000,
+        "random_walk_hadamard_dim": 128,
+        "truncation_mode": "middle"
+    },
+    "eval_params": {
+        "dataset": "narrativeqa",
+        "dataset_path": "dataset/longbench",
+        "instruction": "You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {context}\n\nNow, answer the question based on the story asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
+        "instruction_position": "prefix",
+        "max_new_tokens": 128,
+        "eval_metrics": [
+            "qa_f1_score"
+        ]
+    },
+    "train_params": {
+        "dataset": "LongAlpaca-12k",
+        "dataset_path": "Yukang/LongAlpaca-12k",
+        "save_dir": "processed_dataset/LongAlpaca-12k-longctx/",
+        "instruction": "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:",
+        "instruction_position": "prefix",
+        "max_new_tokens": 128,
+        "eval_metrics": [
+            "qa_f1_score"
+        ]
+    },
+    "eval_results": {},
+    "management": {
+        "exp_desc": "longbench_LongAlpaca-12k_Llama-3.1-8B-Instruct_SmallWorld",
+        "pipeline_config_dir": "config/pipeline_config/SmallWorld/Llama-3.1-8B-Instruct/Llama-3.1-8B-Instruct-inference-32hadamard.json",
+        "eval_config_dir": "config/eval_config/longbench/narrativeqa.json",
+        "output_folder_dir": "/scratch/sj157/Small_World_Attention/scripts/small_world_inference/Llama-3.1-8B-Instruct/longbench/SmallWorld/Llama-3.1-8B-Instruct/LongAlpaca-12k/",
+        "job_post_via": "slurm_sbatch",
+        "slurm_info": {
+            "slurm_job_id": "74543",
+            "slurm_job_name": "trial",
+            "slurm_out_file_dir": "/scratch/sj157/slurm-74543.out"
+        },
+        "sub_dir": {
+            "input_config": "input_config/",
+            "raw_results": "raw_results.json",
+            "result_vis": "result_vis.png",
+            "output_config": "output_config.json"
+        }
+    }
+}

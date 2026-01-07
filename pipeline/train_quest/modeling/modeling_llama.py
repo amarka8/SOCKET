@@ -622,6 +622,7 @@ class LlamaAttention(nn.Module):
                         block_mask_to_indices,
                         expand_block_index_to_heads,
                         random_walk_sparse_attention,
+                        random_walk_indices
                     )
                 except Exception as exc:
                     logger.warning_once(
