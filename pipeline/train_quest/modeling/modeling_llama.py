@@ -519,6 +519,189 @@ class LlamaAttention(nn.Module):
             return walk
         return walk.view(B, H, T_q, T_k)
 
+    # def forward(
+    #     self,
+    #     hidden_states: torch.Tensor,                           # (B, T, hidden_size)
+    #     position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    #     attention_mask: Optional[torch.Tensor],
+    #     past_key_values: Optional["Cache"] = None,
+    #     cache_position: Optional[torch.LongTensor] = None,
+    #     random_walk_states: Optional[dict] = None,
+    #     **kwargs,
+    # ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    #     input_shape = hidden_states.shape[:-1]
+    #     hidden_shape = (*input_shape, -1, self.head_dim)
+
+    #     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H,T_q,D)
+    #     key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H_kv,T_k,D)
+    #     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    #     cos, sin = position_embeddings
+    #     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    #     if past_key_values is not None:
+    #         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+    #         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+    #     if self.num_key_value_groups > 1:
+    #         B, H_kv, T_k, D = key_states.shape
+    #         H = query_states.size(1)
+    #         # repeat = H // H_kv
+    #     else:
+    #         B, H, T_k, D = key_states.shape
+    #         H = query_states.size(1)
+
+    #     B, H, T_q, D = query_states.shape
+    #     device = hidden_states.device
+
+    #     estimator_log_probs = None
+    #     attn_impl = "sdpa"
+    #     if attn_impl == "sdpa":
+    #         attention_interface = sdpa_attention_forward
+    #     else:
+    #         attention_interface = eager_attention_forward
+    #     # Teacher token-level probs over keys: (B,T_q,T_k)
+    #     teacher_attention_probs = None
+    #     attn_out_masked = None
+    #     attn_weights_masked = None
+
+    #     if self.masker_mode == "inference_only" and self.random_walk_alpha is not None and T_q > 1 and self.layer_idx > 1:
+    #         block_size = self.random_walk_block_size or 1
+    #         teacher_attention_probs = self._hadamard_attention_probs_block(
+    #             query_states, key_states, attention_mask=None, block_size=block_size
+    #         )
+    #         random_walk_probs = self._update_random_walk(
+    #             teacher_attention_probs.detach(), past_key_values, random_walk_states
+    #         )
+
+    #         if block_size > 1:
+    #             num_blocks_q = random_walk_probs.shape[1]
+    #             num_blocks_k = random_walk_probs.shape[2]
+    #             block_probs = random_walk_probs
+    #             q_idx = torch.arange(num_blocks_q, device=device).view(num_blocks_q, 1)
+    #             k_idx = torch.arange(num_blocks_k, device=device).view(1, num_blocks_k)
+    #             causal_blocks = (k_idx <= q_idx).view(1, num_blocks_q, num_blocks_k)
+    #             masked_probs = block_probs.float().masked_fill(~causal_blocks, float("nan"))
+    #             th = torch.nanquantile(masked_probs, 0.8, dim=-1, keepdim=True)  # (B, T_qb, 1)
+    #             if isinstance(th, torch.Tensor):
+    #                 tail = min(block_size, th.shape[-2])
+    #                 if tail > 0:
+    #                     th = th.clone()
+    #                     th[:, -5:, :] = 0
+    #             allow_blocks = block_probs > th  # (B, T_qb, T_kb)
+
+    #             # This only works for prefill
+    #             # SLIDING WINDOW + SINK (token-level -> block-level)
+    #             block_window = self.random_walk_window
+    #             if block_window is not None and 0 < block_window < 1:
+    #                 block_window = max(1, int(block_window * T_k))
+    #             if block_window is not None and block_window > 0:
+    #                 window_blocks = max(1, int((block_window + block_size - 1) // block_size))
+    #                 q_block = torch.arange(num_blocks_q, device=device).view(num_blocks_q, 1)
+    #                 k_block = torch.arange(num_blocks_k, device=device).view(1, num_blocks_k)
+    #                 window_mask = (k_block <= q_block) & (k_block >= (q_block - window_blocks + 1))
+    #                 sink_mask = k_block < window_blocks
+    #                 allow_blocks = allow_blocks | window_mask.unsqueeze(0) | sink_mask.unsqueeze(0)
+    #         else:
+    #             allow_blocks = random_walk_probs >= 0
+    #             block_window = None
+
+    #         use_rw_kernel = (
+    #             (block_size > 1)
+    #             and (T_q == T_k)
+    #             and query_states.is_cuda
+    #             and key_states.is_cuda
+    #             and value_states.is_cuda
+    #             and (query_states.dtype in (torch.float16, torch.bfloat16))
+    #             and (D in (16, 32, 64, 128))
+    #         )
+
+    #         if use_rw_kernel:
+    #             try:
+    #                 from kernels.block_sparse_flash_attention import (
+    #                     block_mask_to_indices,
+    #                     expand_block_index_to_heads,
+    #                     random_walk_sparse_attention,
+    #                 )
+    #             except Exception as exc:
+    #                 logger.warning_once(
+    #                     "block_sparse_flash_attention import failed; falling back to sdpa. "
+    #                     f"Reason: {exc}"
+    #                 )
+    #                 use_rw_kernel = False
+
+    #         if use_rw_kernel:
+    #             klist = int(getattr(self.config, "random_walk_kblocks", 0) or 0)
+    #             if klist <= 0:
+    #                 klist = None
+    #             blk_brk = block_mask_to_indices(
+    #                 allow_blocks=allow_blocks,
+    #                 block_m=block_size,
+    #                 block_n=block_size,
+    #                 K=klist,
+    #                 force_include_diagonal=True,
+    #             )
+    #             blk_bhrk = expand_block_index_to_heads(blk_brk, H=query_states.size(1))
+
+    #             key_full = repeat_kv(key_states, self.num_key_value_groups)
+    #             value_full = repeat_kv(value_states, self.num_key_value_groups)
+
+    #             if attention_mask is None:
+    #                 seqlens = torch.full((B,), T_k, device=device, dtype=torch.int32)
+    #             else:
+    #                 last_row = attention_mask[:, 0, -1, :]
+    #                 neg_inf = torch.finfo(last_row.dtype).min
+    #                 seqlens = (last_row > (neg_inf / 2)).sum(dim=-1).to(torch.int32)
+
+    #             out_bhtd = random_walk_sparse_attention(
+    #                 q=query_states,
+    #                 k=key_full,
+    #                 v=value_full,
+    #                 seqlens=seqlens,
+    #                 block_index=blk_bhrk,
+    #                 block_m=block_size,
+    #                 block_n=block_size,
+    #             )
+    #             attn_out_masked = out_bhtd.transpose(1, 2).contiguous()
+    #             attn_weights_masked = None
+    #         else:
+    #             attn_mask_for_second = attention_mask
+    #             attn_out_masked, attn_weights_masked = attention_interface(
+    #                 self,
+    #                 query_states,
+    #                 key_states,
+    #                 value_states,
+    #                 attn_mask_for_second,
+    #                 dropout=0.0 if not self.training else self.attention_dropout,
+    #                 scaling=self.scaling,
+    #                 rw_allow_blocks=allow_blocks,
+    #                 rw_block_size=block_size,
+    #                 rw_tq=T_q,
+    #                 rw_tk=T_k,
+    #                 rw_window_tokens=block_window,
+    #                 **kwargs,
+    #             )
+    #     else:
+    #         attn_out_masked, attn_weights_masked = attention_interface(
+    #             self,
+    #             query_states,
+    #             key_states,
+    #             value_states,
+    #             attention_mask=attention_mask,
+    #             dropout=0.0 if not self.training else self.attention_dropout,
+    #             scaling=self.scaling,
+    #             **kwargs,
+    #         )
+
+    #     extra = {
+    #         "estimator_log_probs": estimator_log_probs,
+    #         "teacher_attention_probs": teacher_attention_probs,
+    #     }
+    #     attn_out = attn_out_masked.reshape(*input_shape, -1).contiguous()
+    #     attn_output = self.o_proj(attn_out)
+
+    #     return attn_output, attn_weights_masked, extra
+
     def forward(
         self,
         hidden_states: torch.Tensor,                           # (B, T, hidden_size)
@@ -529,100 +712,100 @@ class LlamaAttention(nn.Module):
         random_walk_states: Optional[dict] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        Clean, V1-like integration:
+        - teacher probs computed via Hadamard sketch (token-level, (B,T,T))
+        - random-walk update in token space
+        - block indices built via random_walk_indices (never -1, causal, diag+sink)
+        - Triton block-sparse kernel used ONLY for prefill (T_q==T_k) and empty cache
+        - SDPA fallback when kernel isn't applicable
+        """
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        # ---- Projections ----
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H,T_q,D)
         key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H_kv,T_k,D)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H_kv,T_k,D)
 
+        # ---- RoPE ----
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        # ---- KV cache update (prefill/decode) ----
+        past_len = 0
         if past_key_values is not None:
+            past_len = past_key_values.get_seq_length()
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
-        if self.num_key_value_groups > 1:
-            B, H_kv, T_k, D = key_states.shape
-            H = query_states.size(1)
-            # repeat = H // H_kv
-        else:
-            B, H, T_k, D = key_states.shape
-            H = query_states.size(1)
-
+        # Shapes
         B, H, T_q, D = query_states.shape
-        device = hidden_states.device
+        T_k = key_states.shape[2]
+        device = query_states.device
 
+        # ---- Attention backend ----
+        attention_interface = sdpa_attention_forward  # or eager_attention_forward
         estimator_log_probs = None
-        attn_impl = "sdpa"
-        if attn_impl == "sdpa":
-            attention_interface = sdpa_attention_forward
-        else:
-            attention_interface = eager_attention_forward
-        # Teacher token-level probs over keys: (B,T_q,T_k)
         teacher_attention_probs = None
+
         attn_out_masked = None
         attn_weights_masked = None
 
-        if self.masker_mode == "inference_only" and self.random_walk_alpha is not None and T_q > 1 and self.layer_idx > 1:
-            block_size = self.random_walk_block_size or 1
+        # ---- Random-walk sparse path (prefill-only) ----
+        do_rw = (
+            (self.masker_mode == "inference_only")
+            and (self.random_walk_alpha is not None)
+            and (T_q > 1)
+        )
+
+        if do_rw:
+            print("INSIDE RANDOM WALK ATTENTION PATH")
+            block_size = int(getattr(self, "random_walk_block_size", 64) or 64)
+            if block_size <= 1:
+                block_size = 1
+
+            # 1) block-level teacher probs: (B, Tb, Tb)
             teacher_attention_probs = self._hadamard_attention_probs_block(
                 query_states, key_states, attention_mask=None, block_size=block_size
             )
-            random_walk_probs = self._update_random_walk(
+
+            # 2) random walk in block space: (B, Tb, Tb)
+            rw = self._update_random_walk(
                 teacher_attention_probs.detach(), past_key_values, random_walk_states
             )
 
-            if block_size > 1:
-                num_blocks_q = random_walk_probs.shape[1]
-                num_blocks_k = random_walk_probs.shape[2]
-                block_probs = random_walk_probs
-                q_idx = torch.arange(num_blocks_q, device=device).view(num_blocks_q, 1)
-                k_idx = torch.arange(num_blocks_k, device=device).view(1, num_blocks_k)
-                causal_blocks = (k_idx <= q_idx).view(1, num_blocks_q, num_blocks_k)
-                masked_probs = block_probs.float().masked_fill(~causal_blocks, float("nan"))
-                th = torch.nanquantile(masked_probs, 0.8, dim=-1, keepdim=True)  # (B, T_qb, 1)
-                if isinstance(th, torch.Tensor):
-                    tail = min(block_size, th.shape[-2])
-                    if tail > 0:
-                        th = th.clone()
-                        th[:, -5:, :] = 0
-                allow_blocks = block_probs > th  # (B, T_qb, T_kb)
-
-                # This only works for prefill
-                # SLIDING WINDOW + SINK (token-level -> block-level)
-                block_window = self.random_walk_window
-                if block_window is not None and 0 < block_window < 1:
-                    block_window = max(1, int(block_window * T_k))
-                if block_window is not None and block_window > 0:
-                    window_blocks = max(1, int((block_window + block_size - 1) // block_size))
-                    q_block = torch.arange(num_blocks_q, device=device).view(num_blocks_q, 1)
-                    k_block = torch.arange(num_blocks_k, device=device).view(1, num_blocks_k)
-                    window_mask = (k_block <= q_block) & (k_block >= (q_block - window_blocks + 1))
-                    sink_mask = k_block < window_blocks
-                    allow_blocks = allow_blocks | window_mask.unsqueeze(0) | sink_mask.unsqueeze(0)
-            else:
-                allow_blocks = random_walk_probs >= 0
-                block_window = None
-
+            # 3) kernel gating (prefill only)
             use_rw_kernel = (
                 (block_size > 1)
                 and (T_q == T_k)
-                and query_states.is_cuda
-                and key_states.is_cuda
-                and value_states.is_cuda
+                and (past_len == 0)
+                and query_states.is_cuda and key_states.is_cuda and value_states.is_cuda
                 and (query_states.dtype in (torch.float16, torch.bfloat16))
                 and (D in (16, 32, 64, 128))
             )
 
+            # 4) window_blocks in *blocks*
+            window_blocks = None
+            Tb = rw.size(-1)
+            rw_win = getattr(self, "random_walk_window", None)
+            if rw_win is not None:
+                if 0 < rw_win < 1:
+                    rw_win_tokens = max(1, int(rw_win * T_k))
+                else:
+                    rw_win_tokens = int(rw_win)
+                if rw_win_tokens > 0:
+                    window_blocks = max(1, (rw_win_tokens + block_size - 1) // block_size)
+                    window_blocks = min(window_blocks, Tb)
+
             if use_rw_kernel:
                 try:
                     from kernels.block_sparse_flash_attention import (
-                        block_mask_to_indices,
                         expand_block_index_to_heads,
                         random_walk_sparse_attention,
-                        random_walk_indices
+                        random_walk_indices_from_block_probs,
                     )
                 except Exception as exc:
                     logger.warning_once(
@@ -632,28 +815,33 @@ class LlamaAttention(nn.Module):
                     use_rw_kernel = False
 
             if use_rw_kernel:
-                klist = int(getattr(self.config, "random_walk_kblocks", 0) or 0)
-                if klist <= 0:
-                    klist = None
-                blk_brk = block_mask_to_indices(
-                    allow_blocks=allow_blocks,
-                    block_m=block_size,
-                    block_n=block_size,
-                    K=klist,
-                    force_include_diagonal=True,
-                )
-                blk_bhrk = expand_block_index_to_heads(blk_brk, H=query_states.size(1))
+                KLIST = int(getattr(self.config, "random_walk_kblocks", 8) or 8)
+                if KLIST <= 0:
+                    KLIST = 8
 
+                # 5) build indices directly from block probs: (B, Tb, KLIST)
+                blk_brk = random_walk_indices_from_block_probs(
+                    random_walk_probs_blk=rw.float(),
+                    K=KLIST,
+                    enforce_causal_blocks=True,
+                    force_include_diagonal=True,
+                    window_blocks=window_blocks,
+                )
+                blk_bhrk = expand_block_index_to_heads(blk_brk, H=H)  # (B,H,Tb,KLIST)
+
+                # 6) expand kv heads to full heads
                 key_full = repeat_kv(key_states, self.num_key_value_groups)
                 value_full = repeat_kv(value_states, self.num_key_value_groups)
 
+                # 7) seqlens
                 if attention_mask is None:
                     seqlens = torch.full((B,), T_k, device=device, dtype=torch.int32)
                 else:
+                    # attention_mask is additive (B,1,T_q,T_k)
                     last_row = attention_mask[:, 0, -1, :]
-                    neg_inf = torch.finfo(last_row.dtype).min
-                    seqlens = (last_row > (neg_inf / 2)).sum(dim=-1).to(torch.int32)
+                    seqlens = torch.isfinite(last_row).sum(dim=-1).to(torch.int32)
 
+                # 8) run Triton kernel (returns (B,H,T,D))
                 out_bhtd = random_walk_sparse_attention(
                     q=query_states,
                     k=key_full,
@@ -663,26 +851,22 @@ class LlamaAttention(nn.Module):
                     block_m=block_size,
                     block_n=block_size,
                 )
-                attn_out_masked = out_bhtd.transpose(1, 2).contiguous()
+                attn_out_masked = out_bhtd.transpose(1, 2).contiguous()  # (B,T,H,D)
                 attn_weights_masked = None
             else:
-                attn_mask_for_second = attention_mask
+                # SDPA fallback: plain causal+pad mask (optionally you can add a RW mask here)
                 attn_out_masked, attn_weights_masked = attention_interface(
                     self,
                     query_states,
                     key_states,
                     value_states,
-                    attn_mask_for_second,
+                    attention_mask=attention_mask,
                     dropout=0.0 if not self.training else self.attention_dropout,
                     scaling=self.scaling,
-                    rw_allow_blocks=allow_blocks,
-                    rw_block_size=block_size,
-                    rw_tq=T_q,
-                    rw_tk=T_k,
-                    rw_window_tokens=block_window,
                     **kwargs,
                 )
         else:
+            # Standard dense attention
             attn_out_masked, attn_weights_masked = attention_interface(
                 self,
                 query_states,
@@ -694,14 +878,16 @@ class LlamaAttention(nn.Module):
                 **kwargs,
             )
 
+        # ---- Output projection ----
+        attn_out = attn_out_masked.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_out)
+
         extra = {
             "estimator_log_probs": estimator_log_probs,
             "teacher_attention_probs": teacher_attention_probs,
         }
-        attn_out = attn_out_masked.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_out)
-
         return attn_output, attn_weights_masked, extra
+
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):

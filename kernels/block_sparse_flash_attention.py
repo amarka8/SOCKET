@@ -137,6 +137,91 @@ def random_walk_indices(
 
 
 @torch.no_grad()
+def random_walk_indices_from_block_probs(
+    random_walk_probs_blk: torch.Tensor,  # (B, Tb_q, Tb_k)
+    K: int,
+    q_quantile: float = 0.8,              # NOTE: currently unused in your code; keep or remove
+    enforce_causal_blocks: bool = True,
+    force_include_diagonal: bool = True,
+    window_blocks: int | None = None,
+) -> torch.Tensor:
+    assert random_walk_probs_blk.dim() == 3
+    B, Tb_q, Tb_k = random_walk_probs_blk.shape
+    device = random_walk_probs_blk.device
+    assert K > 0
+
+    num_rows, num_cols = Tb_q, Tb_k
+    scores = random_walk_probs_blk  # (B, num_rows, num_cols)
+
+    k_blks = torch.arange(num_cols, device=device)
+
+    if enforce_causal_blocks:
+        # in block space, row r can only attend to cols <= r (or <= mapped diag if rectangular)
+        q_last_blk = torch.arange(num_rows, device=device)  # (num_rows,)
+        max_kblk = torch.minimum(q_last_blk, torch.tensor(num_cols - 1, device=device))
+        valid = k_blks[None, :] <= max_kblk[:, None]        # (num_rows, num_cols)
+    else:
+        valid = torch.ones((num_rows, num_cols), device=device, dtype=torch.bool)
+
+    forced = torch.zeros((num_rows, num_cols), device=device, dtype=torch.bool)
+
+    if force_include_diagonal:
+        diag = torch.arange(num_rows, device=device).clamp(0, num_cols - 1)
+        forced[torch.arange(num_rows, device=device), diag] = True
+
+    if window_blocks is not None and window_blocks > 0:
+        diag_blk = torch.arange(num_rows, device=device)[:, None]
+        c = torch.arange(num_cols, device=device)[None, :]
+        win_lo = diag_blk - (window_blocks - 1)
+        window_mask = (c <= diag_blk) & (c >= win_lo)
+        forced |= window_mask
+
+    forced &= valid
+    forced[:, 0] = True
+    forced &= valid
+
+    # Stabilize topk (prefer recent blocks)
+    tie = (k_blks.to(scores.dtype) / max(1, num_cols))[None, None, :]
+    scores = scores + 1e-6 * tie
+
+    scores_valid = scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
+    scores_fill = scores_valid.masked_fill(forced.unsqueeze(0), float("-inf"))
+
+    K_eff = min(K, num_cols)
+    fill_idx = torch.topk(scores_fill, K_eff, dim=-1).indices
+    fill_scores = torch.gather(scores_fill, dim=-1, index=fill_idx)
+    fill_idx = torch.where(fill_scores.isneginf(), torch.zeros_like(fill_idx), fill_idx)
+
+    # forced list per row
+    forced_idx_list = [torch.nonzero(forced[r], as_tuple=False).flatten() for r in range(num_rows)]
+    maxF = max((t.numel() for t in forced_idx_list), default=0)
+    if maxF == 0:
+        forced_idx_b = torch.empty((B, num_rows, 0), device=device, dtype=torch.long)
+    else:
+        forced_pad = torch.full((num_rows, maxF), 0, device=device, dtype=torch.long)
+        for r, t in enumerate(forced_idx_list):
+            forced_pad[r, : t.numel()] = t
+        forced_idx_b = forced_pad.unsqueeze(0).expand(B, -1, -1)
+
+    idx_cat = torch.cat([forced_idx_b, fill_idx], dim=-1)
+    idx_cat, _ = torch.sort(idx_cat, dim=-1)
+
+    dup = idx_cat[..., 1:] == idx_cat[..., :-1]
+    idx_cat2 = idx_cat.clone()
+    idx_cat2[..., 1:] = torch.where(dup, torch.tensor(0, device=device, dtype=idx_cat2.dtype), idx_cat2[..., 1:])
+    idx_cat2, _ = torch.sort(idx_cat2, dim=-1)
+    idx_out = idx_cat2[..., :K_eff].contiguous()
+
+    if force_include_diagonal:
+        diag = torch.arange(num_rows, device=device).clamp(0, num_cols - 1).view(1, num_rows, 1).expand(B, -1, -1)
+        idx_out[..., 0:1] = diag
+
+    idx_out = torch.clamp(idx_out, 0, num_cols - 1)
+    idx_out, _ = torch.sort(idx_out, dim=-1)
+    return idx_out.to(torch.int32)
+
+
+@torch.no_grad()
 def expand_block_index_to_heads(block_index_brk: torch.Tensor, H: int) -> torch.Tensor:
     assert block_index_brk.dtype in (torch.int32, torch.int64)
     B, R, K = block_index_brk.shape
