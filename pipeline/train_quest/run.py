@@ -139,8 +139,16 @@ def run(configs, args, logger):
         pipeline_params["load_model_path"] = load_dir
         print(f"Loading from previous run epoch_{pipeline_params["resume"]}!")
 
-    if pipeline_params["model_name"] == "meta-llama/Meta-Llama-3-8B-Instruct" or pipeline_params["model_name"] == "meta-llama/Llama-3.2-3B-Instruct" or pipeline_params["model_name"] == "meta-llama/Llama-3.2-1B-Instruct":
-        model_name = pipeline_params["model_name"]
+    model_name = pipeline_params["model_name"]
+    use_smallworld = pipeline_params.get("method") == "smallworld"
+    is_llama_instruct = model_name in {
+        "meta-llama/Meta-Llama-3-8B-Instruct",
+        "meta-llama/Llama-3.2-3B-Instruct",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "meta-llama/Llama-3.1-8B-Instruct",
+    }
+
+    if use_smallworld and is_llama_instruct:
         llama_config = AutoConfig.from_pretrained(model_name)
 
         llama_config.use_topk_masker   = True
@@ -150,11 +158,13 @@ def run(configs, args, logger):
         llama_config.topk_tau          = 1.5
         llama_config.topk_soft_alpha   = 8.0
         llama_config.random_walk_hadamard_dim = pipeline_params.get("random_walk_hadamard_dim", 128)
-        model = LlamaForCausalLM.from_pretrained(model_name, config=llama_config)
+        model = LlamaForCausalLM.from_pretrained(
+            model_name, config=llama_config, torch_dtype=torch.bfloat16
+        )
         model.set_masker_mode(configs['pipeline_params']["train_mode"])
     else:
-        model = AutoModelForCausalLM.from_pretrained(pipeline_params["model_name"], device_map=None)
-    tokenizer = AutoTokenizer.from_pretrained(pipeline_params["model_name"])
+        model = AutoModelForCausalLM.from_pretrained(model_name, device_map=None, torch_dtype=torch.bfloat16)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
     loaded = False
@@ -253,7 +263,7 @@ def run(configs, args, logger):
         )
 
 
-    max_new_tokens = 256
+    max_new_tokens = eval_params["max_new_tokens"]
     total_train_steps = 0
     best_acc = 0
     collator = MyCollator(tokenizer, label_pad_token_id=-100)

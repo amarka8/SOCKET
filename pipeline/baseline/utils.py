@@ -13,13 +13,13 @@ def initialize_model_tokenizer(pipeline_params):
     if pipeline_params['use_flash_attn']:
         attn_implementation = 'flash_attention_2'
     else:
-        attn_implementation = 'eager'
+        attn_implementation = 'sdpa'
 
     if 'mamba' in pipeline_params['model_name'].lower():
         from transformers import MambaConfig, MambaForCausalLM
         model = MambaForCausalLM.from_pretrained(pipeline_params['model_name']).to("cuda")
     else:
-        model = AutoModelForCausalLM.from_pretrained(pipeline_params['model_name'], config=config, attn_implementation=attn_implementation, torch_dtype=torch.float16).to("cuda")
+        model = AutoModelForCausalLM.from_pretrained(pipeline_params['model_name'], config=config, attn_implementation=attn_implementation, torch_dtype=torch.bfloat16).to("cuda")
 
     tokenizer = AutoTokenizer.from_pretrained(pipeline_params['model_name'], padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token

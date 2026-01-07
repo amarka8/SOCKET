@@ -222,6 +222,7 @@ def get_val_dataset(
         input_ids = tokenizer.apply_chat_template(
             conversation, tokenize=True, add_generation_prompt=True
         )
+        
         max_len = config['pipeline_params']['max_model_len']
         if len(input_ids) > max_len:
             input_ids = input_ids[:max_len // 2] + input_ids[-max_len // 2:]

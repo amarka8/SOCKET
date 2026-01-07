@@ -99,17 +99,19 @@ def eval_longbench(config) -> Tuple[Dict, Dict]:
     all_classes = dataset[0]["all_classes"]
 
     model, tokenizer = initialize_model_tokenizer(pipeline_config)
+    model.eval()
     model.tokenizer = tokenizer
 
-    predictions, total_score = _generate_predictions(
-        dataset=dataset,
-        model=model,
-        tokenizer=tokenizer,
-        pipeline_config=pipeline_config,
-        eval_config=eval_config,
-        ground_truths=ground_truths,
-        all_classes=all_classes,
-    )
+    with torch.inference_mode():
+        predictions, total_score = _generate_predictions(
+            dataset=dataset,
+            model=model,
+            tokenizer=tokenizer,
+            pipeline_config=pipeline_config,
+            eval_config=eval_config,
+            ground_truths=ground_truths,
+            all_classes=all_classes,
+        )
 
     avg_score = 100.0 * total_score / max(len(predictions), 1)
     processed_result = {

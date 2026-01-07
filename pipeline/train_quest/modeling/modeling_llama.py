@@ -54,6 +54,38 @@ from deepspeed.runtime.activation_checkpointing.checkpointing import checkpoint 
 
 logger = logging.get_logger(__name__)
 
+def _torch_version_gte(target: str) -> bool:
+    try:
+        from packaging import version as pkg_version
+        return pkg_version.parse(torch.__version__) >= pkg_version.parse(target)
+    except Exception:
+        ver = torch.__version__.split("+", 1)[0]
+        parts = []
+        for part in ver.split("."):
+            num = ""
+            for ch in part:
+                if ch.isdigit():
+                    num += ch
+                else:
+                    break
+            parts.append(int(num) if num else 0)
+        target_parts = [int(p) for p in target.split(".")]
+        while len(parts) < len(target_parts):
+            parts.append(0)
+        return tuple(parts[: len(target_parts)]) >= tuple(target_parts)
+
+
+def _is_torch_xpu_available() -> bool:
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
+def _is_torch_npu_available() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+_is_torch_greater_or_equal_than_2_5 = _torch_version_gte("2.5")
+_is_torch_greater_or_equal_than_2_8 = _torch_version_gte("2.8")
+
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
@@ -172,6 +204,142 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def sdpa_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    rw_allow_blocks: Optional[torch.Tensor] = None,
+    rw_block_size: Optional[int] = None,
+    rw_tq: Optional[int] = None,
+    rw_tk: Optional[int] = None,
+    rw_window_tokens: Optional[int] = None,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    if kwargs.get("output_attentions", False):
+        logger.warning_once(
+            "`sdpa` attention does not support `output_attentions=True`. "
+            "Please set attention to `eager` if you want these features."
+        )
+    if hasattr(module, "num_key_value_groups"):
+        key = repeat_kv(key, module.num_key_value_groups)
+        value = repeat_kv(value, module.num_key_value_groups)
+
+    if _is_torch_npu_available():
+        if attention_mask is not None and attention_mask.dtype != torch.bool:
+            attention_mask = torch.logical_not(attention_mask.bool()).to(query.device)
+
+    if attention_mask is not None:
+        if attention_mask.dim() == 2:
+            attention_mask = attention_mask[:, None, None, :]
+        elif attention_mask.dim() == 3:
+            attention_mask = attention_mask.unsqueeze(1)
+        elif attention_mask.dim() == 4 and attention_mask.size(1) == 0:
+            attention_mask = attention_mask.new_zeros(
+                (attention_mask.size(0), 1, attention_mask.size(2), attention_mask.size(3))
+            )
+
+
+    sdpa_kwargs = {}
+    is_causal = False
+
+    if query.dim() == 4 and rw_allow_blocks is not None:
+        B, H, T_q, D = query.shape
+        token_window_mask = None
+        if rw_window_tokens is not None and rw_window_tokens > 0:
+            q_idx = torch.arange(T_q, device=query.device).view(T_q, 1)
+            k_idx = torch.arange(T_q if rw_tk is None else rw_tk, device=query.device).view(1, -1)
+            token_window_mask = (k_idx <= q_idx) & (k_idx >= (q_idx - rw_window_tokens + 1))
+            sink_mask = k_idx < rw_window_tokens
+            token_window_mask = token_window_mask | sink_mask
+        outputs = []
+        # import pdb
+        # import torch.distributed as dist
+        # dist.barrier()
+        # if dist.get_rank() == 0:
+        #     import pdb; pdb.set_trace()
+        # dist.barrier()
+        
+        for h in range(H):
+            q_h = query[:, h : h + 1, :, :]
+            k_h = key[:, h : h + 1, :, :]
+            v_h = value[:, h : h + 1, :, :]
+            if rw_allow_blocks is not None:
+                allow_blocks_h = rw_allow_blocks[:, h]
+                block_size = rw_block_size or 1
+                num_blocks_q, num_blocks_k = allow_blocks_h.shape[1], allow_blocks_h.shape[2]
+                allow_h = allow_blocks_h[:, :, None, :, None].expand(
+                    B, num_blocks_q, block_size, num_blocks_k, block_size
+                )
+                allow_h = allow_h.reshape(B, num_blocks_q * block_size, num_blocks_k * block_size)
+                allow_h = allow_h[:, : (rw_tq or T_q), : (rw_tk or allow_h.size(-1))]
+                # import pdb
+                # import torch.distributed as dist
+                # dist.barrier()
+                # if dist.get_rank() == 0:
+                #     import pdb; pdb.set_trace()
+                # dist.barrier()
+                if token_window_mask is not None:
+                    allow_h = allow_h | token_window_mask.unsqueeze(0)
+                if not module.training and h == 0:
+                    q_idx = torch.arange(allow_h.size(1), device=query.device).view(1, -1, 1)
+                    k_idx = torch.arange(allow_h.size(2), device=query.device).view(1, 1, -1)
+                    causal = k_idx <= q_idx
+                    allowed_causal = allow_h & causal
+                    density = allowed_causal.float().sum() / causal.float().sum()
+                    print(f"Layer {module.layer_idx}, [rw-mask] causal density={density.item():.2f}")
+                if attention_mask is None:
+                    mask_h = None
+                else:
+                    neg_inf = torch.finfo(attention_mask.dtype).min
+                    if attention_mask.dim() == 4 and attention_mask.size(1) == 1:
+                        mask_h = attention_mask[:, :1, :, :]
+                    else:
+                        mask_h = attention_mask[:, h : h + 1, :, :]
+                    mask_h = mask_h + (
+                        (~allow_h).unsqueeze(1).to(attention_mask.dtype) * neg_inf
+                    )
+            else:
+                if attention_mask is None:
+                    mask_h = None
+                elif attention_mask.dim() == 4:
+                    if attention_mask.size(1) == 1:
+                        mask_h = attention_mask[:, :1, :, :]
+                    else:
+                        mask_h = attention_mask[:, h : h + 1, :, :]
+                else:
+                    mask_h = attention_mask
+            
+            out_h = F.scaled_dot_product_attention(
+                q_h,
+                k_h,
+                v_h,
+                attn_mask=mask_h,
+                dropout_p=dropout,
+                scale=scaling,
+                is_causal=is_causal,
+                **sdpa_kwargs,
+            )
+            outputs.append(out_h)
+        attn_output = torch.cat(outputs, dim=1)
+    else:
+        attn_output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=dropout,
+            scale=scaling,
+            is_causal=is_causal,
+            **sdpa_kwargs,
+        )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, None
 
 
 def eager_attention_forward(
@@ -313,8 +481,9 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         if key_states.size(1) != query_states.size(1):
             key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-        q = self._hadamard_project(query_states.float(), self.random_walk_hadamard_dim)
-        k = self._hadamard_project(key_states.float(), self.random_walk_hadamard_dim)
+        proj_dtype = torch.bfloat16
+        q = self._hadamard_project(query_states.to(proj_dtype), self.random_walk_hadamard_dim)
+        k = self._hadamard_project(key_states.to(proj_dtype), self.random_walk_hadamard_dim)
         scale = q.size(-1) ** -0.5
         logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
         if attention_mask is not None:
@@ -330,8 +499,89 @@ class LlamaAttention(nn.Module):
         # dist.barrier()
         return pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
 
+    def _block_pool(self, x: torch.Tensor, block_size: int) -> torch.Tensor:
+        # x: (B, H, T, D) -> (B, H, T_blocks, D) via mean pooling
+        if block_size <= 1:
+            return x
+        B, H, T, D = x.shape
+        num_blocks = (T + block_size - 1) // block_size
+        pad = num_blocks * block_size - T
+        if pad:
+            x = F.pad(x, (0, 0, 0, pad), value=0.0)
+        x = x.view(B, H, num_blocks, block_size, D).mean(dim=3)
+        return x
+
+    def _hadamard_attention_probs_block(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        block_size: int,
+    ) -> torch.Tensor:
+        if key_states.size(1) != query_states.size(1):
+            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        q = self._block_pool(query_states, block_size)
+        k = self._block_pool(key_states, block_size)
+        proj_dtype = torch.bfloat16
+        q = self._hadamard_project(q.to(proj_dtype), self.random_walk_hadamard_dim)
+        k = self._hadamard_project(k.to(proj_dtype), self.random_walk_hadamard_dim)
+        scale = q.size(-1) ** -0.5
+        logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        if attention_mask is not None:
+            logits = logits + attention_mask
+        attn_probs = torch.softmax(logits.clamp(-10, 10), dim=-1)
+        pt_blk = attn_probs.sum(dim=1)
+        return pt_blk / (pt_blk.sum(dim=-1, keepdim=True) + 1e-12)
+
+    def _hadamard_attention_probs_block_per_head(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        block_size: int,
+    ) -> torch.Tensor:
+        if key_states.size(1) != query_states.size(1):
+            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        q = self._block_pool(query_states, block_size)
+        k = self._block_pool(key_states, block_size)
+        proj_dtype = torch.bfloat16
+        q = self._hadamard_project(q.to(proj_dtype), self.random_walk_hadamard_dim)
+        k = self._hadamard_project(k.to(proj_dtype), self.random_walk_hadamard_dim)
+        scale = q.size(-1) ** -0.5
+        logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        if attention_mask is not None:
+            logits = logits + attention_mask
+        attn_probs = torch.softmax(logits.clamp(-1, 1), dim=-1)
+        return attn_probs
+
+    def _hadamard_attention_probs_keyblock(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        block_size: int,
+    ) -> torch.Tensor:
+        if key_states.size(1) != query_states.size(1):
+            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        k = self._block_pool(key_states, block_size)
+        proj_dtype = torch.bfloat16
+        q = self._hadamard_project(query_states.to(proj_dtype), self.random_walk_hadamard_dim)
+        k = self._hadamard_project(k.to(proj_dtype), self.random_walk_hadamard_dim)
+        scale = q.size(-1) ** -0.5
+        logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        if attention_mask is not None:
+            logits = logits + attention_mask
+        attn_probs = torch.softmax(logits.clamp(-10, 10), dim=-1)
+        pt_qk = attn_probs.sum(dim=1)
+        return pt_qk / (pt_qk.sum(dim=-1, keepdim=True) + 1e-12)
+
     def _update_random_walk(self, attention_probs, past_key_values, runtime_states):
-        B, T_q, T_k = attention_probs.shape
+        per_head = attention_probs.dim() == 4
+        if per_head:
+            B, H, T_q, T_k = attention_probs.shape
+            attention_probs = attention_probs.reshape(B * H, T_q, T_k)
+        else:
+            B, T_q, T_k = attention_probs.shape
         states = self._get_random_walk_states(past_key_values, runtime_states)
         # BUG: when T_q == 1 and layer0
         prev = states.get(self.layer_idx - 1, None) if states is not None else None
@@ -357,7 +607,9 @@ class LlamaAttention(nn.Module):
         walk = state
         if states is not None:
             states[self.layer_idx] = walk.detach()
-        return walk
+        if not per_head:
+            return walk
+        return walk.view(B, H, T_q, T_k)
 
     def forward(
         self,
@@ -402,23 +654,15 @@ class LlamaAttention(nn.Module):
         # estimator_log_probs = torch.log_softmax(logits_tokens, dim=-1)
 
         # ===== (teacher, DENSE) =====
-        attention_interface: Callable = eager_attention_forward
+        attn_impl = "sdpa"
 
-        attn_out_dense, attn_weights_dense = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=None,                       
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+        if attn_impl == "sdpa":
+            attention_interface = sdpa_attention_forward
+        else:
+            attention_interface = eager_attention_forward
 
         # Teacher token-level probs over keys: (B,T_q,T_k)
-        teacher_attention_probs = self._hadamard_attention_probs(
-            query_states, key_states, attention_mask=None
-        )
+        teacher_attention_probs = None
 
         # pt_tok = attn_weights_dense.sum(dim=1) if attn_weights_dense.dim() == 4 else attn_weights_dense
         # teacher_attention_probs1 = pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
@@ -429,80 +673,84 @@ class LlamaAttention(nn.Module):
         #     import pdb; pdb.set_trace()
         # dist.barrier()
 
-        attn_out_masked = attn_out_dense
-        attn_weights_masked = attn_weights_dense
+        attn_out_masked = None
+        attn_weights_masked = None
 
-        if self.masker_mode == "inference_only" and self.random_walk_alpha is not None and T_q > 1:
+        if self.masker_mode == "inference_only" and self.random_walk_alpha is not None and T_q > 1 and self.layer_idx > 1:
+            block_size = self.random_walk_block_size or 1
+            teacher_attention_probs = self._hadamard_attention_probs_block_per_head(
+                query_states, key_states, attention_mask=None, block_size=block_size
+            )
             random_walk_probs = self._update_random_walk(
                 teacher_attention_probs.detach(), past_key_values, random_walk_states
             )
-            block_size = self.random_walk_block_size
-            if block_size is not None and block_size > 1:
-                num_blocks = (T_k + block_size - 1) // block_size
-                pad = num_blocks * block_size - T_k
-                if pad:
-                    random_walk_probs_padded = F.pad(random_walk_probs, (0, pad), value=0.0)
-                else:
-                    random_walk_probs_padded = random_walk_probs
-                # random_walk_probs_padded: (B, T_q, num_blocks * block_size)
-                block_sums = random_walk_probs_padded.view(B, T_q, num_blocks, block_size).sum(dim=-1)  # (B, T_q, num_blocks)
-                block_counts = torch.full((num_blocks,), block_size, device=device, dtype=block_sums.dtype)  # (num_blocks,)
-                block_counts[-1] = T_k - block_size * (num_blocks - 1)  # (num_blocks,), last block may be shorter
-                # TODO: Consider removing average
-                block_probs = block_sums / block_counts.view(1, 1, -1)  # (B, T_q, num_blocks)
-                th = torch.quantile(block_probs, 0.9, dim=-1, keepdim=True) if self.layer_idx > -1 and self.layer_idx % 2 == 1 else 0  # (B, T_q, 1)
+
+            if block_size > 1:
+                num_blocks_q = random_walk_probs.shape[2]
+                num_blocks_k = random_walk_probs.shape[3]
+                block_probs = random_walk_probs
+                q_idx = torch.arange(num_blocks_q, device=device).view(num_blocks_q, 1)
+                k_idx = torch.arange(num_blocks_k, device=device).view(1, num_blocks_k)
+                causal_blocks = (k_idx <= q_idx).view(1, 1, num_blocks_q, num_blocks_k)
+                masked_probs = block_probs.float().masked_fill(~causal_blocks, float("nan"))
+                th = torch.nanquantile(masked_probs, 0.8, dim=-1, keepdim=True)  # (B, H, T_qb, 1)
                 if isinstance(th, torch.Tensor):
-                    tail = min(block_size, th.shape[1])
+                    tail = min(block_size, th.shape[-2])
                     if tail > 0:
                         th = th.clone()
-                        th[:, -tail:, :] = 0
-                allow_blocks = block_probs >= th  # (B, T_q, num_blocks)
+                        th[:, :, -5:, :] = 0
+                allow_blocks = block_probs > th  # (B, H, T_qb, T_kb)
 
                 # This only works for prefill
-                # SLIDING WINDOW
+                # SLIDING WINDOW (token-level)
                 block_window = self.random_walk_window
                 if block_window is not None and 0 < block_window < 1:
-                    block_window = max(1, int(block_window * num_blocks))
-                if block_window is not None and block_window > 0:
-                    q_block = (torch.arange(T_q, device=device) // block_size).view(T_q, 1)  # (T_q, 1)
-                    k_block = torch.arange(num_blocks, device=device).view(1, num_blocks)  # (1, num_blocks)
-                    block_window_mask = (k_block <= q_block) & (k_block >= (q_block - block_window + 1))  # (T_q, num_blocks)
-                    allow_blocks = allow_blocks | block_window_mask.unsqueeze(0)
-                allow = allow_blocks.unsqueeze(-1).expand(-1, -1, -1, block_size)  # (B, T_q, num_blocks, block_size)
-                allow = allow.reshape(B, T_q, num_blocks * block_size)[..., :T_k]  # (B, T_q, T_k)
-                if not self.training:
-                    q_idx = torch.arange(T_q, device=device).view(1, T_q, 1)
-                    k_idx = torch.arange(T_k, device=device).view(1, 1, T_k)
-                    causal = k_idx <= q_idx
-                    allowed_causal = allow & causal
-                    density = allowed_causal.float().sum() / causal.float().sum()
-                    print(f"Layer {self.layer_idx}, [rw-mask] causal density={density.item():.2f}")
+                    block_window = max(1, int(block_window * T_k))
+            else:
+                allow_blocks = random_walk_probs >= 0
+                block_window = None
 
+            # if not self.training:
+            #     allow_dbg = allow_blocks.any(dim=1) if allow_blocks.dim() == 4 else allow_blocks
+            #     num_blocks = allow_dbg.shape[-1]
+            #     allow_dbg = allow_dbg[:, :, None, :, None].expand(
+            #         B, allow_dbg.shape[1], block_size, num_blocks, block_size
+            #     )
+            #     allow_dbg = allow_dbg.reshape(
+            #         B, allow_dbg.shape[1] * block_size, num_blocks * block_size
+            #     )
+            #     allow_dbg = allow_dbg[:, :T_q, :T_k]
+            #     q_idx = torch.arange(T_q, device=device).view(1, T_q, 1)
+            #     k_idx = torch.arange(T_k, device=device).view(1, 1, T_k)
+            #     causal = k_idx <= q_idx
+            #     allowed_causal = allow_dbg & causal
+            #     density = allowed_causal.float().sum() / causal.float().sum()
+            #     print(f"Layer {self.layer_idx}, [rw-mask] causal density={density.item():.2f}")
+
+            attn_mask_for_second = attention_mask
             
-            rw_bias = torch.zeros(
-                allow.size(0),
-                1,
-                allow.size(1),
-                allow.size(2),
-                device=allow.device,
-                dtype=query_states.dtype,
-            )
-            rw_bias.masked_fill_(~allow.unsqueeze(1), torch.finfo(query_states.dtype).min)
-            attn_mask_for_second = (
-                rw_bias if attention_mask is None else attention_mask + rw_bias
-            )
-            # import pdb
-            # import torch.distributed as dist
-            # dist.barrier()
-            # if dist.get_rank() == 0:
-            #     import pdb; pdb.set_trace()
-            # dist.barrier()
             attn_out_masked, attn_weights_masked = attention_interface(
                 self,
                 query_states,
                 key_states,
                 value_states,
                 attn_mask_for_second,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                rw_allow_blocks=allow_blocks,
+                rw_block_size=block_size,
+                rw_tq=T_q,
+                rw_tk=T_k,
+                rw_window_tokens=block_window,
+                **kwargs,
+            )
+        else:
+            attn_out_masked, attn_weights_masked = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=attention_mask,
                 dropout=0.0 if not self.training else self.attention_dropout,
                 scaling=self.scaling,
                 **kwargs,

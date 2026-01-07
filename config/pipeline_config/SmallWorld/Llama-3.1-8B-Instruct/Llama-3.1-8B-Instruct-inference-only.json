@@ -1,6 +1,6 @@
 {
         "pipeline_params": {
-                "method": "fafo",
+                "method": "smallworld",
                 "kv_cache_method": "stream-llm",
                 "model_name": "meta-llama/Llama-3.1-8B-Instruct",
                 "save_path": "/rhf/allocations/as143/el72/ckpts/LIM/Llama-3.1-8B-Instruct",
@@ -19,7 +19,7 @@
                 "num_epochs": 2,
                 "eval_period": 1,
                 "n_new_tokens": 1024,
-                "max_model_len": 8192,
+                "max_model_len": 128000,
                 "random_walk_hadamard_dim": 128,
                 "truncation_mode": "middle"
         }
