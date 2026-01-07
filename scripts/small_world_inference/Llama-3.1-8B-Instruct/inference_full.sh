@@ -30,9 +30,9 @@ datasets=(
 )
 
 for eval_dataset in "${datasets[@]}"; do
-    CUDA_VISIBLE_DEVICES=${cuda_devices} deepspeed --master_port 27600 pipeline/train_quest/main.py \
+    CUDA_VISIBLE_DEVICES=${cuda_devices} deepspeed --master_port 21600 pipeline/train_quest/main.py \
         --exp_desc ${task}_${train_dataset}_${model}_${method} \
-        --pipeline_config_dir config/pipeline_config/${method}/${model}/${model}-inference-32hadamard.json \
+        --pipeline_config_dir config/pipeline_config/${method}/${model}/${model}-inference-only.json \
         --eval_config_dir config/eval_config/${task}/${eval_dataset}.json \
         --train_config_dir config/train_config/train/${train_dataset}.json \
         --output_folder_dir ${output_dir_root}/${task}/${method}/${model}/${train_dataset}/${eval_dataset} \
