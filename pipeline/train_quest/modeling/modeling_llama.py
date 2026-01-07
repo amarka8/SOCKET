@@ -591,31 +591,97 @@ class LlamaAttention(nn.Module):
                 allow_blocks = block_probs > th  # (B, T_qb, T_kb)
 
                 # This only works for prefill
-                # SLIDING WINDOW (token-level)
+                # SLIDING WINDOW + SINK (token-level -> block-level)
                 block_window = self.random_walk_window
                 if block_window is not None and 0 < block_window < 1:
                     block_window = max(1, int(block_window * T_k))
+                if block_window is not None and block_window > 0:
+                    window_blocks = max(1, int((block_window + block_size - 1) // block_size))
+                    q_block = torch.arange(num_blocks_q, device=device).view(num_blocks_q, 1)
+                    k_block = torch.arange(num_blocks_k, device=device).view(1, num_blocks_k)
+                    window_mask = (k_block <= q_block) & (k_block >= (q_block - window_blocks + 1))
+                    sink_mask = k_block < window_blocks
+                    allow_blocks = allow_blocks | window_mask.unsqueeze(0) | sink_mask.unsqueeze(0)
             else:
                 allow_blocks = random_walk_probs >= 0
                 block_window = None
 
-            attn_mask_for_second = attention_mask
-            
-            attn_out_masked, attn_weights_masked = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attn_mask_for_second,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                rw_allow_blocks=allow_blocks,
-                rw_block_size=block_size,
-                rw_tq=T_q,
-                rw_tk=T_k,
-                rw_window_tokens=block_window,
-                **kwargs,
+            use_rw_kernel = (
+                (block_size > 1)
+                and (T_q == T_k)
+                and (past_key_values is None)
+                and query_states.is_cuda
+                and key_states.is_cuda
+                and value_states.is_cuda
+                and (query_states.dtype in (torch.float16, torch.bfloat16))
+                and (D in (16, 32, 64, 128))
             )
+
+            if use_rw_kernel:
+                try:
+                    from kernels.block_sparse_flash_attention import (
+                        block_mask_to_indices,
+                        expand_block_index_to_heads,
+                        random_walk_sparse_attention,
+                    )
+                except Exception as exc:
+                    logger.warning_once(
+                        "block_sparse_flash_attention import failed; falling back to sdpa. "
+                        f"Reason: {exc}"
+                    )
+                    use_rw_kernel = False
+
+            if use_rw_kernel:
+                klist = int(getattr(self.config, "random_walk_kblocks", 0) or 0)
+                if klist <= 0:
+                    klist = None
+                blk_brk = block_mask_to_indices(
+                    allow_blocks=allow_blocks,
+                    block_m=block_size,
+                    block_n=block_size,
+                    K=klist,
+                    force_include_diagonal=True,
+                )
+                blk_bhrk = expand_block_index_to_heads(blk_brk, H=query_states.size(1))
+
+                key_full = repeat_kv(key_states, self.num_key_value_groups)
+                value_full = repeat_kv(value_states, self.num_key_value_groups)
+
+                if attention_mask is None:
+                    seqlens = torch.full((B,), T_k, device=device, dtype=torch.int32)
+                else:
+                    last_row = attention_mask[:, 0, -1, :]
+                    neg_inf = torch.finfo(last_row.dtype).min
+                    seqlens = (last_row > (neg_inf / 2)).sum(dim=-1).to(torch.int32)
+
+                out_bhtd = random_walk_sparse_attention(
+                    q=query_states,
+                    k=key_full,
+                    v=value_full,
+                    seqlens=seqlens,
+                    block_index=blk_bhrk,
+                    block_m=block_size,
+                    block_n=block_size,
+                )
+                attn_out_masked = out_bhtd.transpose(1, 2).contiguous()
+                attn_weights_masked = None
+            else:
+                attn_mask_for_second = attention_mask
+                attn_out_masked, attn_weights_masked = attention_interface(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask_for_second,
+                    dropout=0.0 if not self.training else self.attention_dropout,
+                    scaling=self.scaling,
+                    rw_allow_blocks=allow_blocks,
+                    rw_block_size=block_size,
+                    rw_tq=T_q,
+                    rw_tk=T_k,
+                    rw_window_tokens=block_window,
+                    **kwargs,
+                )
         else:
             attn_out_masked, attn_weights_masked = attention_interface(
                 self,
