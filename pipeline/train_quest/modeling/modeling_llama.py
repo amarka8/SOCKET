@@ -49,7 +49,14 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 
 from deepspeed.runtime.activation_checkpointing.checkpointing import checkpoint as ds_checkpoint
-
+import itertools
+import math
+import triton
+import triton.language as tl
+from kernels.cra_triton_kernels import (
+    prefill_with_triton,
+    insert_into_buckets_triton
+)
 
 logger = logging.get_logger(__name__)
 
@@ -366,527 +373,395 @@ class LlamaAttention(nn.Module):
 
         hidden_gate = getattr(config, "topk_hidden", max(256, self.head_dim))
         self.masker_mode = "joint"
-        self.random_walk_alpha = getattr(config, "random_walk_alpha", 0.001)
-        self.random_walk_window = getattr(config, "random_walk_window", 0.1)
-        self.random_walk_block_size = getattr(config, "random_walk_block_size", 64)
-        self.random_walk_hadamard_dim = getattr(config, "random_walk_hadamard_dim", 128)
-        print(f"Hadamard sketching dim is: {self.random_walk_hadamard_dim}")
 
-    def _get_random_walk_states(self, past_key_values, runtime_states):
+        self.bucket_K = getattr(config, "bucket_K", 4)           # P
+        self.bucket_L = getattr(config, "bucket_L", 2)           # L
+        self.bucket_top_t = getattr(config, "bucket_top_t", 4)
+        self.bucket_capacity = getattr(config, "bucket_capacity", 32)  # slots per bucket
+        self.bucket_heavy_size = getattr(config, "bucket_heavy_size", 256)  # Km budget
+        self.bucket_sink_tokens = getattr(config, "bucket_sink_tokens", 4)
+        self.bucket_window_tokens = getattr(config, "bucket_window_tokens", 256)
+        
+        self._planes_cache = {}
+        self._protos_cache = {}
+
+
+    def get_bucket_states(self, past_key_values, runtime_states):
+        """
+        Store per-layer state on the HF cache object when available, otherwise use runtime_states.
+        """
         if past_key_values is not None:
-            states = getattr(past_key_values, "random_walk_states", None)
+            states = getattr(past_key_values, "bucket_states", None)
             if states is None:
                 states = {}
-                setattr(past_key_values, "random_walk_states", states)
+                setattr(past_key_values, "bucket_states", states)
             return states
         return runtime_states
 
-    def _prepare_random_walk_state(self, prev, target_len, batch_size, dtype, device):
-        if prev is None or prev.size(0) != batch_size:
-            base = torch.eye(target_len, device=device, dtype=dtype).unsqueeze(0)
-            if batch_size > 1:
-                base = base.repeat(batch_size, 1, 1)
-            prev = base
+    def init_bucket_state(self, states, B, H, L, R, cap, device):
+        """
+        Allocate slots/counts lazily.
+        """
+        st = states.get(self.layer_idx, None)
+        if st is None:
+            st = {}
+            states[self.layer_idx] = st
+
+        slots = st.get("slots", None)
+        counts = st.get("counts", None)
+        v_norm = st.get("v_norm", None)
+
+        # slots: [B,H,L,R,cap], initialize -1
+        if slots is None or slots.shape[:4] != (B, H, L, R) or slots.shape[-1] != cap or slots.device != device:
+            slots = torch.full((B, H, L, R, cap), -1, device=device, dtype=torch.int32)
+            counts = torch.zeros((B, H, L, R), device=device, dtype=torch.int32)
+            v_norm = None  # will be rebuilt/extended
+            st["slots"] = slots
+            st["counts"] = counts
+            st["v_norm"] = v_norm
         else:
-            prev = prev.to(device=device, dtype=dtype)
-            prev_len = prev.size(-1)
-            if prev_len < target_len:
-                pad = target_len - prev_len
-                base = torch.eye(target_len, device=device, dtype=dtype).unsqueeze(0)
-                if batch_size > 1:
-                    base = base.repeat(batch_size, 1, 1)
-                base[:, :prev_len, :prev_len] = prev
-                prev = base
-            elif prev_len > target_len:
-                prev = prev[:, :target_len, :target_len]
-        return prev
+            # ensure counts exists
+            if counts is None:
+                counts = torch.zeros((B, H, L, R), device=device, dtype=torch.int32)
+                st["counts"] = counts
 
-    def _fwht(self, x: torch.Tensor) -> torch.Tensor:
-        n = x.size(-1)
-        y = x.reshape(-1, n)
-        h = 1
-        while h < n:
-            y = y.view(-1, n // (2 * h), 2 * h)
-            a = y[..., :h].clone()
-            b = y[..., h : 2 * h]
-            y[..., :h] = a + b
-            y[..., h : 2 * h] = a - b
-            h *= 2
-        return y.view(*x.shape)
+        return st
 
-    def _hadamard_project(self, x: torch.Tensor, proj_dim: int) -> torch.Tensor:
-        n = x.size(-1)
-        n_pow2 = 1 << (n - 1).bit_length()
-        if n_pow2 != n:
-            x = F.pad(x, (0, n_pow2 - n), value=0.0)
-        sign = torch.randint(0, 2, (1, x.size(1), 1, n_pow2), device=x.device, dtype=torch.int8)
-        sign = sign.to(x.dtype) * 2 - 1
-        x = x * sign
-        x = self._fwht(x)
-        proj_dim = min(proj_dim, n_pow2)
-        x = x / ((n_pow2 / proj_dim) ** 0.5)
-        idx = torch.randperm(n_pow2, device=x.device)[:proj_dim]
-        return x.index_select(-1, idx)
-
-    def _hadamard_attention_probs(
+    def get_hyper_planes(
         self,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        cache,
+        D: int,
+        L: int,
+        P: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        rng: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        if key_states.size(1) != query_states.size(1):
-            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-        proj_dtype = torch.bfloat16
-        q = self._hadamard_project(query_states.to(proj_dtype), self.random_walk_hadamard_dim)
-        k = self._hadamard_project(key_states.to(proj_dtype), self.random_walk_hadamard_dim)
-        scale = q.size(-1) ** -0.5
-        logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
-        if attention_mask is not None:
-            logits = logits + attention_mask
-        # If softmax here, many outliers make most of the numbers become 0 -> clamp
-        attn_probs = torch.softmax(logits.clamp(-10, 10), dim=-1)
-        pt_tok = attn_probs.sum(dim=1)
-        # import pdb
-        # import torch.distributed as dist
-        # dist.barrier()
-        # if dist.get_rank() == 0:
-        #     import pdb; pdb.set_trace()
-        # dist.barrier()
-        return pt_tok / (pt_tok.sum(dim=-1, keepdim=True) + 1e-12)
+        """
+        Independent SRP planes per table:
+            planes: [L, P, D]
 
-    def _block_pool(self, x: torch.Tensor, block_size: int) -> torch.Tensor:
-        # x: (B, H, T, D) -> (B, H, T_blocks, D) via mean pooling
-        if block_size <= 1:
-            return x
-        B, H, T, D = x.shape
-        num_blocks = (T + block_size - 1) // block_size
-        pad = num_blocks * block_size - T
-        if pad:
-            x = F.pad(x, (0, 0, 0, pad), value=0.0)
-        x = x.view(B, H, num_blocks, block_size, D).mean(dim=3)
-        return x
+        Memoized by (D, device, dtype, L, P).
+        """
+        key = (D, device, dtype, L, P)
+        planes = cache.get(key)
+        if planes is None:
+            base = torch.randn((L, P, D), device=device, dtype=torch.float32, generator=rng)
+            planes = base.to(dtype)
+            cache[key] = planes
+        return planes
 
-    def _hadamard_attention_probs_block(
+
+    def get_protos_T(
         self,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        block_size: int,
+        cache,
+        P: int,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> torch.Tensor:
-        if key_states.size(1) != query_states.size(1):
-            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-        q = self._block_pool(query_states, block_size)
-        k = self._block_pool(key_states, block_size)
-        proj_dtype = torch.bfloat16
-        q = self._hadamard_project(q.to(proj_dtype), self.random_walk_hadamard_dim)
-        k = self._hadamard_project(k.to(proj_dtype), self.random_walk_hadamard_dim)
-        scale = q.size(-1) ** -0.5
-        logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale
-        if attention_mask is not None:
-            logits = logits + attention_mask
-        attn_probs = torch.softmax(logits.clamp(-10, 10), dim=-1)
-        pt_blk = attn_probs.sum(dim=1)
-        return pt_blk / (pt_blk.sum(dim=-1, keepdim=True) + 1e-12)
+        """
+        Hypercube corners: protos_T in {-1,+1}^P, shape [P, R], where R = 2^P.
+        Memoized by (P, device, dtype).
+        """
+        key = (P, device, dtype)
+        protos_T = cache.get(key)
+        if protos_T is None:
+            corners = torch.tensor(
+                list(itertools.product([-1.0, +1.0], repeat=P)),
+                device=device,
+                dtype=torch.float32,
+            )  # [R, P]
+            protos_T = corners.t().to(dtype)  # [P, R]
+            cache[key] = protos_T
+        return protos_T
 
 
-    def _update_random_walk(self, attention_probs, past_key_values, runtime_states):
-        per_head = attention_probs.dim() == 4
-        if per_head:
-            B, H, T_q, T_k = attention_probs.shape
-            attention_probs = attention_probs.reshape(B * H, T_q, T_k)
-        else:
-            B, T_q, T_k = attention_probs.shape
-        states = self._get_random_walk_states(past_key_values, runtime_states)
-        # BUG: when T_q == 1 and layer0
-        prev = states.get(self.layer_idx - 1, None) if states is not None else None
-        if prev is None:
-            state = attention_probs
-        else:
-            state = self._prepare_random_walk_state(
-                prev=prev,
-                target_len=T_k,
-                batch_size=B,
-                dtype=attention_probs.dtype,
-                device=attention_probs.device,
-            )
-        
-        for i in range(3):
-            state = torch.matmul(state, attention_probs)
-        walk = state
-        if states is not None:
-            states[self.layer_idx] = walk.detach()
-        if not per_head:
-            return walk
-        return walk.view(B, H, T_q, T_k)
+    def pack_bits(self, bits: torch.Tensor) -> torch.Tensor:
+        """
+        Pack last-dim bits into integer codes (big-endian).
+        bits: [..., P] bool
+        returns: [...] int16
+        """
+        P = bits.shape[-1]
+        weights = (1 << torch.arange(P - 1, -1, -1, device=bits.device, dtype=torch.int16))  # [P]
+        view_shape = (*([1] * (bits.ndim - 1)), P)
+        return torch.sum(bits.to(torch.int16) * weights.view(*view_shape), dim=-1)
 
-    # def forward(
-    #     self,
-    #     hidden_states: torch.Tensor,                           # (B, T, hidden_size)
-    #     position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    #     attention_mask: Optional[torch.Tensor],
-    #     past_key_values: Optional["Cache"] = None,
-    #     cache_position: Optional[torch.LongTensor] = None,
-    #     random_walk_states: Optional[dict] = None,
-    #     **kwargs,
-    # ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-    #     input_shape = hidden_states.shape[:-1]
-    #     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    #     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H,T_q,D)
-    #     key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H_kv,T_k,D)
-    #     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    def hard_hash(self, tensor: torch.Tensor, planes: torch.Tensor) -> torch.Tensor:
+        """
+        tensor: [B, H, N, D]
+        planes: [L, P, D]
+        returns bucket codes per table: [B, H, L, N]
+        """
+        # proj: [B, H, N, L, P]
+        proj = torch.einsum("bhnd,lkd->bhnlk", tensor, planes)
+        bits = proj >= 0  # [B, H, N, L, P] bool
+        codes = self.pack_bits(bits)  # [B, H, N, L] int16
+        return codes.permute(0, 1, 3, 2).contiguous()  # [B, H, L, N]
 
-    #     cos, sin = position_embeddings
-    #     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    #     if past_key_values is not None:
-    #         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-    #         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+    def soft_hash(
+        self,
+        queries: torch.Tensor,
+        planes: torch.Tensor,
+        protos_T: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        queries:   [B, H, Q, D]
+        planes:    [L, P, D]
+        protos_T:  [P, R]
+        returns soft bucket probabilities: [B, H, Q, L, R]
+        """
+        # q_proj: [B, H, Q, L, P]
+        q_proj = torch.einsum("bhqd,lkd->bhqlk", queries, planes)
 
-    #     if self.num_key_value_groups > 1:
-    #         B, H_kv, T_k, D = key_states.shape
-    #         H = query_states.size(1)
-    #         # repeat = H // H_kv
-    #     else:
-    #         B, H, T_k, D = key_states.shape
-    #         H = query_states.size(1)
+        temp = math.sqrt(queries.size(-1))
+        qh = torch.tanh(q_proj) / max(temp, 1e-6)
 
-    #     B, H, T_q, D = query_states.shape
-    #     device = hidden_states.device
+        # logits: [B, H, Q, L, R]
+        logits = torch.einsum("bhqlk,kr->bhqlr", qh, protos_T)
+        return F.softmax(logits, dim=-1)
 
-    #     estimator_log_probs = None
-    #     attn_impl = "sdpa"
-    #     if attn_impl == "sdpa":
-    #         attention_interface = sdpa_attention_forward
-    #     else:
-    #         attention_interface = eager_attention_forward
-    #     # Teacher token-level probs over keys: (B,T_q,T_k)
-    #     teacher_attention_probs = None
-    #     attn_out_masked = None
-    #     attn_weights_masked = None
 
-    #     if self.masker_mode == "inference_only" and self.random_walk_alpha is not None and T_q > 1 and self.layer_idx > 1:
-    #         block_size = self.random_walk_block_size or 1
-    #         teacher_attention_probs = self._hadamard_attention_probs_block(
-    #             query_states, key_states, attention_mask=None, block_size=block_size
-    #         )
-    #         random_walk_probs = self._update_random_walk(
-    #             teacher_attention_probs.detach(), past_key_values, random_walk_states
-    #         )
+    def insert_into_buckets(self, slots, counts, key_buckets_for_pos, pos_idx):
+        insert_into_buckets_triton(slots, counts, key_buckets_for_pos, int(pos_idx))
 
-    #         if block_size > 1:
-    #             num_blocks_q = random_walk_probs.shape[1]
-    #             num_blocks_k = random_walk_probs.shape[2]
-    #             block_probs = random_walk_probs
-    #             q_idx = torch.arange(num_blocks_q, device=device).view(num_blocks_q, 1)
-    #             k_idx = torch.arange(num_blocks_k, device=device).view(1, num_blocks_k)
-    #             causal_blocks = (k_idx <= q_idx).view(1, num_blocks_q, num_blocks_k)
-    #             masked_probs = block_probs.float().masked_fill(~causal_blocks, float("nan"))
-    #             th = torch.nanquantile(masked_probs, 0.8, dim=-1, keepdim=True)  # (B, T_qb, 1)
-    #             if isinstance(th, torch.Tensor):
-    #                 tail = min(block_size, th.shape[-2])
-    #                 if tail > 0:
-    #                     th = th.clone()
-    #                     th[:, -5:, :] = 0
-    #             allow_blocks = block_probs > th  # (B, T_qb, T_kb)
 
-    #             # This only works for prefill
-    #             # SLIDING WINDOW + SINK (token-level -> block-level)
-    #             block_window = self.random_walk_window
-    #             if block_window is not None and 0 < block_window < 1:
-    #                 block_window = max(1, int(block_window * T_k))
-    #             if block_window is not None and block_window > 0:
-    #                 window_blocks = max(1, int((block_window + block_size - 1) // block_size))
-    #                 q_block = torch.arange(num_blocks_q, device=device).view(num_blocks_q, 1)
-    #                 k_block = torch.arange(num_blocks_k, device=device).view(1, num_blocks_k)
-    #                 window_mask = (k_block <= q_block) & (k_block >= (q_block - window_blocks + 1))
-    #                 sink_mask = k_block < window_blocks
-    #                 allow_blocks = allow_blocks | window_mask.unsqueeze(0) | sink_mask.unsqueeze(0)
-    #         else:
-    #             allow_blocks = random_walk_probs >= 0
-    #             block_window = None
+    # -------------------------
+    # Gathered attention
+    # -------------------------
+    def gathered_attention(self, q, k, v, idx, scaling, dropout_p: float, training: bool):
+        """
+        q:   [B,H,Q,D]
+        k,v: [B,H,T,D]
+        idx: [B,H,Q,Km] token indices into T dimension (must be valid)
+        Returns: out [B,H,Q,D]
+        """
+        B, H, Q, D = q.shape
+        Km = idx.shape[-1]
 
-    #         use_rw_kernel = (
-    #             (block_size > 1)
-    #             and (T_q == T_k)
-    #             and query_states.is_cuda
-    #             and key_states.is_cuda
-    #             and value_states.is_cuda
-    #             and (query_states.dtype in (torch.float16, torch.bfloat16))
-    #             and (D in (16, 32, 64, 128))
-    #         )
+        # Gather K/V: [B,H,Q,Km,D]
+        idx_exp = idx.unsqueeze(-1).expand(B, H, Q, Km, D)
+        k_sel = torch.gather(k.unsqueeze(2).expand(B, H, Q, k.size(2), D), dim=3, index=idx_exp)
+        v_sel = torch.gather(v.unsqueeze(2).expand(B, H, Q, v.size(2), D), dim=3, index=idx_exp)
 
-    #         if use_rw_kernel:
-    #             try:
-    #                 from kernels.block_sparse_flash_attention import (
-    #                     block_mask_to_indices,
-    #                     expand_block_index_to_heads,
-    #                     random_walk_sparse_attention,
-    #                 )
-    #             except Exception as exc:
-    #                 logger.warning_once(
-    #                     "block_sparse_flash_attention import failed; falling back to sdpa. "
-    #                     f"Reason: {exc}"
-    #                 )
-    #                 use_rw_kernel = False
+        # logits: [B,H,Q,Km]
+        logits = torch.einsum("bhqd,bhqkd->bhqk", q, k_sel) * scaling
+        attn = torch.softmax(logits, dim=-1)
+        if dropout_p > 0 and training:
+            attn = F.dropout(attn, p=dropout_p, training=True)
 
-    #         if use_rw_kernel:
-    #             klist = int(getattr(self.config, "random_walk_kblocks", 0) or 0)
-    #             if klist <= 0:
-    #                 klist = None
-    #             blk_brk = block_mask_to_indices(
-    #                 allow_blocks=allow_blocks,
-    #                 block_m=block_size,
-    #                 block_n=block_size,
-    #                 K=klist,
-    #                 force_include_diagonal=True,
-    #             )
-    #             blk_bhrk = expand_block_index_to_heads(blk_brk, H=query_states.size(1))
+        out = torch.einsum("bhqk,bhqkd->bhqd", attn, v_sel)
+        return out
 
-    #             key_full = repeat_kv(key_states, self.num_key_value_groups)
-    #             value_full = repeat_kv(value_states, self.num_key_value_groups)
 
-    #             if attention_mask is None:
-    #                 seqlens = torch.full((B,), T_k, device=device, dtype=torch.int32)
-    #             else:
-    #                 last_row = attention_mask[:, 0, -1, :]
-    #                 neg_inf = torch.finfo(last_row.dtype).min
-    #                 seqlens = (last_row > (neg_inf / 2)).sum(dim=-1).to(torch.int32)
-
-    #             out_bhtd = random_walk_sparse_attention(
-    #                 q=query_states,
-    #                 k=key_full,
-    #                 v=value_full,
-    #                 seqlens=seqlens,
-    #                 block_index=blk_bhrk,
-    #                 block_m=block_size,
-    #                 block_n=block_size,
-    #             )
-    #             attn_out_masked = out_bhtd.transpose(1, 2).contiguous()
-    #             attn_weights_masked = None
-    #         else:
-    #             attn_mask_for_second = attention_mask
-    #             attn_out_masked, attn_weights_masked = attention_interface(
-    #                 self,
-    #                 query_states,
-    #                 key_states,
-    #                 value_states,
-    #                 attn_mask_for_second,
-    #                 dropout=0.0 if not self.training else self.attention_dropout,
-    #                 scaling=self.scaling,
-    #                 rw_allow_blocks=allow_blocks,
-    #                 rw_block_size=block_size,
-    #                 rw_tq=T_q,
-    #                 rw_tk=T_k,
-    #                 rw_window_tokens=block_window,
-    #                 **kwargs,
-    #             )
-    #     else:
-    #         attn_out_masked, attn_weights_masked = attention_interface(
-    #             self,
-    #             query_states,
-    #             key_states,
-    #             value_states,
-    #             attention_mask=attention_mask,
-    #             dropout=0.0 if not self.training else self.attention_dropout,
-    #             scaling=self.scaling,
-    #             **kwargs,
-    #         )
-
-    #     extra = {
-    #         "estimator_log_probs": estimator_log_probs,
-    #         "teacher_attention_probs": teacher_attention_probs,
-    #     }
-    #     attn_out = attn_out_masked.reshape(*input_shape, -1).contiguous()
-    #     attn_output = self.o_proj(attn_out)
-
-    #     return attn_output, attn_weights_masked, extra
-
+    # -----------------------------------------------------------------------------
+    # Your forward with Triton-integrated PREFILL (no Python for pos in range(T_k))
+    # -----------------------------------------------------------------------------
     def forward(
         self,
-        hidden_states: torch.Tensor,                           # (B, T, hidden_size)
+        hidden_states: torch.Tensor,                           # (B,T,hidden)
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional["Cache"] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        random_walk_states: Optional[dict] = None,
+        attention_mask: torch.Tensor | None,                   # additive [B,1,T_q,T_k]
+        past_key_values=None,
+        cache_position=None,
+        random_walk_states: dict | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-        """
-        Clean, V1-like integration:
-        - teacher probs computed via Hadamard sketch (token-level, (B,T,T))
-        - random-walk update in token space
-        - block indices built via random_walk_indices (never -1, causal, diag+sink)
-        - Triton block-sparse kernel used ONLY for prefill (T_q==T_k) and empty cache
-        - SDPA fallback when kernel isn't applicable
-        """
+    ):
+        # ---- projections ----
         input_shape = hidden_states.shape[:-1]
+        B, T_q, _ = hidden_states.shape
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        # ---- Projections ----
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H,T_q,D)
-        key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H_kv,T_k,D)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)   # (B,H_kv,T_k,D)
+        q = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,H,T_q,D]
+        k = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,H_kv,T_q,D]
+        v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,H_kv,T_q,D]
 
         # ---- RoPE ----
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # ---- KV cache update (prefill/decode) ----
+        # ---- cache update ----
         past_len = 0
         if past_key_values is not None:
             past_len = past_key_values.get_seq_length()
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+            k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
-        # Shapes
-        B, H, T_q, D = query_states.shape
-        T_k = key_states.shape[2]
-        device = query_states.device
+        # Expand KV heads to full heads
+        H = q.size(1)
+        k_full = repeat_kv(k, self.num_key_value_groups)  # [B,H,T_k,D]
+        v_full = repeat_kv(v, self.num_key_value_groups)  # [B,H,T_k,D]
+        T_k = k_full.size(2)
+        D = k_full.size(-1)
+        device = q.device
 
-        # ---- Attention backend ----
-        attention_interface = sdpa_attention_forward  # or eager_attention_forward
-        estimator_log_probs = None
-        teacher_attention_probs = None
+        # ---- bucket params ----
+        P = int(getattr(self, "bucket_K", 7))
+        R = 1 << P
+        L = int(getattr(self, "bucket_L", 33))
+        top_t = int(getattr(self, "bucket_top_t", 20))
+        cap = int(getattr(self, "bucket_capacity", (T_k//R)))
+        sink = int(getattr(self, "bucket_sink_tokens", 128))
+        window = int(getattr(self, "bucket_window_tokens", 128))
 
-        attn_out_masked = None
-        attn_weights_masked = None
+        top_t = max(1, min(top_t, R))
+        sink = max(0, sink)
+        window = max(0, window)
 
-        # ---- Random-walk sparse path (prefill-only) ----
-        do_rw = (
-            (self.masker_mode == "inference_only")
-            and (self.random_walk_alpha is not None)
-            and (T_q > 1)
+        # ---- get planes/protos (cached) ----
+        planes = self.get_hyper_planes(
+            cache=self._planes_cache,
+            D=D,
+            L=L,
+            P=P,
+            device=device,
+            dtype=k_full.dtype,
+            rng=None,
+        )  # [L,P,D]
+        protosT = self.get_protos_T(
+            cache=self._protos_cache,
+            P=P,
+            device=device,
+            dtype=k_full.dtype,
+        )  # [P,R]
+
+        # ---- bucket state (on cache or runtime dict) ----
+        bucket_states = self.get_bucket_states(
+            past_key_values,
+            random_walk_states if random_walk_states is not None else {},
         )
+        st = self.init_bucket_state(bucket_states, B=B, H=H, L=L, R=R, cap=cap, device=device)
+        slots = st["slots"]     # [B,H,L,R,cap] int32
+        counts = st["counts"]   # [B,H,L,R] int32
+        v_norm = st.get("v_norm", None)
 
-        if do_rw:
-            print("INSIDE RANDOM WALK ATTENTION PATH")
-            block_size = int(getattr(self, "random_walk_block_size", 64) or 64)
-            if block_size <= 1:
-                block_size = 1
+        # Decide mode
+        is_prefill = (past_len == 0) and (T_q == T_k) and (T_q > 1)
+        is_decode = (T_q == 1) and (T_k >= 1)
 
-            # 1) block-level teacher probs: (B, Tb, Tb)
-            teacher_attention_probs = self._hadamard_attention_probs_block(
-                query_states, key_states, attention_mask=None, block_size=block_size
-            )
+        # ---- compute value norms for current K/V ----
+        if v_norm is not None:
+            if v_norm.device != device or v_norm.shape[:2] != (B, H):
+                v_norm = None
 
-            # 2) random walk in block space: (B, Tb, Tb)
-            rw = self._update_random_walk(
-                teacher_attention_probs.detach(), past_key_values, random_walk_states
-            )
-
-            # 3) kernel gating (prefill only)
-            use_rw_kernel = (
-                (block_size > 1)
-                and (T_q == T_k)
-                and (past_len == 0)
-                and query_states.is_cuda and key_states.is_cuda and value_states.is_cuda
-                and (query_states.dtype in (torch.float16, torch.bfloat16))
-                and (D in (16, 32, 64, 128))
-            )
-
-            # 4) window_blocks in *blocks*
-            window_blocks = None
-            Tb = rw.size(-1)
-            rw_win = getattr(self, "random_walk_window", None)
-            if rw_win is not None:
-                if 0 < rw_win < 1:
-                    rw_win_tokens = max(1, int(rw_win * T_k))
-                else:
-                    rw_win_tokens = int(rw_win)
-                if rw_win_tokens > 0:
-                    window_blocks = max(1, (rw_win_tokens + block_size - 1) // block_size)
-                    window_blocks = min(window_blocks, Tb)
-
-            if use_rw_kernel:
-                try:
-                    from kernels.block_sparse_flash_attention import (
-                        expand_block_index_to_heads,
-                        random_walk_sparse_attention,
-                        random_walk_indices_from_block_probs,
-                    )
-                except Exception as exc:
-                    logger.warning_once(
-                        "block_sparse_flash_attention import failed; falling back to sdpa. "
-                        f"Reason: {exc}"
-                    )
-                    use_rw_kernel = False
-
-            if use_rw_kernel:
-                KLIST = int(getattr(self.config, "random_walk_kblocks", 8) or 8)
-                if KLIST <= 0:
-                    KLIST = 8
-
-                # 5) build indices directly from block probs: (B, Tb, KLIST)
-                blk_brk = random_walk_indices_from_block_probs(
-                    random_walk_probs_blk=rw.float(),
-                    K=KLIST,
-                    enforce_causal_blocks=True,
-                    force_include_diagonal=True,
-                    window_blocks=window_blocks,
-                )
-                blk_bhrk = expand_block_index_to_heads(blk_brk, H=H)  # (B,H,Tb,KLIST)
-
-                # 6) expand kv heads to full heads
-                key_full = repeat_kv(key_states, self.num_key_value_groups)
-                value_full = repeat_kv(value_states, self.num_key_value_groups)
-
-                # 7) seqlens
-                if attention_mask is None:
-                    seqlens = torch.full((B,), T_k, device=device, dtype=torch.int32)
-                else:
-                    # attention_mask is additive (B,1,T_q,T_k)
-                    last_row = attention_mask[:, 0, -1, :]
-                    seqlens = torch.isfinite(last_row).sum(dim=-1).to(torch.int32)
-
-                # 8) run Triton kernel (returns (B,H,T,D))
-                out_bhtd = random_walk_sparse_attention(
-                    q=query_states,
-                    k=key_full,
-                    v=value_full,
-                    seqlens=seqlens,
-                    block_index=blk_bhrk,
-                    block_m=block_size,
-                    block_n=block_size,
-                )
-                attn_out_masked = out_bhtd.transpose(1, 2).contiguous()  # (B,T,H,D)
-                attn_weights_masked = None
-            else:
-                # SDPA fallback: plain causal+pad mask (optionally you can add a RW mask here)
-                attn_out_masked, attn_weights_masked = attention_interface(
-                    self,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask=attention_mask,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    scaling=self.scaling,
-                    **kwargs,
-                )
+        if v_norm is None:
+            v_norm = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_full.dtype)  # [B,H,T_k]
+        elif v_norm.shape[-1] == T_k:
+            pass
+        elif is_decode and v_norm.shape[-1] == T_k - 1:
+            new_norm = torch.linalg.vector_norm(v_full[:, :, -1, :].float(), ord=2, dim=-1).to(v_full.dtype)  # [B,H]
+            v_norm = torch.cat([v_norm, new_norm.unsqueeze(-1)], dim=-1)
         else:
-            # Standard dense attention
-            attn_out_masked, attn_weights_masked = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                **kwargs,
-            )
+            v_norm = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_full.dtype)
 
-        # ---- Output projection ----
-        attn_out = attn_out_masked.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_out)
+        st["v_norm"] = v_norm
 
-        extra = {
-            "estimator_log_probs": estimator_log_probs,
-            "teacher_attention_probs": teacher_attention_probs,
+        # ---- PREFILL: build tables from scratch (Triton; no Python loop) ----
+        if is_prefill:
+            # hard hash all keys: [B,H,L,T_k]
+            key_buckets = self.hard_hash(k_full, planes)  # int16 [B,H,L,T_k]
+            # in-place build ring buffer tables
+            prefill_with_triton(slots, counts, key_buckets)
+
+        # ---- DECODE: insert only newest token (keep your proven PyTorch path) ----
+        elif is_decode:
+            newest = k_full[:, :, -1:, :]                          # [B,H,1,D]
+            bkt_new = self.hard_hash(newest, planes)[:, :, :, 0]   # [B,H,L]
+            self.insert_into_buckets(slots, counts, bkt_new, T_k - 1)
+
+        # ---- candidate selection ----
+        # correctness-first: sparse only for decode; for prefill we do dense SDPA.
+        if not is_decode:
+            attn_out = F.scaled_dot_product_attention(
+                q, k_full, v_full,
+                attn_mask=attention_mask,
+                dropout_p=0.0 if not self.training else self.attention_dropout,
+                scale=self.scaling,
+                is_causal=False,
+            )  # [B,H,T_q,D]
+            attn_out = attn_out.transpose(1, 2).contiguous()  # [B,T_q,H,D]
+            attn_out = attn_out.reshape(*input_shape, -1)
+            return self.o_proj(attn_out), None, {"bucket_sparse": False}
+
+        # ---- DECODE sparse path ----
+        if attention_mask is not None:
+            allowed_bool = torch.isfinite(attention_mask).expand(B, H, 1, T_k)
+        else:
+            allowed_bool = torch.ones((B, H, 1, T_k), device=device, dtype=torch.bool)
+
+        q_probs = self.soft_hash(q, planes, protosT)  # [B,H,1,L,R]
+        top_buckets = torch.topk(q_probs, k=top_t, dim=-1, largest=True).indices  # [B,H,1,L,top_t]
+
+        # collision counts over all keys: [B,H,T_k]
+        collision = torch.zeros((B, H, T_k), device=device, dtype=torch.int32)
+
+        buckets = top_buckets[:, :, 0, :, :].to(torch.long)  # [B,H,L,top_t]
+
+        b_ids = torch.arange(B, device=device)[:, None, None, None]
+        h_ids = torch.arange(H, device=device)[None, :, None, None]
+        l_ids = torch.arange(L, device=device)[None, None, :, None]
+
+        tok_list_all = slots[b_ids, h_ids, l_ids, buckets, :]   # [B,H,L,top_t,cap]
+        valid = tok_list_all >= 0
+        tok_idx = tok_list_all.clamp_min(0).to(torch.long)
+
+        tok_idx_flat = tok_idx.reshape(B, H, -1)
+        add_flat = valid.to(torch.int32).reshape(B, H, -1)
+        collision.scatter_add_(dim=2, index=tok_idx_flat, src=add_flat)
+
+        collision = collision.masked_fill(~allowed_bool[:, :, 0, :], 0)
+
+        cand = collision > 0
+
+        if sink > 0:
+            sink_idx = torch.arange(min(sink, T_k), device=device)
+            cand[:, :, sink_idx] = True
+
+        if window > 0:
+            start = max(0, T_k - window)
+            win_idx = torch.arange(start, T_k, device=device)
+            cand[:, :, win_idx] = True
+
+        cand = cand & allowed_bool[:, :, 0, :]
+
+        any_c = cand.any(dim=-1, keepdim=True)
+        if not any_c.all():
+            fallback0 = torch.zeros_like(cand)
+            fallback0[:, :, 0] = True
+            fallback0 = fallback0 & allowed_bool[:, :, 0, :]
+            cand = torch.where(any_c, cand, fallback0)
+
+        scores = collision.to(torch.float32) * v_norm.to(torch.float32)
+        scores = scores.masked_fill(~cand, float("-inf"))
+
+        Km = max(1, int(0.2 * T_k))
+
+        top_vals, top_idx = torch.topk(scores, k=Km, dim=-1, largest=True)
+        idx = top_idx.unsqueeze(2)  # [B,H,1,Km]
+
+        out = self.gathered_attention(
+            q=q,
+            k=k_full,
+            v=v_full,
+            idx=idx,
+            scaling=self.scaling,
+            dropout_p=0.0 if not self.training else self.attention_dropout,
+            training=self.training,
+        )  # [B,H,1,D]
+
+        out = out.transpose(1, 2).contiguous()  # [B,1,H,D]
+        out = out.reshape(B, 1, -1).contiguous()
+        out = self.o_proj(out)
+
+        return out, None, {
+            "bucket_sparse": True,
+            "Km": Km,
+            "sink": sink,
+            "window": window,
         }
-        return attn_output, attn_weights_masked, extra
+
 
 
 

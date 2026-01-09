@@ -2,7 +2,7 @@ output_dir_root=$1
 
 task="longbench"
 train_dataset="LongAlpaca-12k"
-eval_dataset="narrativeqa"
+eval_dataset="qasper"
 model="Llama-3.1-8B-Instruct"
 method="SmallWorld"
 
