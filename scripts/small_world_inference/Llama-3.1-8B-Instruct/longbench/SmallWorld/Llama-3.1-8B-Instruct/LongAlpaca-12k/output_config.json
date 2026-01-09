@@ -259,9 +259,9 @@
         "output_folder_dir": "/scratch/sj157/Small_World_Attention/scripts/small_world_inference/Llama-3.1-8B-Instruct/longbench/SmallWorld/Llama-3.1-8B-Instruct/LongAlpaca-12k/",
         "job_post_via": "slurm_sbatch",
         "slurm_info": {
-            "slurm_job_id": "75961",
+            "slurm_job_id": "76106",
             "slurm_job_name": "trial",
-            "slurm_out_file_dir": "/scratch/sj157/slurm-75961.out"
+            "slurm_out_file_dir": "/scratch/sj157/slurm-76106.out"
         },
         "sub_dir": {
             "input_config": "input_config/",
@@ -269,8 +269,8 @@
             "result_vis": "result_vis.png",
             "output_config": "output_config.json"
         },
-        "start_time": "2026-01-09 10:52:49.074509-06:00",
-        "end_time": "2026-01-09 11:00:56.053218-06:00",
-        "exp_duration": "0:08:06.978709"
+        "start_time": "2026-01-09 15:11:28.953206-06:00",
+        "end_time": "2026-01-09 15:19:41.916176-06:00",
+        "exp_duration": "0:08:12.962970"
     }
 }

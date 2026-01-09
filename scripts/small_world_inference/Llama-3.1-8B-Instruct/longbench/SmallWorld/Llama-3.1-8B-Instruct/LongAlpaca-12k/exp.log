@@ -1,5 +1,5 @@
-2026-01-09 10:52:49,132 | INFO : Experiment longbench_LongAlpaca-12k_Llama-3.1-8B-Instruct_SmallWorld (SEED=42) started at 2026-01-09 10:52:49.074509-06:00 with the following config: 
-2026-01-09 10:52:49,133 | INFO : {
+2026-01-09 15:11:28,990 | INFO : Experiment longbench_LongAlpaca-12k_Llama-3.1-8B-Instruct_SmallWorld (SEED=42) started at 2026-01-09 15:11:28.953206-06:00 with the following config: 
+2026-01-09 15:11:28,991 | INFO : {
     "pipeline_params": {
         "method": "smallworld",
         "kv_cache_method": "stream-llm",
@@ -53,9 +53,9 @@
         "output_folder_dir": "/scratch/sj157/Small_World_Attention/scripts/small_world_inference/Llama-3.1-8B-Instruct/longbench/SmallWorld/Llama-3.1-8B-Instruct/LongAlpaca-12k/",
         "job_post_via": "slurm_sbatch",
         "slurm_info": {
-            "slurm_job_id": "75961",
+            "slurm_job_id": "76106",
             "slurm_job_name": "trial",
-            "slurm_out_file_dir": "/scratch/sj157/slurm-75961.out"
+            "slurm_out_file_dir": "/scratch/sj157/slurm-76106.out"
         },
         "sub_dir": {
             "input_config": "input_config/",
@@ -65,14 +65,14 @@
         }
     }
 }
-2026-01-09 11:00:56,050 | INFO : raw_results file saved to /scratch/sj157/Small_World_Attention/scripts/small_world_inference/Llama-3.1-8B-Instruct/longbench/SmallWorld/Llama-3.1-8B-Instruct/LongAlpaca-12k/raw_results.json.
-2026-01-09 11:00:56,052 | INFO : Experiments concluded, below is the raw_results: 
-2026-01-09 11:00:56,052 | INFO : {
+2026-01-09 15:19:41,913 | INFO : raw_results file saved to /scratch/sj157/Small_World_Attention/scripts/small_world_inference/Llama-3.1-8B-Instruct/longbench/SmallWorld/Llama-3.1-8B-Instruct/LongAlpaca-12k/raw_results.json.
+2026-01-09 15:19:41,915 | INFO : Experiments concluded, below is the raw_results: 
+2026-01-09 15:19:41,915 | INFO : {
     "total_score": 51.02320098876953,
     "total": 200.0
 }
-2026-01-09 11:00:56,052 | INFO : ##### And below is the processed_results: #####
-2026-01-09 11:00:56,053 | INFO : {
+2026-01-09 15:19:41,915 | INFO : ##### And below is the processed_results: #####
+2026-01-09 15:19:41,916 | INFO : {
     "dataset": "qasper",
     "score": 25.5116024017334,
     "outputs": [
@@ -278,5 +278,5 @@
         "SimpleQuestions and WebQuestions."
     ]
 }
-2026-01-09 11:00:56,059 | INFO : output_config file saved to /scratch/sj157/Small_World_Attention/scripts/small_world_inference/Llama-3.1-8B-Instruct/longbench/SmallWorld/Llama-3.1-8B-Instruct/LongAlpaca-12k/output_config.json.
-2026-01-09 11:00:56,061 | INFO : Experiment longbench_LongAlpaca-12k_Llama-3.1-8B-Instruct_SmallWorld ended at 2026-01-09 11:00:56.053218-06:00. Duration: 0:08:06.978709
+2026-01-09 15:19:41,920 | INFO : output_config file saved to /scratch/sj157/Small_World_Attention/scripts/small_world_inference/Llama-3.1-8B-Instruct/longbench/SmallWorld/Llama-3.1-8B-Instruct/LongAlpaca-12k/output_config.json.
+2026-01-09 15:19:41,922 | INFO : Experiment longbench_LongAlpaca-12k_Llama-3.1-8B-Instruct_SmallWorld ended at 2026-01-09 15:19:41.916176-06:00. Duration: 0:08:12.962970

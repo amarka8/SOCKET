@@ -600,9 +600,9 @@ class LlamaAttention(nn.Module):
         # ---- bucket params ----
         P = int(getattr(self, "bucket_K", 7))
         R = 1 << P
-        L = int(getattr(self, "bucket_L", 33))
-        top_t = int(getattr(self, "bucket_top_t", 20))
-        cap = int(getattr(self, "bucket_capacity", (T_k//R)))
+        L = int(getattr(self, "bucket_L", 20))
+        top_t = int(getattr(self, "bucket_top_t", 8))
+        cap = int(getattr(self, "bucket_capacity", 3*(T_k//R)))
         sink = int(getattr(self, "bucket_sink_tokens", 128))
         window = int(getattr(self, "bucket_window_tokens", 128))
 
