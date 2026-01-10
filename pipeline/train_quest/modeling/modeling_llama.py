@@ -55,7 +55,10 @@ import triton
 import triton.language as tl
 from kernels.cra_triton_kernels import (
     prefill_with_triton,
-    insert_into_buckets_triton
+    insert_into_buckets_triton,
+    get_collision_counts_indexed,
+    build_inverted_index_csr,
+    attention_mask_to_allowed_prob
 )
 
 logger = logging.get_logger(__name__)
@@ -374,16 +377,32 @@ class LlamaAttention(nn.Module):
         hidden_gate = getattr(config, "topk_hidden", max(256, self.head_dim))
         self.masker_mode = "joint"
 
-        self.bucket_K = getattr(config, "bucket_K", 4)           # P
-        self.bucket_L = getattr(config, "bucket_L", 2)           # L
-        self.bucket_top_t = getattr(config, "bucket_top_t", 4)
-        self.bucket_capacity = getattr(config, "bucket_capacity", 32)  # slots per bucket
+        self.bucket_K = getattr(config, "bucket_K", 7)           # P
+        self.bucket_L = getattr(config, "bucket_L", 20)           # L
+        self.bucket_top_t = getattr(config, "bucket_top_t", 10)
         self.bucket_heavy_size = getattr(config, "bucket_heavy_size", 256)  # Km budget
         self.bucket_sink_tokens = getattr(config, "bucket_sink_tokens", 4)
         self.bucket_window_tokens = getattr(config, "bucket_window_tokens", 256)
         
         self._planes_cache = {}
         self._protos_cache = {}
+
+        # ---- RNG controls (for deterministic SRP plane init) ----
+        # If None: planes are initialized non-deterministically (PyTorch default RNG).
+        self._seed = 123456789
+        self._rng_cache: dict[torch.device, torch.Generator] = {}
+
+
+    def _rng(self, device: torch.device) -> Optional[torch.Generator]:
+        if self._seed is None:
+            return None
+        g = self._rng_cache.get(device)
+        if g is None:
+            g = torch.Generator(device=device)
+            # offset so this doesn't collide with other seeds in the model
+            g.manual_seed(int(self._seed) + 7777)
+            self._rng_cache[device] = g
+        return g
 
 
     def get_bucket_states(self, past_key_values, runtime_states):
@@ -561,15 +580,14 @@ class LlamaAttention(nn.Module):
     # -----------------------------------------------------------------------------
     def forward(
         self,
-        hidden_states: torch.Tensor,                           # (B,T,hidden)
+        hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None,                   # additive [B,1,T_q,T_k]
+        attention_mask: torch.Tensor | None,
         past_key_values=None,
         cache_position=None,
         random_walk_states: dict | None = None,
         **kwargs,
     ):
-        # ---- projections ----
         input_shape = hidden_states.shape[:-1]
         B, T_q, _ = hidden_states.shape
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -578,18 +596,15 @@ class LlamaAttention(nn.Module):
         k = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,H_kv,T_q,D]
         v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,H_kv,T_q,D]
 
-        # ---- RoPE ----
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # ---- cache update ----
         past_len = 0
         if past_key_values is not None:
             past_len = past_key_values.get_seq_length()
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
-        # Expand KV heads to full heads
         H = q.size(1)
         k_full = repeat_kv(k, self.num_key_value_groups)  # [B,H,T_k,D]
         v_full = repeat_kv(v, self.num_key_value_groups)  # [B,H,T_k,D]
@@ -597,82 +612,11 @@ class LlamaAttention(nn.Module):
         D = k_full.size(-1)
         device = q.device
 
-        # ---- bucket params ----
-        P = int(getattr(self, "bucket_K", 7))
-        R = 1 << P
-        L = int(getattr(self, "bucket_L", 20))
-        top_t = int(getattr(self, "bucket_top_t", 8))
-        cap = int(getattr(self, "bucket_capacity", 3*(T_k//R)))
-        sink = int(getattr(self, "bucket_sink_tokens", 128))
-        window = int(getattr(self, "bucket_window_tokens", 128))
-
-        top_t = max(1, min(top_t, R))
-        sink = max(0, sink)
-        window = max(0, window)
-
-        # ---- get planes/protos (cached) ----
-        planes = self.get_hyper_planes(
-            cache=self._planes_cache,
-            D=D,
-            L=L,
-            P=P,
-            device=device,
-            dtype=k_full.dtype,
-            rng=None,
-        )  # [L,P,D]
-        protosT = self.get_protos_T(
-            cache=self._protos_cache,
-            P=P,
-            device=device,
-            dtype=k_full.dtype,
-        )  # [P,R]
-
-        # ---- bucket state (on cache or runtime dict) ----
-        bucket_states = self.get_bucket_states(
-            past_key_values,
-            random_walk_states if random_walk_states is not None else {},
-        )
-        st = self.init_bucket_state(bucket_states, B=B, H=H, L=L, R=R, cap=cap, device=device)
-        slots = st["slots"]     # [B,H,L,R,cap] int32
-        counts = st["counts"]   # [B,H,L,R] int32
-        v_norm = st.get("v_norm", None)
-
         # Decide mode
         is_prefill = (past_len == 0) and (T_q == T_k) and (T_q > 1)
-        is_decode = (T_q == 1) and (T_k >= 1)
+        is_decode  = (T_q == 1) and (T_k >= 1)
 
-        # ---- compute value norms for current K/V ----
-        if v_norm is not None:
-            if v_norm.device != device or v_norm.shape[:2] != (B, H):
-                v_norm = None
-
-        if v_norm is None:
-            v_norm = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_full.dtype)  # [B,H,T_k]
-        elif v_norm.shape[-1] == T_k:
-            pass
-        elif is_decode and v_norm.shape[-1] == T_k - 1:
-            new_norm = torch.linalg.vector_norm(v_full[:, :, -1, :].float(), ord=2, dim=-1).to(v_full.dtype)  # [B,H]
-            v_norm = torch.cat([v_norm, new_norm.unsqueeze(-1)], dim=-1)
-        else:
-            v_norm = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_full.dtype)
-
-        st["v_norm"] = v_norm
-
-        # ---- PREFILL: build tables from scratch (Triton; no Python loop) ----
-        if is_prefill:
-            # hard hash all keys: [B,H,L,T_k]
-            key_buckets = self.hard_hash(k_full, planes)  # int16 [B,H,L,T_k]
-            # in-place build ring buffer tables
-            prefill_with_triton(slots, counts, key_buckets)
-
-        # ---- DECODE: insert only newest token (keep your proven PyTorch path) ----
-        elif is_decode:
-            newest = k_full[:, :, -1:, :]                          # [B,H,1,D]
-            bkt_new = self.hard_hash(newest, planes)[:, :, :, 0]   # [B,H,L]
-            self.insert_into_buckets(slots, counts, bkt_new, T_k - 1)
-
-        # ---- candidate selection ----
-        # correctness-first: sparse only for decode; for prefill we do dense SDPA.
+        # Dense for prefill (your choice)
         if not is_decode:
             attn_out = F.scaled_dot_product_attention(
                 q, k_full, v_full,
@@ -680,86 +624,123 @@ class LlamaAttention(nn.Module):
                 dropout_p=0.0 if not self.training else self.attention_dropout,
                 scale=self.scaling,
                 is_causal=False,
-            )  # [B,H,T_q,D]
-            attn_out = attn_out.transpose(1, 2).contiguous()  # [B,T_q,H,D]
-            attn_out = attn_out.reshape(*input_shape, -1)
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
             return self.o_proj(attn_out), None, {"bucket_sparse": False}
 
-        # ---- DECODE sparse path ----
-        if attention_mask is not None:
-            allowed_bool = torch.isfinite(attention_mask).expand(B, H, 1, T_k)
-        else:
-            allowed_bool = torch.ones((B, H, 1, T_k), device=device, dtype=torch.bool)
+        # ---------- bucket params ----------
+        P = int(getattr(self, "bucket_K", 7))
+        L = int(getattr(self, "bucket_L", 20))
+        top_t = int(getattr(self, "bucket_top_t", 10))
+        R = 1 << P
+        top_t = max(1, min(top_t, R))
 
+        # For correctness checking, use heavy_size (reference-ish) instead of 0.2*T_k
+        Km = min(int(getattr(self, "bucket_heavy_size", 256)), T_k)
+        Km = max(1, Km)
+
+        # planes/protos
+        planes = self.get_hyper_planes(
+            cache=self._planes_cache,
+            D=D, L=L, P=P,
+            device=device,
+            dtype=k_full.dtype,
+            rng=self._rng(device),
+        )
+        protosT = self.get_protos_T(
+            cache=self._protos_cache,
+            P=P,
+            device=device,
+            dtype=k_full.dtype,
+        )
+
+        # (optional but often stabilizes hashing)
+        # k_hash = F.normalize(k_full.float(), dim=-1)
+        # key_buckets = self.hard_hash(k_hash.to(k_full.dtype), planes)
+        key_buckets = self.hard_hash(k_full, planes)  # [B,H,L,T_k] int16
+
+        # Build CSR each step
+        perm, offsets = build_inverted_index_csr(key_buckets.to(torch.int64), R=R)
+
+        # Soft hash query
         q_probs = self.soft_hash(q, planes, protosT)  # [B,H,1,L,R]
         top_buckets = torch.topk(q_probs, k=top_t, dim=-1, largest=True).indices  # [B,H,1,L,top_t]
 
-        # collision counts over all keys: [B,H,T_k]
-        collision = torch.zeros((B, H, T_k), device=device, dtype=torch.int32)
+        # ---------- collision counts ----------
+        # Prefer your existing Triton implementation if present; fallback otherwise.
+        collision = None
+        try:
+            # if you have it imported from your bucket_utils:
+            # from .utils.bucket_utils import get_collision_counts_indexed
+            _, collision_i16 = get_collision_counts_indexed(
+                perm=perm,
+                offsets=offsets,
+                top_buckets=top_buckets,
+                N=T_k,
+            )  # [B,H,1,T_k] int16
+            collision = collision_i16.to(torch.int32)  # use int32 for scoring
+        except Exception:
+            collision = csr_collision_counts_pytorch(
+                perm=perm,
+                offsets=offsets,
+                top_buckets=top_buckets,
+                N=T_k,
+            )  # [B,H,1,T_k] int32
 
-        buckets = top_buckets[:, :, 0, :, :].to(torch.long)  # [B,H,L,top_t]
+        # ---------- attention mask gating ----------
+        if attention_mask is not None:
+            allowed_prob = attention_mask_to_allowed_prob(attention_mask, T_k)  # [B,1,1,T_k] or [B,1,T_q,T_k]
+            allowed_bool = (allowed_prob > 0).expand(B, H, 1, T_k)
+        else:
+            allowed_prob = None
+            allowed_bool = torch.ones((B, H, 1, T_k), device=device, dtype=torch.bool)
 
-        b_ids = torch.arange(B, device=device)[:, None, None, None]
-        h_ids = torch.arange(H, device=device)[None, :, None, None]
-        l_ids = torch.arange(L, device=device)[None, None, :, None]
+        collision = collision.masked_fill(~allowed_bool, 0)
+        cand = (collision > 0) & allowed_bool
 
-        tok_list_all = slots[b_ids, h_ids, l_ids, buckets, :]   # [B,H,L,top_t,cap]
-        valid = tok_list_all >= 0
-        tok_idx = tok_list_all.clamp_min(0).to(torch.long)
-
-        tok_idx_flat = tok_idx.reshape(B, H, -1)
-        add_flat = valid.to(torch.int32).reshape(B, H, -1)
-        collision.scatter_add_(dim=2, index=tok_idx_flat, src=add_flat)
-
-        collision = collision.masked_fill(~allowed_bool[:, :, 0, :], 0)
-
-        cand = collision > 0
+        sink = int(getattr(self, "bucket_sink_tokens", 0))
+        window = int(getattr(self, "bucket_window_tokens", 0))
 
         if sink > 0:
-            sink_idx = torch.arange(min(sink, T_k), device=device)
-            cand[:, :, sink_idx] = True
+            s = min(sink, T_k)
+            cand[:, :, 0, :s] = True
 
         if window > 0:
             start = max(0, T_k - window)
-            win_idx = torch.arange(start, T_k, device=device)
-            cand[:, :, win_idx] = True
+            cand[:, :, 0, start:T_k] = True
 
-        cand = cand & allowed_bool[:, :, 0, :]
+        cand = cand & allowed_bool
 
-        any_c = cand.any(dim=-1, keepdim=True)
-        if not any_c.all():
-            fallback0 = torch.zeros_like(cand)
-            fallback0[:, :, 0] = True
-            fallback0 = fallback0 & allowed_bool[:, :, 0, :]
-            cand = torch.where(any_c, cand, fallback0)
-
-        scores = collision.to(torch.float32) * v_norm.to(torch.float32)
+        # value norms
+        v_norm = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1)  # [B,H,T_k]
+        scores = collision.to(torch.float32) * v_norm.unsqueeze(2).to(torch.float32)  # [B,H,1,T_k]
         scores = scores.masked_fill(~cand, float("-inf"))
 
-        Km = max(1, int(0.2 * T_k))
+        # Top-k keys
+        top_idx = torch.topk(scores, k=Km, dim=-1, largest=True).indices  # [B,H,1,Km]
 
-        top_vals, top_idx = torch.topk(scores, k=Km, dim=-1, largest=True)
-        idx = top_idx.unsqueeze(2)  # [B,H,1,Km]
-
+        # Gathered attention
         out = self.gathered_attention(
             q=q,
             k=k_full,
             v=v_full,
-            idx=idx,
+            idx=top_idx,
             scaling=self.scaling,
             dropout_p=0.0 if not self.training else self.attention_dropout,
             training=self.training,
         )  # [B,H,1,D]
 
-        out = out.transpose(1, 2).contiguous()  # [B,1,H,D]
-        out = out.reshape(B, 1, -1).contiguous()
+        out = out.transpose(1, 2).contiguous().reshape(B, 1, -1)
         out = self.o_proj(out)
 
         return out, None, {
             "bucket_sparse": True,
             "Km": Km,
-            "sink": sink,
-            "window": window,
+            "P": P,
+            "R": R,
+            "L": L,
+            "top_t": top_t,
+            "used_triton": ("get_collision_counts_indexed" in globals()),
         }
 
 

@@ -12,7 +12,7 @@ export CHAT=1
 
 cd /scratch/sj157/Small_World_Attention || exit
 
-deepspeed --master_port 27500 pipeline/train_quest/main.py \
+deepspeed --master_port 27501 pipeline/train_quest/main.py \
     --exp_desc ${task}_${train_dataset}_${model}_${method} \
     --pipeline_config_dir config/pipeline_config/${method}/${model}/${model}-inference-32hadamard.json \
     --eval_config_dir config/eval_config/${task}/${eval_dataset}.json \
