@@ -201,6 +201,7 @@ def collisions_from_ranges_kernel(
     tok = tl.load(perm_ptr + perm_lin, mask=in_bounds, other=0).to(tl.int64)
 
     out_lin = (((b * H + h) * Q + q) * N + tok)
+    tl.atomic_add(out_ptr + out_lin, 1, mask=in_bounds)
 
 
 def scatter_from_ranges_triton(
@@ -284,6 +285,9 @@ def get_collision_counts_indexed(
     start = offsets_flat[row, buckets]
     end   = offsets_flat[row, buckets + 1]
     lens = (end - start).clamp_min(0)
+    row0 = 0
+    bucket_counts = offsets_flat[row0, 1:] - offsets_flat[row0, :-1]
+
 
     collision_i32 = torch.zeros((B, H, Q, N), device=device, dtype=torch.int32)
     collision_flat_i32 = collision_i32.view(-1)
