@@ -41,6 +41,9 @@ import os
 import torch
 import torch.distributed as dist
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, REPO_ROOT)
+
 def is_rank0():
     return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 

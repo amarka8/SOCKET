@@ -1,22 +1,5 @@
-# coding=utf-8
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+import os
+import sys
 from collections.abc import Callable
 from typing import Optional, Union
 
@@ -53,10 +36,12 @@ import itertools
 import math
 import triton
 import triton.language as tl
+
+# Ensure repo root is on sys.path so local modules (e.g., kernels) resolve from any cwd
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 from kernels.cra_triton_kernels import (
-    prefill_with_triton,
-    get_collision_counts_indexed,
-    build_inverted_index_csr,
     attention_mask_to_allowed_prob
 )
 
@@ -572,30 +557,6 @@ class LlamaAttention(nn.Module):
         logits = torch.einsum("bhqlk,kr->bhqlr", qh, protos_T)
         return F.softmax(logits, dim=-1)
 
-    # -------------------------
-    # Gathered attention
-    # -------------------------
-    def gathered_attention(self, q, k, v, idx, scaling, dropout_p: float, training: bool):
-        """
-        q:   [B,H,Q,D]
-        k,v: [B,H,T,D]
-        idx: [B,H,Q,Km] token indices into T dimension (must be valid)
-        Returns: out [B,H,Q,D]
-        """
-        B, H, Q, D = q.shape
-        Km = idx.shape[-1]
-
-        # Gather K/V: [B,H,Q,Km,D]
-        idx_exp = idx.unsqueeze(-1).expand(B, H, Q, Km, D)
-        k_sel = torch.gather(k.unsqueeze(2).expand(B, H, Q, k.size(2), D), dim=3, index=idx_exp)
-        v_sel = torch.gather(v.unsqueeze(2).expand(B, H, Q, v.size(2), D), dim=3, index=idx_exp)
-
-        # logits: [B,H,Q,Km]
-        logits = torch.einsum("bhqd,bhqkd->bhqk", q, k_sel) * scaling
-        attn = torch.softmax(logits, dim=-1)
-        out = torch.einsum("bhqk,bhqkd->bhqd", attn, v_sel)
-        return out
-
 
     # -----------------------------------------------------------------------------
     # Your forward with Triton-integrated PREFILL (no Python for pos in range(T_k))
@@ -661,6 +622,36 @@ class LlamaAttention(nn.Module):
 
         return prev_allowed
 
+
+    def _get_states_container(
+        self,
+        past_key_values,
+        runtime_states: dict | None,
+    ) -> dict:
+        """
+        Return a mutable dict that persists across decode steps.
+
+        Priority:
+        1) If HF past_key_values is provided, attach state to it
+        so it survives across generation steps.
+        2) Otherwise, fall back to runtime_states (caller-managed).
+        """
+
+        # ---- Preferred: attach to HF cache object ----
+        if past_key_values is not None:
+            # HuggingFace cache objects are mutable; we can safely hang attrs on them
+            states = getattr(past_key_values, "bucket_states", None)
+            if states is None:
+                states = {}
+                setattr(past_key_values, "bucket_states", states)
+            return states
+
+        # ---- Fallback: external runtime_states dict ----
+        if runtime_states is None:
+            runtime_states = {}
+
+        return runtime_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -668,13 +659,14 @@ class LlamaAttention(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values=None,
         cache_position=None,
-        random_walk_states: dict | None = None,
+        cra_states: dict | None = None,
         **kwargs,
     ):
         input_shape = hidden_states.shape[:-1]
         B, T_q, _ = hidden_states.shape
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        # ---- projections ----
         q = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,H,T_q,D]
         k = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,H_kv,T_q,D]
         v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,H_kv,T_q,D]
@@ -693,10 +685,13 @@ class LlamaAttention(nn.Module):
         B, H, T_k, D = k_full.shape
         device = q.device
 
-        is_decode = (T_q == 1) and (T_k >= 1)
+        # Only sparse path for true single-token decode (common HF generation)
+        is_decode_1tok = (T_q == 1) and (past_len > 0)
 
-        # Prefill: keep dense causal (your original)
-        if not is_decode:
+        # ============================================================
+        # Prefill / non-1tok decode: do dense, but init sparse state
+        # ============================================================
+        if not is_decode_1tok:
             attn_out = F.scaled_dot_product_attention(
                 q, k_full, v_full,
                 attn_mask=attention_mask,
@@ -705,53 +700,14 @@ class LlamaAttention(nn.Module):
                 is_causal=False,
             )
             attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
-            return self.o_proj(attn_out), None, {"bucket_sparse": False}
+            out = self.o_proj(attn_out)
 
-        # ---------------------------
-        # 0) Allowed positions from external attention_mask (masker uses allowed_prob>0)
-        # ---------------------------
-        if attention_mask is not None:
-            allowed_prob = attention_mask_to_allowed_prob(attention_mask, T_k)  # [B,1,*,T_k]
-            allowed_ext = (allowed_prob > 0).expand(B, H, 1, T_k)               # bool, True=allowed
-        else:
-            allowed_prob = None
-            allowed_ext = torch.ones((B, H, 1, T_k), device=device, dtype=torch.bool)
+            # ---- init/refresh state for later 1-tok decode ----
+            states = self._get_states_container(past_key_values, cra_states)
 
-        # ---------------------------
-        # 1) Build prev_allowed = sink OR local (MATCH maskers exactly)
-        # ---------------------------
-        sink_size_cfg = getattr(self.config, "sink_size", 128)
-        window_size_cfg = getattr(self.config, "window_size", 128)
-
-        prev_allowed = self._build_prev_allowed_like_maskers(
-            B=B,
-            H=H,
-            T_q=T_q,
-            T_k=T_k,
-            allowed_ext=allowed_ext,     # bool True=allowed
-            sink_size_cfg=sink_size_cfg,
-            window_size_cfg=window_size_cfg,
-            device=device,
-        )
-
-        # ---------------------------
-        # 2) Bucket selection (MATCH BucketMasker logic)
-        # ---------------------------
-        P = int(getattr(self, "bucket_K", 7))
-        L = int(getattr(self, "bucket_L", 20))
-        top_t = int(getattr(self, "bucket_top_t", 8))
-        R = 1 << P
-        top_t = max(1, min(top_t, R))
-
-        heavy_size = getattr(self.config, "heavy_size", 0.2)  # can be float or int
-        M = self._effective_size(heavy_size, T_k)
-        M = max(0, min(int(M), T_k))
-        bucket_allowed = None
-        if M == 0:
-            # only sink+local
-            final_allowed = prev_allowed
-        else:
-            Km = min(M, T_k)
+            P = int(getattr(self, "bucket_K", 7))
+            L = int(getattr(self, "bucket_L", 20))
+            R = 1 << P
 
             planes = self.get_hyper_planes(
                 cache=self._planes_cache,
@@ -760,89 +716,134 @@ class LlamaAttention(nn.Module):
                 dtype=k_full.dtype,
                 rng=self._rng(device),
             )
+
+            # hard hash all keys once
+            key_buckets = self.hard_hash(k_full, planes).to(torch.int16)  # [B,H,L,T_k]
+
+            # cache v norms (float16 is fine)
+            max_seq = int(getattr(self.config, "max_position_embeddings", max(2048, T_k)))
+            v_mag = torch.empty((B, H, max_seq), device=device, dtype=torch.float16)
+            v_mag[..., :T_k] = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_mag.dtype)
+
+            states[self.layer_idx] = {
+                "P": P, "L": L, "R": R,
+                "planes": planes,                 # cache planes for deterministic reuse
+                "key_buckets": key_buckets,       # [B,H,L,T_cached]
+                "v_mag": v_mag,                   # [B,H,max_seq]
+                "max_seq": max_seq,
+                "device": device,
+                "B": B, "H": H,
+            }
+            return out, None, {"bucket_sparse": False}
+
+        # ============================================================
+        # 1-token decode: simple expected-collision topM + sink/local
+        # ============================================================
+        states = self._get_states_container(past_key_values, cra_states)
+        st = states.get(self.layer_idx, None)
+
+        P = int(st["P"])
+        L = int(st["L"])
+        R = int(st["R"])
+        planes = st["planes"]
+        key_buckets = st["key_buckets"]   # [B,H,L,T_cached]
+        v_mag = st["v_mag"]
+        max_seq = int(st["max_seq"])
+
+        # ---- keep cached key_buckets in sync by appending ONLY the new token ----
+        # cached length might already match (depending on how HF calls forward)
+        T_cached = key_buckets.shape[-1]
+        if T_cached < T_k:
+            # hash only the new keys at the end (assumes monotonic decode)
+            k_new = k_full[:, :, T_cached:T_k, :]  # [B,H,delta,D] (usually delta=1)
+            bkt_new = self.hard_hash(k_new, planes).to(torch.int16)  # [B,H,L,delta]
+            key_buckets = torch.cat([key_buckets, bkt_new], dim=-1)
+            st["key_buckets"] = key_buckets
+
+        # ---- update v norm cache for the new token(s) ----
+        if T_k <= max_seq:
+            v_mag[..., :T_k] = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_mag.dtype)
+
+        # ---------------------------
+        # external allowed mask -> allowed_ext
+        # ---------------------------
+        if attention_mask is not None:
+            allowed_prob = attention_mask_to_allowed_prob(attention_mask, T_k)
+            allowed_ext = (allowed_prob > 0).expand(B, H, 1, T_k)  # [B,H,1,T_k] bool
+        else:
+            allowed_ext = torch.ones((B, H, 1, T_k), device=device, dtype=torch.bool)
+
+        # ---------------------------
+        # sink/local prev_allowed
+        # ---------------------------
+        sink_size_cfg = getattr(self.config, "sink_size", 128)
+        window_size_cfg = getattr(self.config, "window_size", 128)
+        prev_allowed = self._build_prev_allowed_like_maskers(
+            B=B, H=H, T_q=T_q, T_k=T_k,
+            allowed_ext=allowed_ext,
+            sink_size_cfg=sink_size_cfg,
+            window_size_cfg=window_size_cfg,
+            device=device,
+        )  # [B,H,1,T_k] bool
+
+        # ---------------------------
+        # budget M from heavy_size
+        # ---------------------------
+        heavy_size = getattr(self.config, "heavy_size", 0.2)
+        M = self._effective_size(heavy_size, T_k)
+        M = max(0, min(int(M), T_k))
+
+        if M == 0:
+            final_allowed = prev_allowed & allowed_ext
+        else:
+            # ---------------------------
+            # soft hash query -> q_probs
+            # ---------------------------
             protosT = self.get_protos_T(
                 cache=self._protos_cache,
                 P=P,
                 device=device,
                 dtype=k_full.dtype,
             )
-
-            key_buckets = self.hard_hash(k_full, planes)  # [B,H,L,T_k] int16
-            perm, offsets = build_inverted_index_csr(key_buckets.to(torch.int64), R=R)
-
             q_probs = self.soft_hash(q, planes, protosT)  # [B,H,1,L,R]
-            top_buckets = torch.topk(q_probs, k=top_t, dim=-1, largest=True).indices  # [B,H,1,L,top_t]
 
-            _, collision_i16 = get_collision_counts_indexed(
-                perm=perm,
-                offsets=offsets,
-                top_buckets=top_buckets,
-                N=T_k,
-            )
-            collision = collision_i16.to(torch.int32)  # [B,H,1,T_k]
-            collision = collision.masked_fill(~allowed_ext, 0)
+            # ---------------------------
+            # expected collision per token:
+            # C_i = sum_l q_probs[l, bucket_id(key_i,l)]
+            # ---------------------------
+            # key_buckets: [B,H,L,T_k] -> expand to [B,H,1,L,T_k] for gather
+            bkt = key_buckets[..., :T_k].to(torch.long).unsqueeze(2)  # [B,H,1,L,T_k]
+            # gather over R dimension (last dim of q_probs)
+            gathered = torch.gather(q_probs, dim=-1, index=bkt)        # [B,H,1,L,T_k]
+            collision = gathered.sum(dim=-2)                          # sum over L -> [B,H,1,T_k]
 
-            # adaptive-m
-            need3 = max(1, int(0.8 * M))
-            need2 = max(1, int(0.8 * M))
+            collision = collision.masked_fill(~allowed_ext, 0.0)
 
-            cand_m3 = (collision >= 3)
-            cand_m2 = (collision >= 2)
-            cand_m1 = (collision >= 1)
+            # v norm history
+            if T_k <= max_seq:
+                v_hist = v_mag[..., :T_k].to(torch.float32)           # [B,H,T_k]
+            else:
+                v_hist = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1)  # [B,H,T_k]
 
-            cnt3 = cand_m3.sum(dim=-1)  # [B,H,1]
-            cnt2 = cand_m2.sum(dim=-1)  # [B,H,1]
+            scores = collision.to(torch.float32) * v_hist.unsqueeze(2)            # [B,H,1,T_k]
+            scores = scores.masked_fill(~allowed_ext, float("-inf"))
 
-            use_m2 = (cnt3 < need3).unsqueeze(-1)  # [B,H,1,1]
-            use_m1 = ((cnt2 < need2) & use_m2.squeeze(-1)).unsqueeze(-1)
+            Km = min(M, T_k)
+            top_idx = torch.topk(scores, k=Km, dim=-1, largest=True).indices      # [B,H,1,Km]
 
-            candidate_mask = torch.where(
-                use_m2,
-                torch.where(use_m1, cand_m1, cand_m2),
-                cand_m3,
-            )
-            candidate_mask = candidate_mask & allowed_ext
+            # build bucket_allowed mask from top_idx
+            bucket_allowed = torch.zeros((B, H, 1, T_k), device=device, dtype=torch.bool)
+            bucket_allowed.scatter_(dim=-1, index=top_idx, value=True)
+            bucket_allowed &= allowed_ext
 
-            # score = collision * ||v||
-            v_mag = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1)  # [B,H,T_k]
-            scores = collision.to(torch.float32) * v_mag.unsqueeze(2).to(torch.float32)  # [B,H,1,T_k]
-            scores = scores.masked_fill(~candidate_mask, float("-inf"))
-
-            top_idx = torch.topk(scores, k=Km, dim=-1, largest=True).indices  # [B,H,1,Km]
-
-            cand_counts = candidate_mask.sum(dim=-1)           # [B,H,1]
-            k_each = cand_counts.clamp_max(M).clamp_max(Km)    # [B,H,1]
-            keep = (
-                torch.arange(Km, device=device).view(1, 1, 1, Km)
-                < k_each.unsqueeze(-1)
-            )  # [B,H,1,Km]
-
-            acc = torch.zeros((B, H, 1, T_k), device=device, dtype=torch.int16)
-            acc.scatter_add_(dim=-1, index=top_idx, src=keep.to(acc.dtype))
-            bucket_allowed = (acc > 0) & allowed_ext  # True=allowed
-
-            # Masker merge: max(prev, bucket) in "allowed-space"
             final_allowed = (prev_allowed | bucket_allowed) & allowed_ext
 
         # ---------------------------
-        # 3) Apply as additive -inf mask (true -inf), like a regular masked attention
+        # SDPA with additive -inf mask
         # ---------------------------
-        blocked = ~final_allowed  # True=blocked
-
-        # self._debug_log_masks(
-        #     {
-        #         "allowed_ext": allowed_ext,
-        #         "prev_allowed": prev_allowed,
-        #         "bucket_allowed": bucket_allowed,
-        #         "final_allowed": final_allowed,
-        #         "blocked": blocked,
-        #     }
-        # )
-
-        # Build additive bias in fp32 for stability, then cast
-        additive = torch.zeros((B, H, T_q, T_k), device=device, dtype=torch.float32)
-        additive = additive.masked_fill(blocked, float("-inf"))
-        additive = additive.to(q.dtype)
+        blocked = ~final_allowed
+        additive = torch.zeros((B, H, 1, T_k), device=device, dtype=torch.float32)
+        additive = additive.masked_fill(blocked, float("-inf")).to(q.dtype)
 
         attn_out = F.scaled_dot_product_attention(
             q, k_full, v_full,
@@ -850,20 +851,18 @@ class LlamaAttention(nn.Module):
             dropout_p=0.0 if not self.training else self.attention_dropout,
             scale=self.scaling,
             is_causal=False,
-        )  # [B,H,1,D]
-
+        )
         out = attn_out.transpose(1, 2).contiguous().reshape(B, 1, -1)
         out = self.o_proj(out)
 
         return out, None, {
             "bucket_sparse": True,
-            "mode": "match_masker",
-            "T_k": T_k,
-            "P": P,
-            "R": 1 << P,
-            "L": L,
-            "top_t": top_t,
-            "M": int(max(0, min(self._effective_size(getattr(self.config, "heavy_size", 0.2), T_k), T_k))),
+            "mode": "expected_collision_topM",
+            "T_k": int(T_k),
+            "P": int(P),
+            "R": int(R),
+            "L": int(L),
+            "M": int(M),
             "final_tokens_avg": float(final_allowed.sum(dim=-1).float().mean().item()),
         }
 
@@ -891,7 +890,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        random_walk_states: Optional[dict] = None,
+        cra_states: Optional[dict] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -905,7 +904,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            random_walk_states=random_walk_states,
+            cra_states=cra_states,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1039,7 +1038,7 @@ class LlamaModel(LlamaPreTrainedModel):
         total_selector_loss = torch.tensor(0.0, device=loss_device, dtype=loss_dtype)
         num_contrib = 0
 
-        runtime_random_walk_states = {} if past_key_values is None else None
+        runtime_cra_states = {} if past_key_values is None else None
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states, extra = decoder_layer(
@@ -1049,7 +1048,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                random_walk_states=runtime_random_walk_states,
+                cra_states=runtime_cra_states,
                 **kwargs,
             )
             log_p = extra.get("estimator_log_probs", None)

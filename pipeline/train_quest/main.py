@@ -6,10 +6,17 @@ import pdb
 import torch
 from zoneinfo import ZoneInfo
 
+# current_dir = os.path.dirname(os.path.abspath(__file__))
+# base_dir = os.path.abspath(os.path.join(current_dir, '../../'))
+# sys.path.append(base_dir)
+# os.chdir(base_dir)
 current_dir = os.path.dirname(os.path.abspath(__file__))
-base_dir = os.path.abspath(os.path.join(current_dir, '../../'))
-sys.path.append(base_dir)
-os.chdir(base_dir)
+
+# main.py is in pipeline/train_quest/, so repo root is ../..
+repo_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)  # IMPORTANT: insert, not append
 
 import pipeline.main_utils as main_utils
 from config.access_tokens import hf_access_token
