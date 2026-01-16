@@ -82,6 +82,8 @@ def _model_device(mod):
 
 def run(configs, args, logger):
     local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+
     rank = int(os.environ["RANK"])
     eval_params = configs['eval_params']
     pipeline_params = configs['pipeline_params']
@@ -140,7 +142,8 @@ def run(configs, args, logger):
         load_dir = os.path.join(pipeline_params["save_path"], latest_checkpoint)
 
         pipeline_params["load_model_path"] = load_dir
-        print(f"Loading from previous run epoch_{pipeline_params["resume"]}!")
+        epoch = pipeline_params["resume"]
+        print(f"Loading from previous run epoch_{epoch}!")
 
     model_name = pipeline_params["model_name"]
     use_smallworld = pipeline_params.get("method") == "smallworld"
@@ -357,10 +360,12 @@ def run(configs, args, logger):
                     pbar.update(num_step)
                     num_step = 0
 
+                epochs = pipeline_params["num_epochs"]
+                grad_steps = pipeline_params["gradient_accumulation_steps"]
 
                 pbar.set_description(
-                    f"Training Epoch: {epoch+1}/{pipeline_params["num_epochs"]}, batch {step}/{len(train_dataloader)} "
-                    f"completed (loss: {round(float(loss.detach().float() * pipeline_params["gradient_accumulation_steps"]), 4)}"
+                    f"Training Epoch: {epoch+1}/{epochs}, batch {step}/{len(train_dataloader)} "
+                    f"completed (loss: {round(float(loss.detach().float() * grad_steps), 4)}"
                 )
                 loss = None
             pbar.close()
@@ -408,7 +413,7 @@ def run(configs, args, logger):
                     score += longbench_eval.scorer(
                         eval_params['dataset'],
                         [answer],
-                        [ground_truth[idx]],
+                        [ground_truth[test_idx]],
                         all_classes
                         )
                     if idx < 50 and rank == 0:
@@ -419,7 +424,7 @@ def run(configs, args, logger):
                         print(f"Extracted Output: '{answer}'")
 
                     pbar.update(1)
-                    curr_score = score / total
+                    curr_score = (score / total) * 100
                     curr_score = curr_score.detach().cpu().item()
                     pbar.set_description(
                         f"Test accuracy: {round(curr_score, 2)}"
@@ -436,8 +441,15 @@ def run(configs, args, logger):
             if dist.is_available() and dist.is_initialized():
                 gathered_preds = [None for _ in range(dist.get_world_size())]
                 gathered_indices = [None for _ in range(dist.get_world_size())]
-                dist.gather_object(predictions, gathered_preds, dst=0)
-                dist.gather_object(prediction_indices, gathered_indices, dst=0)
+                if rank == 0:
+                    dist.gather_object(predictions, gathered_preds, dst=0)
+                    dist.gather_object(prediction_indices, gathered_indices, dst=0)                
+                else:
+                    dist.gather_object(predictions, None, dst=0) # Pass None on other ranks
+                    dist.gather_object(prediction_indices, None, dst=0)                
+
+                # dist.gather_object(predictions, gathered_preds, dst=0)
+                # dist.gather_object(prediction_indices, gathered_indices, dst=0)
                 if rank == 0:
                     pred_map = {}
                     for preds, indices in zip(gathered_preds, gathered_indices):

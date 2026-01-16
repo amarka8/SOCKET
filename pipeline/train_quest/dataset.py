@@ -101,14 +101,17 @@ def get_dataset(tokenizer, pipeline_config, dataset_config, max_size=1000000000)
 
     if torch.cuda.device_count() > 1:
         if dist.get_rank() == 0:
+            # print("rank: ")
             processed_dataset = [
                 dataset.map(
                     tokenize_sample, remove_columns=list(dataset.features), num_proc=32
                 )
             ]
+            dist.broadcast_object_list(processed_dataset, src=0)
         else:
             processed_dataset = [None]
-        dist.broadcast_object_list(processed_dataset, src=0)
+            dist.broadcast_object_list(processed_dataset, src=0)
+        
         dataset = processed_dataset[0]
 
     else:

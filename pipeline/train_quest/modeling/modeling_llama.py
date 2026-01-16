@@ -37,6 +37,12 @@ import math
 import triton
 import triton.language as tl
 
+try:
+    from .soft_hash_collision_loader import load_soft_hash_collision
+except ImportError:
+    # Fallback for running the file outside the package context.
+    from soft_hash_collision_loader import load_soft_hash_collision
+
 # Ensure repo root is on sys.path so local modules (e.g., kernels) resolve from any cwd
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if REPO_ROOT not in sys.path:
@@ -46,6 +52,8 @@ from kernels.cra_triton_kernels import (
 )
 
 logger = logging.get_logger(__name__)
+
+_SOFT_HASH_EXT = None
 
 def _torch_version_gte(target: str) -> bool:
     try:
@@ -807,17 +815,28 @@ class LlamaAttention(nn.Module):
             )
             q_probs = self.soft_hash(q, planes, protosT)  # [B,H,1,L,R]
 
-            # ---------------------------
-            # expected collision per token:
-            # C_i = sum_l q_probs[l, bucket_id(key_i,l)]
-            # ---------------------------
-            # key_buckets: [B,H,L,T_k] -> expand to [B,H,1,L,T_k] for gather
-            bkt = key_buckets[..., :T_k].to(torch.long).unsqueeze(2)  # [B,H,1,L,T_k]
-            # gather over R dimension (last dim of q_probs)
-            gathered = torch.gather(q_probs, dim=-1, index=bkt)        # [B,H,1,L,T_k]
-            collision = gathered.sum(dim=-2)                          # sum over L -> [B,H,1,T_k]
+            # # ---------------------------
+            # # expected collision per token:
+            # # C_i = sum_l q_probs[l, bucket_id(key_i,l)]
+            # # ---------------------------
+            # # key_buckets: [B,H,L,T_k] -> expand to [B,H,1,L,T_k] for gather
+            # bkt = key_buckets[..., :T_k].to(torch.long).unsqueeze(2)  # [B,H,1,L,T_k]
+            # # gather over R dimension (last dim of q_probs)
+            # gathered = torch.gather(q_probs, dim=-1, index=bkt)        # [B,H,1,L,T_k]
+            # collision = gathered.sum(dim=-2)                          # sum over L -> [B,H,1,T_k]
 
-            collision = collision.masked_fill(~allowed_ext, 0.0)
+            # collision = collision.masked_fill(~allowed_ext, 0.0)
+
+            """
+            Place Kernel Here
+            """
+            global _SOFT_HASH_EXT
+            if _SOFT_HASH_EXT is None:
+                _SOFT_HASH_EXT = load_soft_hash_collision(3)
+            
+            q_probs_f32 = q_probs.to(torch.float32)
+            bkt = key_buckets[..., :T_k]
+            collision = _SOFT_HASH_EXT.soft_hash_collision(q_probs_f32.contiguous(), bkt.contiguous(), allowed_ext.contiguous())
 
             # v norm history
             if T_k <= max_seq:
