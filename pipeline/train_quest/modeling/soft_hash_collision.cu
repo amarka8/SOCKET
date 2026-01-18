@@ -13,6 +13,7 @@
         q.data_ptr<float>(),
         key_buckets.data_ptr<int16_t>(),
         allowed_ext.data_ptr<bool>(),
+        v_hist.data_ptr<float>(),
         out.data_ptr<float>(),
         static_cast<int>(B),
         static_cast<int>(H),
@@ -25,6 +26,7 @@ __global__ void soft_hash_collision_kernel_3(
     const float* __restrict__ q_probs,        // [B,H,1,L,R] contiguous
     const int16_t* __restrict__ key_buckets,  // [B,H,L,T_k] contiguous
     const bool* __restrict__ allowed_ext,     // [B,H,1,T_k] contiguous
+    const float* __restrict__ v_hist,        // [B,H,1,T_k] contiguous
     float* __restrict__ out,                  // [B,H,1,T_k] contiguous
     int B, int H, int L, int R, int T_k) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -36,7 +38,7 @@ __global__ void soft_hash_collision_kernel_3(
     int bh = b * H + h;
     int al_idx = bh * T_k + t;
     if (!allowed_ext[al_idx]) {
-        out[al_idx] = 0.0f;
+        out[al_idx] = -INFINITY;
         return;
     }
 
@@ -48,6 +50,6 @@ __global__ void soft_hash_collision_kernel_3(
         sum += q_probs[q_idx];
     }
 
-    out[al_idx] = sum;
+    out[al_idx] = sum * v_hist[al_idx];
 }
 // end: soft_hash_collision_kernel_3

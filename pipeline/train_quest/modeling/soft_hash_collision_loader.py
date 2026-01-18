@@ -16,27 +16,33 @@ CUDA_WRAPPER_TEMPLATE = Template(
     torch::Tensor soft_hash_collision(
         torch::Tensor q_probs,
         torch::Tensor key_buckets,
-        torch::Tensor allowed_ext
+        torch::Tensor allowed_ext,
+        torch::Tensor v_hist_in
     ) {
         TORCH_CHECK(q_probs.is_cuda(), "q_probs must be CUDA");
         TORCH_CHECK(key_buckets.is_cuda(), "key_buckets must be CUDA");
         TORCH_CHECK(allowed_ext.is_cuda(), "allowed_ext must be CUDA");
+        TORCH_CHECK(v_hist_in.is_cuda(), "v_hist must be CUDA");
 
         TORCH_CHECK(q_probs.is_contiguous(), "q_probs must be contiguous");
         TORCH_CHECK(key_buckets.is_contiguous(), "key_buckets must be contiguous");
         TORCH_CHECK(allowed_ext.is_contiguous(), "allowed_ext must be contiguous");
+        TORCH_CHECK(v_hist_in.is_contiguous(), "v_hist must be contiguous");
 
         TORCH_CHECK(q_probs.scalar_type() == torch::kFloat, "q_probs must be float32");
         TORCH_CHECK(key_buckets.scalar_type() == torch::kInt16, "key_buckets must be int16");
         TORCH_CHECK(allowed_ext.scalar_type() == torch::kBool, "allowed_ext must be bool");
+        TORCH_CHECK(v_hist_in.scalar_type() == torch::kFloat, "v_hist must be float32");
 
         TORCH_CHECK(q_probs.dim() == 5, "q_probs must be [B,H,1,L,R]");
         TORCH_CHECK(key_buckets.dim() == 4, "key_buckets must be [B,H,L,T_k]");
         TORCH_CHECK(allowed_ext.dim() == 4, "allowed_ext must be [B,H,1,T_k]");
+        TORCH_CHECK(v_hist_in.dim() == 4, "v_hist must be [B,H,1,T_k]");
 
         auto q = q_probs.contiguous();
         auto kb = key_buckets.contiguous();
         auto al = allowed_ext.contiguous();
+        auto v_hist = v_hist_in.contiguous();
 
         int64_t B = q.size(0);
         int64_t H = q.size(1);
@@ -48,6 +54,8 @@ CUDA_WRAPPER_TEMPLATE = Template(
                     "key_buckets shape mismatch");
         TORCH_CHECK(al.size(0) == B && al.size(1) == H && al.size(2) == 1 && al.size(3) == T_k,
                     "allowed_ext shape mismatch");
+        TORCH_CHECK(v_hist.size(0) == B && v_hist.size(1) == H && v_hist.size(2) == 1 && v_hist.size(3) == T_k,
+                    "v_hist shape mismatch");
 
         auto out = torch::zeros({B, H, 1, T_k}, q.options());
 
@@ -60,7 +68,7 @@ CUDA_WRAPPER_TEMPLATE = Template(
 
     PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m.def("soft_hash_collision", &soft_hash_collision,
-              "Soft hash collision (q_probs, key_buckets, allowed_ext -> out)");
+              "Soft hash collision (q_probs, key_buckets, allowed_ext, v_hist -> out)");
     }
     """
 )

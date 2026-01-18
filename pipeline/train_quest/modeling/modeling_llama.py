@@ -834,18 +834,22 @@ class LlamaAttention(nn.Module):
             if _SOFT_HASH_EXT is None:
                 _SOFT_HASH_EXT = load_soft_hash_collision(3)
             
-            q_probs_f32 = q_probs.to(torch.float32)
-            bkt = key_buckets[..., :T_k]
-            collision = _SOFT_HASH_EXT.soft_hash_collision(q_probs_f32.contiguous(), bkt.contiguous(), allowed_ext.contiguous())
-
             # v norm history
             if T_k <= max_seq:
                 v_hist = v_mag[..., :T_k].to(torch.float32)           # [B,H,T_k]
             else:
                 v_hist = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1)  # [B,H,T_k]
 
-            scores = collision.to(torch.float32) * v_hist.unsqueeze(2)            # [B,H,1,T_k]
-            scores = scores.masked_fill(~allowed_ext, float("-inf"))
+            q_probs_f32 = q_probs.to(torch.float32)
+            bkt = key_buckets[..., :T_k]
+            v_hist_ext = v_hist.unsqueeze(2)
+            scores = _SOFT_HASH_EXT.soft_hash_collision(  # [B, H, 1, T_k]
+                q_probs_f32.contiguous(),
+                bkt.contiguous(),
+                allowed_ext.contiguous(),
+                v_hist_ext.contiguous(),
+            )
+            # scores = scores.masked_fill(~allowed_ext, float("-inf"))
 
             Km = min(M, T_k)
             top_idx = torch.topk(scores, k=Km, dim=-1, largest=True).indices      # [B,H,1,Km]
