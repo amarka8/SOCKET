@@ -48,12 +48,87 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", 
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 from kernels.cra_triton_kernels import (
-    attention_mask_to_allowed_prob
+    attention_mask_to_allowed_prob, sparse_attention_fwd
 )
 
 logger = logging.get_logger(__name__)
 
 _SOFT_HASH_EXT = None
+
+def _get_soft_hash_ext():
+    global _SOFT_HASH_EXT
+    if _SOFT_HASH_EXT is None:
+        _SOFT_HASH_EXT = load_soft_hash_collision(3)
+    return _SOFT_HASH_EXT
+
+@torch.no_grad()
+def build_sparse_list_decode(
+    q_probs: torch.Tensor,         # [B,H,L,R] fp16/bf16/fp32
+    k_hard_bhlt: torch.Tensor,      # [B,H,L,T] int16/int32
+    v_norm_bht: torch.Tensor,       # [B,H,T] fp16/bf16/fp32
+    allowed_bht: torch.Tensor,      # [B,H,T] bool
+    sink: int,
+    window: int,
+    M: int,
+    KC: int = 8,
+    BLOCK_N: int = 512,
+    num_warps: int = 8,
+    num_stages: int = 2,
+):
+    assert q_probs.is_cuda and k_hard_bhlt.is_cuda and v_norm_bht.is_cuda and allowed_bht.is_cuda
+    assert allowed_bht.dtype == torch.bool
+
+    B, H, L, R = q_probs.shape
+    _, _, L2, T = k_hard_bhlt.shape
+    assert L2 == L
+
+    device = q_probs.device
+    M_eff = min(M, T)
+    if M_eff > 0:
+        ext = _get_soft_hash_ext()
+        q_probs_f32 = q_probs.float().unsqueeze(2).contiguous()  # [B,H,1,L,R]
+        key_buckets = k_hard_bhlt
+        if key_buckets.dtype != torch.int16:
+            key_buckets = key_buckets.to(torch.int16)
+        key_buckets = key_buckets.contiguous()
+        allowed_ext = allowed_bht.unsqueeze(2).contiguous()       # [B,H,1,T]
+        v_hist = v_norm_bht.float().unsqueeze(2).contiguous()     # [B,H,1,T]
+
+        scores = ext.soft_hash_collision(
+            q_probs_f32,
+            key_buckets,
+            allowed_ext,
+            v_hist,
+        ).squeeze(2)  # [B,H,T]
+
+        top = torch.topk(scores, k=M_eff, dim=-1, largest=True)
+        heavy_idx = top.indices.to(torch.int32)
+    else:
+        heavy_idx = torch.empty((B, H, 0), device=device, dtype=torch.int32)
+
+    sink = max(0, min(sink, T))
+    window = max(0, min(window, T))
+
+    parts = []
+    if sink > 0:
+        parts.append(torch.arange(sink, device=device, dtype=torch.int32))
+    if window > 0:
+        win_start = max(T - window, sink)
+        if win_start < T:
+            parts.append(torch.arange(win_start, T, device=device, dtype=torch.int32))
+
+    if len(parts) == 0:
+        base = torch.tensor([T - 1], device=device, dtype=torch.int32)
+    else:
+        base = torch.cat(parts, dim=0)
+
+    base = base.view(1, 1, -1).expand(B, H, -1)
+    base_ok = torch.gather(allowed_bht, dim=-1, index=base.to(torch.long))
+    base = base.masked_fill(~base_ok, -1)
+
+    sparse_list = torch.cat([base, heavy_idx], dim=-1).contiguous()
+    sparse_len = torch.full((B, H), sparse_list.shape[-1], device=device, dtype=torch.int32)
+    return sparse_list, sparse_len
 
 def _torch_version_gte(target: str) -> bool:
     try:
@@ -773,120 +848,76 @@ class LlamaAttention(nn.Module):
             v_mag[..., :T_k] = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_mag.dtype)
 
         # ---------------------------
-        # external allowed mask -> allowed_ext
+        # external allowed mask -> allowed_bht
         # ---------------------------
         if attention_mask is not None:
             allowed_prob = attention_mask_to_allowed_prob(attention_mask, T_k)
-            allowed_ext = (allowed_prob > 0).expand(B, H, 1, T_k)  # [B,H,1,T_k] bool
+            allowed_bht = (allowed_prob > 0).expand(B, H, 1, T_k).squeeze(2).contiguous()
         else:
-            allowed_ext = torch.ones((B, H, 1, T_k), device=device, dtype=torch.bool)
+            allowed_bht = torch.ones((B, H, T_k), device=device, dtype=torch.bool)
 
         # ---------------------------
-        # sink/local prev_allowed
+        # budget + sparse list
         # ---------------------------
-        sink_size_cfg = getattr(self.config, "sink_size", 128)
-        window_size_cfg = getattr(self.config, "window_size", 128)
-        prev_allowed = self._build_prev_allowed_like_maskers(
-            B=B, H=H, T_q=T_q, T_k=T_k,
-            allowed_ext=allowed_ext,
-            sink_size_cfg=sink_size_cfg,
-            window_size_cfg=window_size_cfg,
-            device=device,
-        )  # [B,H,1,T_k] bool
-
-        # ---------------------------
-        # budget M from heavy_size
-        # ---------------------------
-        heavy_size = getattr(self.config, "heavy_size", 0.2)
-        M = self._effective_size(heavy_size, T_k)
+        sink = int(getattr(self.config, "sink_size", 20))
+        window = int(getattr(self.config, "window_size", 20))
+        M_cfg = getattr(self.config, "heavy_const", getattr(self.config, "heavy_size", 0.2))
+        M = self._effective_size(M_cfg, T_k)
         M = max(0, min(int(M), T_k))
 
-        if M == 0:
-            final_allowed = prev_allowed & allowed_ext
-        else:
-            # ---------------------------
-            # soft hash query -> q_probs
-            # ---------------------------
-            protosT = self.get_protos_T(
-                cache=self._protos_cache,
-                P=P,
-                device=device,
-                dtype=k_full.dtype,
-            )
-            q_probs = self.soft_hash(q, planes, protosT)  # [B,H,1,L,R]
-
-            # # ---------------------------
-            # # expected collision per token:
-            # # C_i = sum_l q_probs[l, bucket_id(key_i,l)]
-            # # ---------------------------
-            # # key_buckets: [B,H,L,T_k] -> expand to [B,H,1,L,T_k] for gather
-            # bkt = key_buckets[..., :T_k].to(torch.long).unsqueeze(2)  # [B,H,1,L,T_k]
-            # # gather over R dimension (last dim of q_probs)
-            # gathered = torch.gather(q_probs, dim=-1, index=bkt)        # [B,H,1,L,T_k]
-            # collision = gathered.sum(dim=-2)                          # sum over L -> [B,H,1,T_k]
-
-            # collision = collision.masked_fill(~allowed_ext, 0.0)
-
-            """
-            Place Kernel Here
-            """
-            global _SOFT_HASH_EXT
-            if _SOFT_HASH_EXT is None:
-                _SOFT_HASH_EXT = load_soft_hash_collision(3)
-            
-            # v norm history
-            if T_k <= max_seq:
-                v_hist = v_mag[..., :T_k].to(torch.float32)           # [B,H,T_k]
-            else:
-                v_hist = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1)  # [B,H,T_k]
-
-            q_probs_f32 = q_probs.to(torch.float32)
-            bkt = key_buckets[..., :T_k]
-            v_hist_ext = v_hist.unsqueeze(2)
-            scores = _SOFT_HASH_EXT.soft_hash_collision(  # [B, H, 1, T_k]
-                q_probs_f32.contiguous(),
-                bkt.contiguous(),
-                allowed_ext.contiguous(),
-                v_hist_ext.contiguous(),
-            )
-            # scores = scores.masked_fill(~allowed_ext, float("-inf"))
-
-            Km = min(M, T_k)
-            top_idx = torch.topk(scores, k=Km, dim=-1, largest=True).indices      # [B,H,1,Km]
-
-            # build bucket_allowed mask from top_idx
-            bucket_allowed = torch.zeros((B, H, 1, T_k), device=device, dtype=torch.bool)
-            bucket_allowed.scatter_(dim=-1, index=top_idx, value=True)
-            bucket_allowed &= allowed_ext
-
-            final_allowed = (prev_allowed | bucket_allowed) & allowed_ext
-
-        # ---------------------------
-        # SDPA with additive -inf mask
-        # ---------------------------
-        blocked = ~final_allowed
-        additive = torch.zeros((B, H, 1, T_k), device=device, dtype=torch.float32)
-        additive = additive.masked_fill(blocked, float("-inf")).to(q.dtype)
-
-        attn_out = F.scaled_dot_product_attention(
-            q, k_full, v_full,
-            attn_mask=additive,
-            dropout_p=0.0 if not self.training else self.attention_dropout,
-            scale=self.scaling,
-            is_causal=False,
+        protosT = self.get_protos_T(
+            cache=self._protos_cache,
+            P=P,
+            device=device,
+            dtype=k_full.dtype,
         )
-        out = attn_out.transpose(1, 2).contiguous().reshape(B, 1, -1)
+        q_probs = self.soft_hash(q[:, :, 0:1, :], planes, protosT).squeeze(2)  # [B,H,L,R]
+
+        if T_k <= max_seq:
+            v_norm_bht = v_mag[..., :T_k].to(torch.float16)
+        else:
+            v_norm_bht = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(torch.float16)
+
+        k_hard_bhlt = key_buckets[..., :T_k].contiguous()
+
+        sparse_list, sparse_len = build_sparse_list_decode(
+            q_probs,
+            k_hard_bhlt,
+            v_norm_bht,
+            allowed_bht,
+            sink=sink,
+            window=window,
+            M=M,
+            KC=8,
+            BLOCK_N=512,
+            num_warps=8,
+            num_stages=2,
+        )
+        if sparse_list.dtype != torch.int32:
+            sparse_list = sparse_list.to(torch.int32)
+        if sparse_len.dtype != torch.int32:
+            sparse_len = sparse_len.to(torch.int32)
+
+        q_bhd = q[:, :, 0, :].contiguous()
+        out_bhd = sparse_attention_fwd(
+            q_bhd,
+            k,
+            v,
+            sparse_list,
+            sparse_len,
+            block_seq=256,
+        )
+        out = out_bhd.unsqueeze(2).transpose(1, 2).contiguous().reshape(B, 1, -1)
         out = self.o_proj(out)
 
         return out, None, {
             "bucket_sparse": True,
-            "mode": "expected_collision_topM",
+            "mode": "cra_sparse",
             "T_k": int(T_k),
             "P": int(P),
             "R": int(R),
             "L": int(L),
             "M": int(M),
-            "final_tokens_avg": float(final_allowed.sum(dim=-1).float().mean().item()),
         }
 
 
