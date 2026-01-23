@@ -851,8 +851,9 @@ class LlamaAttention(nn.Module):
         # external allowed mask -> allowed_bht
         # ---------------------------
         if attention_mask is not None:
-            allowed_prob = attention_mask_to_allowed_prob(attention_mask, T_k)
-            allowed_bht = (allowed_prob > 0).expand(B, H, 1, T_k).squeeze(2).contiguous()
+            pos = cache_position.view(-1)
+            allowed = torch.arange(T_k, device=pos.device) <= pos.max()
+            allowed_bht = allowed.view(1, 1, T_k).expand(B, H, T_k).contiguous()
         else:
             allowed_bht = torch.ones((B, H, T_k), device=device, dtype=torch.bool)
 
