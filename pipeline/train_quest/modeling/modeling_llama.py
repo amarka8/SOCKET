@@ -47,9 +47,7 @@ except ImportError:
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
-from kernels.cra_triton_kernels import (
-    attention_mask_to_allowed_prob, sparse_attention_fwd
-)
+from kernels.socket_triton_kernels import sparse_attention_fwd
 
 logger = logging.get_logger(__name__)
 
@@ -920,8 +918,6 @@ class LlamaAttention(nn.Module):
             "L": int(L),
             "M": int(M),
         }
-
-
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
