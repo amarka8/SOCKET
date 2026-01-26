@@ -1,0 +1,26 @@
+{
+        "pipeline_params": {
+                "method": "smallworld",
+                "kv_cache_method": "stream-llm",
+                "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+                "save_path": "/scratch/sj157/checkpoints/Llama-3.2-1B-Instruct-selector",
+                "load_model_path": null,
+                "train_mode": "inference_only",
+                "n_init": 0.2,
+                "n_local": 0.3,
+                "only_eval": true,
+                "resume": 0,
+                "bf16": false,
+                "batch_size_training": 1,
+                "reset_optimizer": true,
+                "lr": 1e-4,
+                "weight_decay": 0.01,
+                "gradient_accumulation_steps": 1,
+                "num_epochs": 2,
+                "eval_period": 1,
+                "n_new_tokens": 64,
+                "max_model_len": 128000,
+                "random_walk_hadamard_dim": 128,
+                "truncation_mode": "middle"
+        }
+}

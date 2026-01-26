@@ -1,0 +1,21 @@
+{
+    "train_params": {
+        "dataset": "LongAlpaca-12k",
+        "dataset_path": "Yukang/LongAlpaca-12k",
+        "save_dir": "processed_dataset/LongAlpaca-12k-longctx/",
+        "instruction": "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:",
+        "instruction_position": "prefix",
+        "max_new_tokens": 128,
+        "eval_metrics": [
+            "qa_f1_score"
+        ]
+    },
+    "management": {
+        "sub_dir": {
+            "input_config": "input_config/",
+            "raw_results": "raw_results.json",
+            "result_vis": "result_vis.png",
+            "output_config": "output_config.json"
+        }
+    }
+}

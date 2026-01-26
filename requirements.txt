@@ -1,0 +1,91 @@
+accelerate
+aiohappyeyeballs
+aiohttp
+aiosignal
+annotated-types
+attrs
+blessed
+certifi
+charset-normalizer
+click
+datasets
+deepspeed
+dill
+docker-pycreds
+einops
+filelock
+frozenlist
+fsspec
+fuzzywuzzy
+gitdb
+GitPython
+gpustat
+hf-xet
+hjson
+huggingface-hub
+idna
+jieba
+Jinja2
+MarkupSafe
+mpmath
+msgpack
+multidict
+multiprocess
+networkx
+ninja
+numpy
+# nvidia-cublas-cu12
+# nvidia-cuda-cupti-cu12
+# nvidia-cuda-nvrtc-cu12
+# nvidia-cuda-runtime-cu12
+# nvidia-cudnn-cu12
+# nvidia-cufft-cu12
+# nvidia-cufile-cu12
+# nvidia-curand-cu12
+# nvidia-cusolver-cu12
+# nvidia-cusparse-cu12
+# nvidia-cusparselt-cu12
+# nvidia-ml-py
+# nvidia-nccl-cu12
+# nvidia-nvjitlink-cu12
+# nvidia-nvtx-cu12
+packaging
+pandas
+peft
+platformdirs
+propcache
+protobuf
+psutil
+py-cpuinfo
+pyarrow
+pydantic
+pydantic_core
+python-dateutil
+pytz
+PyYAML
+regex
+requests
+rouge
+safetensors
+sentencepiece
+sentry-sdk
+setproctitle
+setuptools
+shortuuid
+six
+smmap
+sympy
+tokenizers
+# torch
+tqdm
+transformers
+triton
+typing-inspection
+typing_extensions
+tzdata
+urllib3
+wandb
+wcwidth
+wheel
+xxhash
+yarl

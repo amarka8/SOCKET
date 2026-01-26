@@ -1,0 +1,18 @@
+{
+    "eval_params": {
+        "dataset": "aime",
+        "dataset_path": "Maxwell-Jia/AIME_2024",
+        "max_new_tokens": 20480,
+        "eval_metrics": [
+            "throughput",
+            "avg_acceptance_len"
+        ]
+    },
+    "management": {
+        "sub_dir": {
+            "input_config": "input_config/",
+            "raw_results": "raw_results.json",
+            "output_config": "output_config.json"
+        }
+    }
+}

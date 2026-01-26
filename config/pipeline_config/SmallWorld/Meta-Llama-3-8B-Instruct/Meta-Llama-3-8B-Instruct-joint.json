@@ -1,0 +1,25 @@
+{
+    "pipeline_params": {
+        "method": "fafo",
+        "kv_cache_method": "stream-llm",
+        "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
+        "save_path": "/mnt/rds/VipinRDS/VipinRDS/users/dhl64/ckpts/LIM/Meta-Llama-3-8B-Instruct-selector",
+        "train_mode": "joint",
+        "n_init": 0.2,
+        "n_local": 0.3,
+        "load_model_path": "/mnt/rds/VipinRDS/VipinRDS/users/dhl64/ckpts/LIM/Meta-Llama-3-8B-Instruct-selector/checkpoint_20",
+        "only_eval": false,
+        "resume": 0,
+        "bf16": false,
+        "batch_size_training": 1,
+        "reset_optimizer": true,
+        "lr": 1e-4,
+        "weight_decay": 0.01,
+        "gradient_accumulation_steps": 1,
+        "num_epochs": 20,
+        "eval_period": 10,
+        "n_new_tokens": 1024,
+        "max_model_len": 5120,
+        "truncation_mode": "middle"
+    }
+}
