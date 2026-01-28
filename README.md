@@ -1,7 +1,9 @@
 # SOCKET: Soft Collision Kernel EsTimator for Sparse Attention
 
-We introduce SOCKET and provide:
+SOCKET offers:
 
-- A long-context inference time algorithm that helps to score keys efficiently using soft LSH.
-- We demonstrate that traditional LSH is unsuitable of ranking and scoring keys efficiently, instead this can be achieved with soft LSH.
-- A comprehensive evaluationg on LongBench + RULER using Llama-3.1-8B-Instruct, Llama-3.2-1B-Instruct, and Qwen3-8B
+- A long-context inference-time algorithm for efficient key scoring using soft LSH.
+- Traditional LSH is not suitable for ranking and scoring keys efficiently; soft LSH overcomes this limitation.
+- 1.5x higher throughput compared to full attention, as measured with GPT-FAST.
+
+To reproduce our results, follow the instructions in /SOCKET/REPRODUCE.txt and /SOCKET/GPT-FAST/REPRODUCE.txt.
