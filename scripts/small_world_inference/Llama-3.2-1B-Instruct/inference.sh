@@ -8,7 +8,7 @@ model="Llama-3.2-1B-Instruct"
 method="SmallWorld"
 
 export COLOR_PRINT=1
-export TRITON_CACHE_DIR="/rhf/allocations/as143/el72"
+export TRITON_CACHE_DIR= # ADD PATH TO TRITON CACHE HERE
 export CHAT=1
 
 CUDA_VISIBLE_DEVICES=$1 deepspeed  --master_port 28500 pipeline/train_quest/main.py \

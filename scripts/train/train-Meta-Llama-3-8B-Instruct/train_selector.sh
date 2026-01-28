@@ -8,7 +8,7 @@ model="Meta-Llama-3-8B-Instruct"
 method="LearnHash"
 
 export COLOR_PRINT=1
-export TRITON_CACHE_DIR="/data1/el72"
+export TRITON_CACHE_DIR= # Add PATH TO TRITON CACHE HERE
 # export CHAT=1
 
 deepspeed  --master_port 28600  pipeline/train_quest/main.py \

@@ -8,7 +8,7 @@ model="Llama-3.2-3B-Instruct"
 method="LearnHash"
 
 export COLOR_PRINT=1
-export TRITON_CACHE_DIR="/mnt/rds/VipinRDS/VipinRDS/users/dhl64"
+export TRITON_CACHE_DIR= # Add PATH TO TRITON CACHE HERE
 # export CHAT=1
 
 CUDA_VISIBLE_DEVICES=0,1,2 deepspeed  --master_port 29666 pipeline/train_quest/main.py \

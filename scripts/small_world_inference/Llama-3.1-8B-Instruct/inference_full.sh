@@ -7,7 +7,7 @@ model="Llama-3.1-8B-Instruct"
 method="SmallWorld"
 
 export COLOR_PRINT=1
-export TRITON_CACHE_DIR="/rhf/allocations/as143/el72"
+export TRITON_CACHE_DIR= # ADD PATH TO TRITON CACHE HERE
 export CHAT=1
 
 datasets=(

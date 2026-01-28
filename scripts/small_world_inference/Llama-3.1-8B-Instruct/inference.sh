@@ -8,7 +8,7 @@ method="SmallWorld"
 
 export COLOR_PRINT=1
 # ADD PATH TO TRITON CACHE HERE
-export TRITON_CACHE_DIR="/path/to/triton_cache"
+export TRITON_CACHE_DIR= # ADD PATH TO TRITON CACHE HERE
 export CHAT=1
 
 # CD INTO DIRECTORY FROM WHICH PATHS BELOW ARE RELATIVE (e.g. ../pipeline)

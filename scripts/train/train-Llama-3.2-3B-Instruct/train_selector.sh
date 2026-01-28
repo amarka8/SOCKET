@@ -8,8 +8,7 @@ model="Llama-3.2-3B-Instruct"
 method="LearnHash"
 
 export COLOR_PRINT=1
-# export TRITON_CACHE_DIR="/data1/el72"
-# export CHAT=1
+export TRITON_CACHE_DIR= # ADD PATH TO TRITON CACHE HERE
 
 deepspeed  --master_port 29666 pipeline/train_quest/main.py \
     --exp_desc ${task}_${train_dataset}_${model}_${method} \
