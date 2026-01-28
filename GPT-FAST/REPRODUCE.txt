@@ -1,0 +1,12 @@
+going to gpt fast and running the corresponding bash script.
+a virtual or conda environment using the packages in requirements.txt. Here is an example:
+To obtain time statistics for a specific inference-time forward pass implementation of Llama-2-7b-chat-hf—such as the sparse forward implementation (SOCKET)—follow these steps:
+
+1. Change to the GPT-FAST directory.
+2. In generate.py, update the following line:
+    parser.add_argument('--checkpoint_path', type=Path, default=Path("Enter/Path/to/model/checkpoints"), help='Model checkpoint path.')
+   Replace the default path with the location of your model checkpoints. You can obtain these checkpoints by accessing the model on Hugging Face and running the appropriate bash script in GPT-FAST.
+
+3. Run generate.py from the command line with the required arguments. Make sure to execute the script within a virtual or conda environment that has all dependencies from requirements.txt installed. For example:
+
+    python generate.py --max_new_tokens 5079 --decode_type sparse

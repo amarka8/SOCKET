@@ -1,0 +1,20 @@
+To evaluate accuracy on the qasper dataset using LongAlpaca-12k for training and the Llama 3.1 8B model, follow these steps:
+
+1. Navigate to /SOCKET/scripts/small_world_inference/Llama-3.1-8B-Instruct/inference.sh.
+2. Update the following lines in the script:
+    task="longbench"
+    train_dataset="LongAlpaca-12k"
+    eval_dataset="qasper"
+    model="Llama-3.1-8B-Instruct"
+    method="SmallWorld"
+    cd /path/to/directory
+    export TRITON_CACHE_DIR="/path/to/triton_cache"
+
+3. Make sure that the configuration file:
+    config/pipeline_config/${method}/${model}/${model}-inference-32hadamard.json
+   has a valid save_path that exists on your file system.
+
+4. Enter your Hugging Face token in access_tokens.py by setting the hf_token value.
+
+You can repeat this process for any other model by adjusting the relevant parameters. Ensure to run this script from
+a virtual or conda environment using the packages in requirements.txt.
