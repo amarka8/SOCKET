@@ -3,7 +3,7 @@
         "method": "fafo",
         "kv_cache_method": "stream-llm",
         "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
-        "save_path": "/data1/el72/ckpts/LIM/Meta-Llama-3-8B-Instruct-traink",
+        "save_path": "/ckpts/LIM/Meta-Llama-3-8B-Instruct-traink",
         "train_mode": "train_k",
         "n_init": 0.2,
         "n_local": 0.3,

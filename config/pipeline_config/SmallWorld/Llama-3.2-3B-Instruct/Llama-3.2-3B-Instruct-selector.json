@@ -3,7 +3,7 @@
         "method": "fafo",
         "kv_cache_method": "stream-llm",
         "model_name": "meta-llama/Llama-3.2-3B-Instruct",
-        "save_path": "/mnt/rds/VipinRDS/VipinRDS/users/dhl64/ckpts/LIM/Llama-3.2-3B-Instruct-selector",
+        "save_path": "/ckpts/LIM/Llama-3.2-3B-Instruct-selector",
         "load_model_path": null,
         "train_mode": "only_selector",
         "n_init": 0.2,
