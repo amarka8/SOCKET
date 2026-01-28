@@ -3,7 +3,7 @@
         "method": "smallworld",
         "kv_cache_method": "stream-llm",
         "model_name": "meta-llama/Llama-3.1-8B-Instruct",
-        "save_path": "/scratch/sj157/checkpoints/Llama-3.2-1B-Instruct-selector",
+        "save_path": "/savepath/for/model/checkpoints",
         "load_model_path": null,
         "train_mode": "inference_only",
         "n_init": 0.2,
@@ -256,12 +256,12 @@
         "exp_desc": "longbench_LongAlpaca-12k_Llama-3.1-8B-Instruct_SmallWorld",
         "pipeline_config_dir": "config/pipeline_config/SmallWorld/Llama-3.1-8B-Instruct/Llama-3.1-8B-Instruct-inference-32hadamard.json",
         "eval_config_dir": "config/eval_config/longbench/qasper.json",
-        "output_folder_dir": "/scratch/sj157/Small_World_Attention/scripts/small_world_inference/Llama-3.1-8B-Instruct/longbench/SmallWorld/Llama-3.1-8B-Instruct/LongAlpaca-12k/",
+        "output_folder_dir": "/savepath/for/dataset",
         "job_post_via": "slurm_sbatch",
         "slurm_info": {
             "slurm_job_id": "78314",
             "slurm_job_name": "trial",
-            "slurm_out_file_dir": "/scratch/sj157/slurm-78314.out"
+            "slurm_out_file_dir": "/output/directory/for/slurm/job"
         },
         "sub_dir": {
             "input_config": "input_config/",

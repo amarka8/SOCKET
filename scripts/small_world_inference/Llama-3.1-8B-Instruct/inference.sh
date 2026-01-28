@@ -7,10 +7,12 @@ model="Llama-3.1-8B-Instruct"
 method="SmallWorld"
 
 export COLOR_PRINT=1
-export TRITON_CACHE_DIR="/scratch/sj157/triton_cache"
+# ADD PATH TO TRITON CACHE HERE
+export TRITON_CACHE_DIR="/path/to/triton_cache"
 export CHAT=1
 
-cd /scratch/sj157/SOCKET || exit
+# CD INTO DIRECTORY FROM WHICH PATHS BELOW ARE RELATIVE (e.g. ../pipeline)
+cd /path/to/directory || exit
 
 deepspeed --master_port 27501 pipeline/train_quest/main.py \
     --exp_desc ${task}_${train_dataset}_${model}_${method} \

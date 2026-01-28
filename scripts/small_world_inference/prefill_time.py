@@ -1,7 +1,6 @@
 import torch
 from transformers import AutoTokenizer
 import sys
-sys.path.insert(0, "/scratch/sj157/Small_World_Attention")
 from pipeline.train_quest.modeling.modeling_llama import LlamaForCausalLM
 
 @torch.inference_mode()
