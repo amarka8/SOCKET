@@ -440,9 +440,8 @@ class LlamaAttention(nn.Module):
         self.masker_kl_weight: float = getattr(config, "topk_masker_kl_weight", 1.0)
         self.masker_mode = "joint"
 
-        self.bucket_K = getattr(config, "bucket_K", 7)           # P
-        self.bucket_L = getattr(config, "bucket_L", 20)           # L
-        self.bucket_top_t = getattr(config, "bucket_top_t", 8)
+        self.bucket_K = getattr(config, "bucket_K", 8)           # P
+        self.bucket_L = getattr(config, "bucket_L", 60)           # L
         
         self._planes_cache = {}
         self._protos_cache = {}
@@ -636,7 +635,7 @@ class LlamaAttention(nn.Module):
 
         # logits: [B, H, Q, L, R]
         logits = torch.einsum("bhqlk,kr->bhqlr", qh, protos_T)
-        return F.softmax(logits, dim=-1)
+        return F.softmax(logits/0.3, dim=-1)
 
 
     # -----------------------------------------------------------------------------
@@ -647,61 +646,6 @@ class LlamaAttention(nn.Module):
         if isinstance(size, float):
             return int(size * N)
         return int(size)
-
-
-    def _build_prev_allowed_like_maskers(
-        self,
-        B: int,
-        H: int,
-        T_q: int,
-        T_k: int,
-        allowed_ext: torch.Tensor,   # [B,H,T_q,T_k] or [B,H,1,T_k]
-        sink_size_cfg,
-        window_size_cfg,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        Build prev_allowed = SinkMasker + LocalMasker, matching the masker implementation.
-
-        Conventions:
-        - In your Mask class dense mask uses 1.0 = MASKED (blocked), 0.0 = allowed.
-        - Here we return bool allowed=True (opposite), consistent with your LlamaAttention code.
-        """
-        # effective sizes (float => ratio)
-        sink_size = self._effective_size(sink_size_cfg, T_k)
-        window_size = self._effective_size(window_size_cfg, T_k)
-        sink_size = max(0, min(int(sink_size), T_k))
-        window_size = max(0, min(int(window_size), T_k))
-
-        # Start with all-False allowed mask
-        prev_allowed = torch.zeros((B, H, T_q, T_k), device=device, dtype=torch.bool)
-
-        # ---- SinkMasker: allow first sink_size keys ----
-        if sink_size > 0:
-            prev_allowed[..., :sink_size] = True
-
-        if window_size > 0:
-            q_pos = torch.arange(T_q, device=device).view(T_q, 1)     # [T_q,1]
-            k_pos = torch.arange(T_k, device=device).view(1, T_k)     # [1,T_k]
-            diagonal_offset = k_pos - q_pos                           # [T_q,T_k]
-
-            offset1 = T_k - T_q - window_size + 1
-            offset2 = T_k - T_q + 1
-
-            # Masked band (blocked by local pattern)
-            band_masked = (diagonal_offset >= offset1) & (diagonal_offset < offset2)
-
-            local_allowed = band_masked
-            prev_allowed |= local_allowed.view(1, 1, T_q, T_k)
-
-        # ---- Gate with external allowed mask (pad+causal) ----
-        # allowed_ext is already [B,H,1,T_k] in your code; handle either shape safely.
-        if allowed_ext.dim() == 4 and allowed_ext.shape[2] == T_q:
-            prev_allowed &= allowed_ext
-        else:
-            prev_allowed &= allowed_ext.expand(B, H, T_q, T_k)
-
-        return prev_allowed
 
 
     def _get_states_container(
@@ -786,8 +730,8 @@ class LlamaAttention(nn.Module):
             # ---- init/refresh state for later 1-tok decode ----
             states = self._get_states_container(past_key_values, cra_states)
 
-            P = int(getattr(self, "bucket_K", 7))
-            L = int(getattr(self, "bucket_L", 20))
+            P = int(getattr(self, "bucket_K", 8))
+            L = int(getattr(self, "bucket_L", 60))
             R = 1 << P
 
             planes = self.get_hyper_planes(
@@ -860,7 +804,7 @@ class LlamaAttention(nn.Module):
         # ---------------------------
         sink = int(getattr(self.config, "sink_size", 20))
         window = int(getattr(self.config, "window_size", 20))
-        M_cfg = getattr(self.config, "heavy_const", getattr(self.config, "heavy_size", 0.2))
+        M_cfg = getattr(self.config, "heavy_const", getattr(self.config, "heavy_size", 0.1))
         M = self._effective_size(M_cfg, T_k)
         M = max(0, min(int(M), T_k))
 

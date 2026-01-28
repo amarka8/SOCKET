@@ -7,10 +7,10 @@ model="Llama-3.1-8B-Instruct"
 method="SmallWorld"
 
 export COLOR_PRINT=1
-export TRITON_CACHE_DIR="/scratch/ask20/triton_cache"
+export TRITON_CACHE_DIR="/scratch/sj157/triton_cache"
 export CHAT=1
 
-# cd /scratch/ask20/Small_World_Attention || exit
+cd /scratch/sj157/SOCKET || exit
 
 deepspeed --master_port 27501 pipeline/train_quest/main.py \
     --exp_desc ${task}_${train_dataset}_${model}_${method} \

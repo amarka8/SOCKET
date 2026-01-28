@@ -219,12 +219,21 @@ def get_val_dataset(
     config,
     tokenizer
 ):
-    def process_dataset(sample):
+    dataset = config["eval_params"].get("dataset")
+    def build_chat(tokenizer, prompt):
         conversation = [{"role": "system", "content": "You are a useful assistant."}]
-        conversation.append({"role": "user", "content": sample["prompt"]})
-        input_ids = tokenizer.apply_chat_template(
+        conversation.append({"role": "user", "content": prompt})
+        return tokenizer.apply_chat_template(
             conversation, tokenize=True, add_generation_prompt=True
         )
+
+    def process_dataset(sample):
+        prompt = sample["prompt"]
+        if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]:
+            # Chat models are better off without build prompts on these tasks.
+            input_ids = build_chat(tokenizer, prompt)
+        else:
+            input_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         
         max_len = config['pipeline_params']['max_model_len']
         if len(input_ids) > max_len:
