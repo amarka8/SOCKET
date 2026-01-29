@@ -75,10 +75,11 @@ shortuuid
 six
 smmap
 sympy
+tiktoken
 tokenizers
 # torch
 tqdm
-transformers
+transformers==4.57.6
 triton
 typing-inspection
 typing_extensions
