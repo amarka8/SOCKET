@@ -17,7 +17,8 @@ from datasets import load_dataset, Dataset
 from tqdm import tqdm
 
 import eval.longbench_utils.eval_long_bench as longbench_eval
-from eval.longbench_utils.constants import LONGBENCH_DATASET
+from eval.longbench_utils.constants import LONGBENCH_DATASET, RULER_DATASET
+from eval.ruler_utils.load_ruler32k import load_ruler32k
 from pipeline.baseline.utils import initialize_model_tokenizer
 
 def load_longctx_dataset(pipeline_config, dataset_config):
@@ -59,6 +60,17 @@ def load_longctx_dataset(pipeline_config, dataset_config):
 def get_dataset(tokenizer, pipeline_config, dataset_config, max_size=1000000000):
 
     def tokenize_sample(sample):
+        if dataset_config['dataset'] in RULER_DATASET:
+            # RULER prompts are self-contained (context + question + answer_prefix
+            # built at load time). Keep `answer` as the list/ndarray of refs and
+            # carry per-row max_new_tokens + task through for the runner.
+            return {
+                "prompt": sample["prompt"],
+                "answer": sample["answer"],
+                "idx": sample["idx"],
+                "max_new_tokens": sample["max_new_tokens"],
+                "task": sample["task"],
+            }
         if dataset_config['dataset'] in LONGBENCH_DATASET:
             prompt = dataset_config['instruction'].format(**sample)
             answer = sample.get("answer", sample.get("answers", ""))[0]
@@ -73,7 +85,22 @@ def get_dataset(tokenizer, pipeline_config, dataset_config, max_size=1000000000)
         }
         return sample
 
-    if dataset_config['dataset'] in LONGBENCH_DATASET:
+    if dataset_config['dataset'] in RULER_DATASET:
+        df = load_ruler32k(dataset_config['dataset'], n=100)
+        data = []
+        for idx, row in df.iterrows():
+            # Self-contained RULER prompt: NO instruction.format wrapping.
+            # answer_prefix is included (load-bearing for niah/vt/fwe) but is NOT
+            # scored — only `answer` refs are scored downstream.
+            prompt = row["context"] + row["question"] + row["answer_prefix"]
+            data.append({
+                "prompt": prompt,
+                "answer": list(row["answer"]),  # keep list-of-refs; never str()/[0]
+                "idx": idx,
+                "max_new_tokens": int(row["max_new_tokens"]),
+                "task": row["task"],
+            })
+    elif dataset_config['dataset'] in LONGBENCH_DATASET:
         ds = longbench_eval.load_data(dataset_config['dataset'])
         data = [
             {**dict(example), "idx": idx}

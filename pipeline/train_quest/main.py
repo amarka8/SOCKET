@@ -21,7 +21,11 @@ if repo_root not in sys.path:
 import pipeline.main_utils as main_utils
 from config.access_tokens import hf_access_token
 from huggingface_hub import login
-login(token=hf_access_token)
+# Only call login() when an explicit token is configured. An empty token raises
+# ValueError in huggingface_hub; falling through here lets the cached
+# credentials in HF_HOME (and locally cached model weights) be used instead.
+if hf_access_token:
+    login(token=hf_access_token)
 
 from pipeline.train_quest.run import run
 

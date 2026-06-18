@@ -635,7 +635,8 @@ class LlamaAttention(nn.Module):
 
         # logits: [B, H, Q, L, R]
         logits = torch.einsum("bhqlk,kr->bhqlr", qh, protos_T)
-        return F.softmax(logits/0.3, dim=-1)
+        tau = float(getattr(self.config, "tau", 0.3))
+        return F.softmax(logits / tau, dim=-1)
 
 
     # -----------------------------------------------------------------------------
@@ -840,6 +841,19 @@ class LlamaAttention(nn.Module):
             sparse_list = sparse_list.to(torch.int32)
         if sparse_len.dtype != torch.int32:
             sparse_len = sparse_len.to(torch.int32)
+
+        # [SOCKET-SMOKE] one-time achieved-sparsity log (layer 0, first decode):
+        # proves the sparse path is actually pruning (kept << T_k), not silently
+        # falling back to dense. Gated by env var so it never fires in campaign runs.
+        if os.environ.get("SOCKET_SMOKE_LOG") and self.layer_idx == 0 and not getattr(self, "_smoke_logged", False):
+            self._smoke_logged = True
+            kept = int(sparse_len[0, 0].item())
+            print(
+                f"[SOCKET-SMOKE] layer0 decode SPARSE: T_k={T_k} kept={kept} "
+                f"sink={sink} window={window} M={M} "
+                f"frac_kept={kept / max(T_k, 1):.4f}",
+                flush=True,
+            )
 
         q_bhd = q[:, :, 0, :].contiguous()
         out_bhd = sparse_attention_fwd(

@@ -13,7 +13,8 @@ from peft import LoraConfig, get_peft_model, PeftModel
 import deepspeed
 
 import eval.longbench_utils.eval_long_bench as longbench_eval
-from eval.longbench_utils.constants import LONGBENCH_DATASET
+from eval.longbench_utils.constants import LONGBENCH_DATASET, RULER_DATASET
+from eval.ruler_utils.calculate_metrics import calculate_metrics as ruler_calculate_metrics
 
 from pipeline.train_quest.dataset import (
     get_dataset,
@@ -97,6 +98,10 @@ def run(configs, args, logger):
         dist.init_process_group(backend="nccl")
 
     ground_truth = None
+    all_classes = None
+    is_ruler = eval_params['dataset'] in RULER_DATASET
+    ruler_task = None
+    ruler_max_new_tokens = None
     if eval_params['dataset'] in LONGBENCH_DATASET:
         ds = longbench_eval.load_data(eval_params['dataset'])
         ground_truth = [
@@ -104,11 +109,20 @@ def run(configs, args, logger):
             for idx, example in enumerate(ds)
         ]
         all_classes = ds[0]["all_classes"]
-    
+    elif is_ruler:
+        from eval.ruler_utils.load_ruler32k import load_ruler32k
+        ruler_df = load_ruler32k(eval_params['dataset'], n=100)
+        # per-row list of reference strings (kept as a list, never str()/[0])
+        ground_truth = [list(ans) for ans in ruler_df["answer"].tolist()]
+        all_classes = None
+        # stash per-row task + max_new_tokens (indexed by sample idx)
+        ruler_task = ruler_df["task"].tolist()
+        ruler_max_new_tokens = [int(v) for v in ruler_df["max_new_tokens"].tolist()]
+
     if rank == 0:
         print("Config:", configs)
 
-    set_seed(41)
+    set_seed(42)
     save_dir = os.path.join(pipeline_params["save_path"])
 
     if not os.path.exists(save_dir) and rank == 0:
@@ -146,7 +160,7 @@ def run(configs, args, logger):
         print(f"Loading from previous run epoch_{epoch}!")
 
     model_name = pipeline_params["model_name"]
-    use_smallworld = pipeline_params.get("method") == "smallworld"
+    use_socket = pipeline_params.get("method") == "socket"
     is_llama_instruct = model_name in {
         "meta-llama/Meta-Llama-3-8B-Instruct",
         "meta-llama/Llama-3.2-3B-Instruct",
@@ -154,7 +168,7 @@ def run(configs, args, logger):
         "meta-llama/Llama-3.1-8B-Instruct",
     }
 
-    if use_smallworld and is_llama_instruct:
+    if use_socket and is_llama_instruct:
         llama_config = AutoConfig.from_pretrained(model_name)
 
         llama_config.use_topk_masker   = True
@@ -164,10 +178,44 @@ def run(configs, args, logger):
         llama_config.topk_tau          = 1.5
         llama_config.topk_soft_alpha   = 8.0
         llama_config.random_walk_hadamard_dim = pipeline_params.get("random_walk_hadamard_dim", 128)
+
+        # ---- SOCKET soft-LSH knobs (thread from pipeline_params onto the
+        # model config so the masker reads configured values, not getattr
+        # defaults). bucket_K=P, bucket_L=L, heavy_const=ratio of heavy tokens,
+        # sink/window=absolute kept-token counts, tau=soft-hash temperature.
+        if "bucket_K" in pipeline_params:
+            llama_config.bucket_K = pipeline_params["bucket_K"]
+        if "bucket_L" in pipeline_params:
+            llama_config.bucket_L = pipeline_params["bucket_L"]
+        if "sink_size" in pipeline_params:
+            llama_config.sink_size = pipeline_params["sink_size"]
+        if "window_size" in pipeline_params:
+            llama_config.window_size = pipeline_params["window_size"]
+        if "heavy_const" in pipeline_params:
+            llama_config.heavy_const = pipeline_params["heavy_const"]
+        if "tau" in pipeline_params:
+            llama_config.tau = pipeline_params["tau"]
+
         model = LlamaForCausalLM.from_pretrained(
             model_name, config=llama_config, torch_dtype=torch.bfloat16
         )
+        # [SOCKET-SMOKE] prove the masker branch is hit + set_masker_mode runs.
+        print(
+            f"[SOCKET-SMOKE] use_socket branch HIT; method={pipeline_params.get('method')} "
+            f"bucket_K={getattr(llama_config,'bucket_K',None)} "
+            f"bucket_L={getattr(llama_config,'bucket_L',None)} "
+            f"sink={getattr(llama_config,'sink_size',None)} "
+            f"window={getattr(llama_config,'window_size',None)} "
+            f"heavy_const={getattr(llama_config,'heavy_const',None)} "
+            f"tau={getattr(llama_config,'tau',None)}",
+            flush=True,
+        )
         model.set_masker_mode(configs['pipeline_params']["train_mode"])
+        print(
+            f"[SOCKET-SMOKE] set_masker_mode('{configs['pipeline_params']['train_mode']}') "
+            f"called; topk_masker_mode={getattr(model.config,'topk_masker_mode',None)}",
+            flush=True,
+        )
     else:
         model = AutoModelForCausalLM.from_pretrained(model_name, device_map=None, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -269,7 +317,9 @@ def run(configs, args, logger):
         )
 
 
-    max_new_tokens = eval_params["max_new_tokens"]
+    # RULER carries max_new_tokens per row from the dataset; LongBench uses the
+    # single config value. Use .get() so RULER configs need not set it.
+    max_new_tokens = eval_params.get("max_new_tokens", None)
     total_train_steps = 0
     best_acc = 0
     collator = MyCollator(tokenizer, label_pad_token_id=-100)
@@ -400,26 +450,40 @@ def run(configs, args, logger):
                     assert len(batch["input_ids"]) == 1
                     total += 1
 
+                    # RULER honors per-row max_new_tokens from the dataset
+                    # (niah=128, qa=32, vt=30, fwe=50); LongBench uses the
+                    # single config value.
+                    if is_ruler:
+                        step_max_new_tokens = ruler_max_new_tokens[int(test_idx)]
+                    else:
+                        step_max_new_tokens = max_new_tokens
+
                     # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
                     # Inference has bug: after generate the first token, attention_mask is not correctly generated
                     answer = model_module.generate(
                         **batch,
                         config=configs,
-                        max_new_tokens=max_new_tokens,
+                        max_new_tokens=step_max_new_tokens,
                         synced_gpus=use_deepspeed,
                     )
                     predictions.append(answer)
                     prediction_indices.append(int(test_idx))
-                    score += longbench_eval.scorer(
-                        eval_params['dataset'],
-                        [answer],
-                        [ground_truth[test_idx]],
-                        all_classes
-                        )
+                    if is_ruler:
+                        # RULER is scored once over the whole results frame after
+                        # the loop (matches the hub's calculate_metrics exactly).
+                        # The running `score` tensor is unused for RULER.
+                        pass
+                    else:
+                        score += longbench_eval.scorer(
+                            eval_params['dataset'],
+                            [answer],
+                            [ground_truth[test_idx]],
+                            all_classes
+                            )
                     if idx < 50 and rank == 0:
-                        # print some examples
+                        # print some examples (reference vs model output)
                         print(
-                            f"Question {test_idx}: Answer = '{answer}'"
+                            f"Question {test_idx}: Reference = '{ground_truth[test_idx]}'"
                         )
                         print(f"Extracted Output: '{answer}'")
 
@@ -464,8 +528,35 @@ def run(configs, args, logger):
                 max_idx = max(pred_map.keys()) if pred_map else -1
                 all_predictions = [pred_map.get(i) for i in range(max_idx + 1)]
 
-            final_score = 100 * score / total
-            final_score = final_score.detach().cpu().item()
+            ruler_per_task = None
+            if is_ruler:
+                # Single-pass scoring over the assembled results frame, matching
+                # the hub's calculate_metrics: string_match_part for qa_*,
+                # string_match_all otherwise. answer stays a list-of-refs.
+                final_score = 0.0
+                if rank == 0 and all_predictions is not None:
+                    import pandas as pd
+                    rows = []
+                    for i, pred in enumerate(all_predictions):
+                        if pred is None:
+                            continue
+                        rows.append({
+                            "task": ruler_task[i],
+                            "predicted_answer": pred,
+                            "answer": ground_truth[i],  # list-of-refs
+                        })
+                    results_df = pd.DataFrame(rows)
+                    scores = ruler_calculate_metrics(results_df)
+                    ruler_per_task = {t: v["string_match"] for t, v in scores.items()}
+                    final_score = (
+                        sum(ruler_per_task.values()) / len(ruler_per_task)
+                        if ruler_per_task else 0.0
+                    )
+                    print(f"[RULER] per-task string_match: {ruler_per_task}")
+                    print(f"[RULER] overall mean string_match: {round(final_score, 2)}")
+            else:
+                final_score = 100 * score / total
+                final_score = final_score.detach().cpu().item()
             if rank == 0:
                 print(f"Accuracy on validation set: {round(final_score, 2)}")
             sys.stdout.flush()
@@ -476,8 +567,10 @@ def run(configs, args, logger):
                 "score": final_score,
                 "outputs": all_predictions,
             }
+            if is_ruler:
+                processed_result["ruler_per_task"] = ruler_per_task
             raw_result = {
-                "total_score": score.detach().cpu().item(),
+                "total_score": (0.0 if is_ruler else score.detach().cpu().item()),
                 "total": total.detach().cpu().item(),
             }
             if pipeline_params["only_eval"]:

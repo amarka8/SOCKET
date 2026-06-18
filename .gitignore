@@ -7,3 +7,5 @@ output
 
 **/scbench/
 processed_dataset/
+# benchmark run outputs / logs / scratch (reproducible artifacts)
+socket_bench/

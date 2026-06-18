@@ -1,12 +1,12 @@
 To evaluate accuracy on the qasper dataset using LongAlpaca-12k for training and the Llama 3.1 8B model, follow these steps:
 
-1. Navigate to /SOCKET/scripts/small_world_inference/Llama-3.1-8B-Instruct/inference.sh.
+1. Navigate to /SOCKET/scripts/socket_inference/Llama-3.1-8B-Instruct/inference.sh.
 2. Update the following lines in the script:
     task="longbench"
     train_dataset="LongAlpaca-12k"
     eval_dataset="qasper"
     model="Llama-3.1-8B-Instruct"
-    method="SmallWorld"
+    method="SOCKET"
     cd /path/to/directory
     export TRITON_CACHE_DIR="/path/to/triton_cache"
 
