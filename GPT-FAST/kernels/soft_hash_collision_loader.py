@@ -30,7 +30,10 @@ CUDA_WRAPPER_TEMPLATE = Template(
         TORCH_CHECK(v_hist_in.is_contiguous(), "v_hist must be contiguous");
 
         TORCH_CHECK(q_probs.scalar_type() == torch::kFloat, "q_probs must be float32");
-        TORCH_CHECK(key_buckets.scalar_type() == torch::kInt16, "key_buckets must be int16");
+        // int16 is REQUIRED: pack_bits over K=8 bits yields bucket values 0..255 (R=256),
+        // which DO NOT fit in signed int8 (max 127) -> values 128..255 would wrap negative
+        // and mis-index q_probs[...,r]. int8 buckets are a correctness bug; reject loudly.
+        TORCH_CHECK(key_buckets.scalar_type() == torch::kInt16, "key_buckets must be int16 (int8 loses buckets 128..255 for R=256)");
         TORCH_CHECK(allowed_ext.scalar_type() == torch::kBool, "allowed_ext must be bool");
         TORCH_CHECK(v_hist_in.scalar_type() == torch::kFloat, "v_hist must be float32");
 
@@ -49,12 +52,14 @@ CUDA_WRAPPER_TEMPLATE = Template(
         int64_t L = q.size(3);
         int64_t R = q.size(4);
         int64_t T_k = kb.size(3);
+        int64_t Hkv = kb.size(1);   // PER-KV-HEAD: key_buckets is [B,Hkv,L,T_k]
 
-        TORCH_CHECK(kb.size(0) == B && kb.size(1) == H && kb.size(2) == L,
+        TORCH_CHECK(H % Hkv == 0, "n_head must be divisible by n_kv_heads");
+        TORCH_CHECK(kb.size(0) == B && kb.size(2) == L,
                     "key_buckets shape mismatch");
         TORCH_CHECK(al.size(0) == B && al.size(1) == H && al.size(2) == 1 && al.size(3) == T_k,
                     "allowed_ext shape mismatch");
-        TORCH_CHECK(v_hist.size(0) == B && v_hist.size(1) == H && v_hist.size(2) == 1 && v_hist.size(3) == T_k,
+        TORCH_CHECK(v_hist.size(0) == B && v_hist.size(1) == Hkv && v_hist.size(2) == 1 && v_hist.size(3) == T_k,
                     "v_hist shape mismatch");
 
         auto out = torch::zeros({B, H, 1, T_k}, q.options());

@@ -22,94 +22,10 @@ sys.path.append(str(wd))
 
 from model import Transformer
 from tp import maybe_init_dist
-from sentencepiece import SentencePieceProcessor
+from tokenizer import get_tokenizer
 from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
 
 @torch.no_grad()
-def warmup_triton_sparse_decode(model: Transformer, device: torch.device, *, T: int = 4096, block_seq: int = 256):
-    """
-    Warm up BOTH:
-      - build_sparse_list_decode (index_build)
-      - sparse_attention_fwd (sparse_kernel)
-
-    Call after model.setup_caches(...) and model is on `device`.
-    """
-    attn = model.layers[0].attention
-    B = 1
-    H = attn.n_head
-    Hl = attn.n_local_heads
-    D = attn.head_dim
-    L = attn.L
-    R = attn.R
-    Ktotal = int(attn.heavy_const)
-
-    # representative decode length (prefix length)
-    T = int(T)
-    T = max(T, 256)  # avoid tiny degenerate shapes
-
-    # Build dummy inputs on device
-    q_bhd = torch.empty((B, H, D), device=device, dtype=torch.bfloat16)
-
-    # q_probs: [B,H,L,R]
-    q_probs = torch.empty((B, H, L, R), device=device, dtype=torch.bfloat16).normal_()
-
-    # k_hard_bhlt: [B,H,L,T] int16 in [0, R-1]
-    k_hard_bhlt = torch.randint(
-        low=0, high=R, size=(B, H, L, T), device=device, dtype=torch.int16
-    )
-
-    # v_norm_bht: [B,H,T] fp16
-    v_norm_bht = torch.rand((B, H, T), device=device, dtype=torch.float16)
-
-    # allowed_bht: [B,H,T] bool
-    allowed_bht = torch.ones((B, H, T), device=device, dtype=torch.bool)
-
-    # k/v backend: [B,Hl,T,D] bf16
-    k_backend = torch.empty((B, Hl, T, D), device=device, dtype=torch.bfloat16)
-    v_backend = torch.empty((B, Hl, T, D), device=device, dtype=torch.bfloat16)
-
-    # Use same knobs as your decode
-    sink = int(getattr(attn.config, "sink_size", 120))
-    window = int(getattr(attn.config, "window_size", 120))
-    M = int(attn.heavy_const)
-
-    sink = max(0, min(sink, T))
-    window = max(0, min(window, T))
-    M = max(0, min(M, T))
-
-    # Run twice to ensure compilation + any autotune paths complete
-    for _ in range(2):
-        sparse_list, sparse_len = build_sparse_list_decode(
-            q_probs,
-            k_hard_bhlt,
-            v_norm_bht,
-            allowed_bht,
-            sink=sink,
-            window=window,
-            M=M,
-            KC=8,
-            BLOCK_N=512,
-            num_warps=8,
-            num_stages=2,
-        )
-
-        if sparse_list.dtype != torch.int32:
-            sparse_list = sparse_list.to(torch.int32)
-        if sparse_len.dtype != torch.int32:
-            sparse_len = sparse_len.to(torch.int32)
-
-        _ = sparse_attention_fwd(
-            q_bhd,
-            k_backend,
-            v_backend,
-            sparse_list,
-            sparse_len,
-            block_seq=block_seq,
-        )
-
-    torch.cuda.synchronize()
-
-
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
@@ -131,24 +47,24 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     idx_next = torch.argmax(probs, dim=-1, keepdim=True).to(dtype=torch.int) # TODO: change the sampling method
     return idx_next, probs
 
+def model_forward(model, x, input_pos, decode_type: str = "dense"):
+    # decode_type threaded so a SINGLE compiled unit (decode_one_token) covers BOTH the sparse
+    # SOCKET path AND the dense FA2/FA3 path. Dynamo specializes on decode_type (a python str
+    # constant -> a guard, not a graph break).
+    if decode_type == "sparse":
+        return model.sparse_forward(x, input_pos)
+    return model(x, input_pos)
+
+
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, decode_type: str, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
-    if decode_type == "dense":
-        logits = model(x, input_pos)
-    else:
-        logits = model.sparse_forward(x, input_pos)
+    logits = model_forward(model, x, input_pos, decode_type=decode_type)
     return sample(logits, **sampling_kwargs)[0]
 
-def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, decode_type: str = "dense", **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
-    logits = model(x, input_pos)
-    return sample(logits, **sampling_kwargs)
-
-def sparse_decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-    # input_pos: [B, 1]
-    assert input_pos.shape[-1] == 1
-    logits = model.sparse_forward(x, input_pos)
+    logits = model_forward(model, x, input_pos, decode_type=decode_type)
     return sample(logits, **sampling_kwargs)
 
 
@@ -164,19 +80,14 @@ def decode_n_tokens(
     new_tokens, new_probs = [], []
 
     for _ in range(num_new_tokens):
-        if decode_type == "dense":
-            # Dense path
-            with sdpa_kernel([SDPBackend.MATH]):
-                next_token, next_prob = decode_one_token(
-                    model, cur_token, input_pos, **sampling_kwargs
-                )
-        else:
-            with sdpa_kernel([ SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, ]):
-                next_token, next_prob = sparse_decode_one_token(
-                    model, cur_token, input_pos, **sampling_kwargs
-                )
+        next_token, next_prob = decode_one_token(
+            model, cur_token, input_pos, decode_type=decode_type, **sampling_kwargs
+        )
 
         input_pos += 1
+        # CLONE before feeding to the next step: under torch.compile(mode="reduce-overhead")
+        # next_token is a CUDA-graph output buffer the next decode_one_token call overwrites;
+        # a bare view would alias it. Cloning gives the next step an independent input.
         next_token = next_token.clone()
         next_prob = next_prob.clone()
 
@@ -184,13 +95,10 @@ def decode_n_tokens(
         new_probs.append(next_prob)
         callback(next_token)
 
-        cur_token = next_token
+        cur_token = next_token.clone()
 
     return new_tokens, new_probs
 
-
-def model_forward(model, x, input_pos):
-    return model(x, input_pos)
 
 def speculative_decode(
     model: Transformer,
@@ -279,9 +187,11 @@ def generate(
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
 
-    T_warm = min(model.max_seq_length, prompt.size(1)) 
-    print("T_warm:", T_warm)
-    warmup_triton_sparse_decode(model, torch.device("cuda"), T=T_warm, block_seq=256)
+    # Kernel warmup is handled EXCLUSIVELY by the SOCKET_DECODE_WARMUP untimed compiled decode
+    # steps below (mirrors the proven FORK, which has no standalone pre-warm). A standalone
+    # dummy-shape pre-warm autotuned the triton grids at the WRONG static size (it used T=prompt_len
+    # instead of the real cache maxlen=find_multiple(T_new,8)), so it warmed kernels the timed run
+    # never executes; removed.
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty((batch_size, T_new), dtype=dtype, device=device)
     empty[:,:T] = prompt
@@ -323,6 +233,8 @@ def generate(
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
 
+    _decode_warmup = 0  # set in the standard (non-speculative) decode branch below
+
     if is_speculative:
         input_pos = input_pos.item()  # for speculative decoding easier to keep on host
         while input_pos < T_new - 1:
@@ -340,16 +252,47 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
+        # KERNEL-WARMUP EXCLUSION. The first decode step pays one-time costs the timed window
+        # must NOT include: Triton JIT + autotune of the sparse stage1/stage2 kernels, the CUDA
+        # scorer's first launch, and the torch.compile CUDA-graph RECORDING (under reduce-overhead
+        # the graph is recorded on the first replay against these static buffers). Run
+        # SOCKET_DECODE_WARMUP untimed decode steps FIRST (they trigger every JIT/build/record on
+        # the SAME static buffers the timed steps reuse), then RESTART the decode timer so only
+        # warm CUDA-graph-replay steps are timed. Default 0 = original behavior (whole loop timed).
+        _total_decode = max_new_tokens - 1
+        _decode_warmup = int(os.getenv("SOCKET_DECODE_WARMUP", "0"))
+        _decode_warmup = min(_decode_warmup, _total_decode - 1) if (_decode_warmup > 0 and _total_decode > 1) else 0
+        if _decode_warmup > 0:
+            warm_tokens, _ = decode_n_tokens(
+                model,
+                next_token,
+                input_pos,
+                _decode_warmup,
+                callback=callback,
+                decode_type=decode_type,
+                **sampling_kwargs,
+            )
+            if len(warm_tokens) > 0:
+                seq[:, T + 1: T + 1 + _decode_warmup] = torch.cat(warm_tokens, dim=1)
+                next_token = warm_tokens[-1].view(batch_size, -1)
+            # kernels are warm + CUDA graph recorded; restart the decode timer to EXCLUDE warmup.
+            torch.cuda.synchronize()
+            if use_cuda_timing:
+                decode_start_evt.record()
+            else:
+                decode_start_t = time.perf_counter()
+
         generated_tokens, _ = decode_n_tokens(
             model,
             next_token,
             input_pos,
-            max_new_tokens - 1,
+            _total_decode - _decode_warmup,
             callback=callback,
             decode_type=decode_type,
             **sampling_kwargs,
         )
-        seq[:,T + 1:] = torch.cat(generated_tokens, dim=1)
+        if len(generated_tokens) > 0:
+            seq[:, T + 1 + _decode_warmup:] = torch.cat(generated_tokens, dim=1)
 
     if use_cuda_timing:
         decode_end_evt.record()
@@ -358,8 +301,8 @@ def generate(
     else:
         decode_time_s = time.perf_counter() - decode_start_t
 
-    # Decode-only tokens exclude the first token produced by prefill.
-    decode_only_tokens = batch_size * max(0, max_new_tokens - 1)
+    # Decode-only tokens exclude the first token (from prefill) AND the warmup steps.
+    decode_only_tokens = batch_size * max(0, (max_new_tokens - 1) - _decode_warmup)
 
     generate_stats = {
         'accept_counts': accept_counts,
@@ -485,12 +428,18 @@ def main(
     torch.cuda.synchronize()
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
-    tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+    # llama-3.1 needs the tiktoken tokenizer; get_tokenizer picks tiktoken vs sentencepiece
+    # based on the model name (checkpoint parent dir, e.g. "llama-3.1-8b").
+    tokenizer = get_tokenizer(str(tokenizer_path), checkpoint_path.parent.name)
 
     if (prompt_file is not None) and (not interactive):
         prompt = Path(prompt_file).read_text(encoding="utf-8")
     encoded = encode_tokens(tokenizer, prompt, batch_size=batch_size, bos=True, device=device)
     prompt_length = encoded.size(1)
+    # Log the ACTUAL token count so the realized sparsity (N / (heavy+sink+window)) is recorded
+    # per cell. Greppable, one line, stdout — does not touch any timing or selection math.
+    print(f"[PROMPT-LEN] prompt_len={prompt_length} decode_type={decode_type} "
+          f"max_new_tokens={max_new_tokens}", flush=True)
 
     torch.manual_seed(1234)
     model_size = sum([p.numel() * p.dtype.itemsize for p in itertools.chain(model.parameters(), model.buffers())])
@@ -499,7 +448,7 @@ def main(
             torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
 
         if is_speculative:
-            global model_forward, logits_to_prob
+            global model_forward
             model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
 
         global decode_one_token, prefill
@@ -523,7 +472,7 @@ def main(
             prompt = input("What is your prompt? ")
             if is_chat:
                 prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-            encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+            encoded = encode_tokens(tokenizer, prompt, batch_size=batch_size, bos=True, device=device)
 
         if interactive and i >= 0:
             buffer = []
@@ -533,8 +482,12 @@ def main(
                 nonlocal done_generating
                 if done_generating:
                     return
-                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
-                if x.item() == tokenizer.eos_id():
+                # decode_n_tokens feeds the callback a batched [B,1] next_token; index the first
+                # batch row to a python int (x.tolist() would be a nested [[id]] and x.item() raises
+                # on a >1-element tensor when B>1).
+                t = int(x.view(-1)[0])
+                buffer.append(tokenizer.decode([period_id, t])[1:])
+                if t == tokenizer.eos_id():
                     done_generating = True
                 if len(buffer) == 4 or done_generating:
                     print(''.join(buffer), end='', flush=True)
@@ -575,7 +528,12 @@ def main(
         t = time.perf_counter() - t0
 
         if not interactive:
-            print(tokenizer.decode(y.tolist()))
+            # display-only detokenization; never let a tokenizer hiccup kill the timing print below.
+            try:
+                toks = y[0].tolist() if y.dim() > 1 else y.tolist()
+                print(tokenizer.decode(toks))
+            except Exception as _e:
+                print(f"(detok skipped: {type(_e).__name__}: {_e})")
         else:
             print()
         tokens_generated = batch_size * (y.size(1) - prompt_length)
