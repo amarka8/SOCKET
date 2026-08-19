@@ -244,20 +244,6 @@ else:
     build_list_op = torch.no_grad()(_build_list_impl)
 
 
-# sparse_len is CONSTANT (== sparse_list.shape[-1]) for every (b,h) by construction, and it is
-# re-created with torch.full on every layer of every decode step. Cache it per (device,B,H,W)
-# so the launch disappears from the steady-state decode path.
-_SPARSE_LEN_CACHE = {}
-
-def _get_sparse_len(B, H, W, device):
-    key = (B, H, W, str(device))
-    t = _SPARSE_LEN_CACHE.get(key)
-    if t is None:
-        t = torch.full((B, H), W, device=device, dtype=torch.int32)
-        _SPARSE_LEN_CACHE[key] = t
-    return t
-
-
 @torch.no_grad()
 def build_sparse_list_decode(
     q_probs: torch.Tensor,         # [B,H,L,R] fp16        (PER-QUERY-HEAD H)
@@ -318,47 +304,39 @@ def build_sparse_list_decode(
 
     # NOTE: KC/BLOCK_N/num_warps/num_stages kept for API compatibility.
     M_eff = min(M, maxlen)  # static
-    _triton_scorer = os.environ.get("SOCKET_TRITON_SCORER", "1") == "1"
-    if M_eff > 0 and _triton_scorer:
-        # Triton scorer: no allowed tensor, native-dtype v_norm, no fp32 q_probs copy.
-        key_buckets = k_hard_bhlt
-        if key_buckets.dtype != torch.int16:
-            key_buckets = key_buckets.to(torch.int16)
-        scores = torch.empty((B, H, maxlen), device=device, dtype=torch.float32)
-        soft_hash_score_op(q_probs.contiguous(), key_buckets.contiguous(),
-                           v_norm_bht.contiguous(), seq_len_t.reshape(()), scores)
-    elif M_eff > 0:
-        # LEGACY CUDA scorer (SOCKET_TRITON_SCORER=0): kept so the gates can compare against
-        # byte-identical baseline math in the same build.
-        q_probs_f32 = q_probs.float().unsqueeze(2).contiguous()  # [B,H,1,L,R]  (per query head)
+    if M_eff > 0:
         key_buckets = k_hard_bhlt                                  # [B,Hkv,L,maxlen] (per kv head)
         # int16 REQUIRED: R=256 buckets span 0..255 which do NOT fit signed int8 -> NO int8.
         if key_buckets.dtype != torch.int16:
             key_buckets = key_buckets.to(torch.int16)
         key_buckets = key_buckets.contiguous()
-        allowed_ext = allowed_bht.unsqueeze(2).contiguous()       # [B,H,1,maxlen]   (per query head)
-        v_hist = v_norm_bht.float().unsqueeze(2).contiguous()     # [B,Hkv,1,maxlen] (per kv head)
 
-        # Call through the registered custom op (socket::soft_hash_collision)
-        # so torch.compile(fullgraph=True) sees a known op instead of an opaque
-        # pybind call. The op body calls the identical CUDA kernel -> bit-identical.
-        scores = torch.ops.socket.soft_hash_collision(
-            q_probs_f32,
-            key_buckets,
-            allowed_ext,
-            v_hist,
-        ).squeeze(2)  # [B,H,maxlen]  (unfilled/disallowed columns are -inf)
+        if os.environ.get("SOCKET_TRITON_SCORER", "1") == "1":
+            # Triton scorer: bit-exact (same fp32 adds, same l order), but needs no `allowed`
+            # tensor, reads v_norm in its native dtype, and gathers q_probs from the native
+            # bf16 table instead of a materialized fp32 copy.
+            scores = torch.empty((B, H, maxlen), device=device, dtype=torch.float32)
+            soft_hash_score_op(q_probs.contiguous(), key_buckets,
+                               v_norm_bht.contiguous(), seq_len_t.reshape(()), scores)
+        else:
+            # LEGACY CUDA scorer (SOCKET_TRITON_SCORER=0): kept so the gates can compare
+            # against byte-identical baseline math in the same build.
+            q_probs_f32 = q_probs.float().unsqueeze(2).contiguous()  # [B,H,1,L,R]
+            allowed_ext = allowed_bht.unsqueeze(2).contiguous()      # [B,H,1,maxlen]
+            v_hist = v_norm_bht.float().unsqueeze(2).contiguous()    # [B,Hkv,1,maxlen]
+            # Registered custom op (socket::soft_hash_collision) so torch.compile
+            # (fullgraph=True) sees a known op instead of an opaque pybind call.
+            scores = torch.ops.socket.soft_hash_collision(
+                q_probs_f32, key_buckets, allowed_ext, v_hist,
+            ).squeeze(2)  # [B,H,maxlen]  (unfilled/disallowed columns are -inf)
 
-        # sorted=False: the list is consumed as a SET (the stage1 online softmax visits
-        # every slot and -1 slots are masked out), so topk's descending SORT of the M
-        # selected entries is dead weight. Measured 0.212 -> 0.115 ms at M=4104 (33x) and
-        # 0.135 -> 0.114 ms at M=2627 (50x) per layer per decode step at T=143411.
-        # The selected SET is unchanged; only the order within the list differs, which
-        # changes the online-softmax accumulation ORDER (hence last-bit fp differences,
-        # not selection differences).
-        # SOCKET_TOPK_SORTED=1 restores the original sorted=True call: a LEGACY control so
-        # the pre/post change can be A/B'd in one build and so the equivalence gates can be
-        # run against byte-identical baseline math.
+        # sorted=False: the list is consumed as a SET (the stage1 online softmax visits every
+        # slot and -1 slots are masked out), so topk's descending SORT of the M selected
+        # entries is dead weight. Measured per layer per decode step at T=143411:
+        # 0.212 -> 0.115 ms at M=4104 (33x), 0.135 -> 0.114 ms at M=2627 (50x). The selected
+        # SET is unchanged; only the order within the list differs, which changes the
+        # online-softmax accumulation ORDER (last-bit fp differences, not selection changes).
+        # SOCKET_TOPK_SORTED=1 restores sorted=True (LEGACY control for A/B + the gates).
         top = torch.topk(scores, k=M_eff, dim=-1, largest=True,
                          sorted=(os.environ.get("SOCKET_TOPK_SORTED", "0") == "1"))
         heavy_idx = top.indices.to(torch.int32)
@@ -384,7 +362,12 @@ def build_sparse_list_decode(
         else:
             heavy_in = heavy_idx
         build_list_op(heavy_in, seq_len_t.reshape(()), sparse_list, sink, window, maxlen)
-        sparse_len = _get_sparse_len(B, H, W, device)
+        # NOTE: sparse_len must be allocated FRESH here. Caching it across calls (it is a
+        # constant W for every (b,h)) breaks under torch.compile(mode="reduce-overhead"):
+        # the cached tensor is allocated inside the CUDA-graph memory pool on the first
+        # (recording) call, and reusing it on later replays raises "accessing tensor output
+        # of CUDAGraphs that has been overwritten by a subsequent run".
+        sparse_len = torch.full((B, H), W, device=device, dtype=torch.int32)
         return sparse_list, sparse_len
 
     # ---- LEGACY eager path (bit-identical reference used by the equivalence gates) --------
