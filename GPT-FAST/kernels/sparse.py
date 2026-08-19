@@ -666,13 +666,23 @@ def _sparse_decode_stage1_impl(
     block_seq: int,
     max_len_in_batch: int,
 ) -> None:
-    # BLOCK_N is the inner gather width. 16 was leaving the gather badly under-vectorized:
-    # measured stage1 at T=143411/width=3107 is 52.5us at BLOCK_N=16 vs 27.9us at BLOCK_N=64
-    # (1.9x), and 68.7 -> 36.0us at width=4584. BLOCK_SEQ stays 256 so stage2's partial count
-    # is unchanged. INVARIANT: BLOCK_SEQ % BLOCK_N == 0 -- the inner mask is
+    # BLOCK_N is the inner gather width. Widening it 16 -> 64 makes the stage1 KERNEL 1.9x
+    # faster (T=143411: 53.5 -> 28.2 us at width=3107, 70.3 -> 36.0 us at width=4584, output
+    # bitwise-identical) -- but that does NOT surface end to end. Measured same-GPU in the
+    # final config at 140K, BLOCK_N 16 vs 64: 89.26/89.33 (P10L10 33x), 93.06/92.80
+    # (P10L10 50x), 92.61/93.99 (P8L50 50x) -- mean +0.4%, inside the ~1% within-job drift.
+    # The decode step simply is not bound by stage1 at these shapes.
+    # Meanwhile BLOCK_N=64 is the ONLY change in this branch that alters the generated tokens
+    # on real text (it re-blocks the online softmax, so the fp accumulation order moves; with
+    # the selection as tie-degenerate as it is on this build -- see the protos_T note in the
+    # report -- that flips which tokens get attended and the greedy stream diverges within a
+    # few steps). Taking a reproducibility hit for no measured gain is a bad trade, so the
+    # DEFAULT stays at the baseline value 16 and 64 is left as an opt-in knob for shapes
+    # where stage1 does dominate.
+    # BLOCK_SEQ stays 256 so stage2's partial count is unchanged. INVARIANT: BLOCK_SEQ % BLOCK_N == 0 -- the inner mask is
     # `offs_n_new < cur_seq_len` (not < cur_block_end), so a non-dividing BLOCK_N would let a
     # block read into the NEXT block's range and DOUBLE-COUNT those tokens.
-    BLOCK_N = int(os.environ.get("SOCKET_BLOCK_N", "64"))
+    BLOCK_N = int(os.environ.get("SOCKET_BLOCK_N", "16"))
     assert block_seq % BLOCK_N == 0, (
         f"BLOCK_SEQ ({block_seq}) must be divisible by BLOCK_N ({BLOCK_N}); otherwise stage1 "
         f"blocks overlap and double-count tokens in the online softmax.")
