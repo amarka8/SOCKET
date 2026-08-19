@@ -19,6 +19,16 @@ except Exception:  # pragma: no cover - very old torch
     def wrap_triton(k):  # type: ignore
         return k
 
+# Which scorer implementation to use: "cuda" (the load_inline kernel, DEFAULT),
+# "triton" (mutating triton_op) or "tritonalloc" (same kernel, non-mutating custom_op).
+# Default is "cuda" because both Triton forms, despite winning the isolated microbenchmark,
+# LOSE end-to-end under torch.compile -- see the comment on _soft_hash_score_alloc.
+# SOCKET_TRITON_SCORER=1 is still honoured as a shorthand for "triton".
+_SCORER_IMPL = os.environ.get(
+    "SOCKET_SCORER_IMPL",
+    "triton" if os.environ.get("SOCKET_TRITON_SCORER", "0") == "1" else "cuda",
+).strip().lower()
+
 _SOFT_HASH_EXT = None
 
 def _get_soft_hash_ext():
@@ -141,12 +151,25 @@ def _soft_hash_score_impl(
 ) -> None:
     B, H, L, R = q_probs.shape
     HKV, T = key_buckets.shape[1], key_buckets.shape[3]
-    BLOCK_T = 1024
+    # Launch config matters a LOT here and the optimum is a constant ~4 ELEMENTS PER THREAD
+    # (BLOCK_T / (32*num_warps) == 4); the L-deep gather loop makes anything wider spill.
+    # Measured at T=143411 vs the CUDA scorer + the fp32 casts it forces (105.4 us at L=10,
+    # 251.3 us at L=50):
+    #   L=10: (128,1) 47.7us = 2.21x   [(1024,4) -- the first default here -- was 51.2us]
+    #   L=50: (256,2) 180.3us = 1.39x  [(1024,4) was 298.3us = 0.84x, i.e. a REGRESSION]
+    # 40 (BLOCK_T, num_warps) variants were checked and every one is bitwise-equal to the
+    # CUDA scorer, so this choice is purely a performance knob.
+    if L <= 16:
+        BLOCK_T, warps = 128, 1
+    else:
+        BLOCK_T, warps = 256, 2
+    BLOCK_T = int(os.environ.get("SOCKET_SCORER_BLOCK_T", BLOCK_T))
+    warps = int(os.environ.get("SOCKET_SCORER_WARPS", warps))
     grid = (triton.cdiv(T, BLOCK_T), H, B)
     wrap_triton(_fwd_kernel_soft_hash_score)[grid](
         q_probs, key_buckets, v_norm, seq_len_t, out,
         H=H, HKV=HKV, L=L, R=R, T=T, BLOCK_T=BLOCK_T,
-        num_warps=4, num_stages=2,
+        num_warps=warps, num_stages=2,
     )
 
 
@@ -156,6 +179,51 @@ if _HAS_TRITON_OP:
     )
 else:
     soft_hash_score_op = torch.no_grad()(_soft_hash_score_impl)
+
+
+# ---------------------------------------------------------------------------
+# ALTERNATE REGISTRATION of the SAME Triton kernel, as a NON-MUTATING custom_op that
+# allocates its own output -- structurally identical to how the CUDA scorer is registered
+# (mutates_args=(), returns a fresh tensor).
+#
+# Why: the mutating triton_op form above is 2.0-2.2x FASTER than the CUDA scorer in an
+# isolated microbenchmark, yet 6-36% SLOWER end-to-end under
+# torch.compile(mode="reduce-overhead"). The kernel accounts for only ~23 us/layer of a
+# ~174 us/layer end-to-end loss at L=50, so the cost is in how the mutated 18.4 MB output
+# buffer interacts with functionalization / cudagraph_trees, not in the arithmetic. This
+# variant removes the mutation so that hypothesis can be measured directly.
+# ---------------------------------------------------------------------------
+@torch.library.custom_op("socket::soft_hash_score_alloc", mutates_args=())
+def _soft_hash_score_alloc(
+    q_probs: torch.Tensor,
+    key_buckets: torch.Tensor,
+    v_norm: torch.Tensor,
+    seq_len_t: torch.Tensor,
+) -> torch.Tensor:
+    B, H, L, R = q_probs.shape
+    HKV, T = key_buckets.shape[1], key_buckets.shape[3]
+    out = torch.empty((B, H, T), device=q_probs.device, dtype=torch.float32)
+    if L <= 16:
+        BLOCK_T, warps = 128, 1
+    else:
+        BLOCK_T, warps = 256, 2
+    BLOCK_T = int(os.environ.get("SOCKET_SCORER_BLOCK_T", BLOCK_T))
+    warps = int(os.environ.get("SOCKET_SCORER_WARPS", warps))
+    grid = (triton.cdiv(T, BLOCK_T), H, B)
+    # raw launch (NOT wrap_triton): Dynamo never traces into a custom_op body.
+    _fwd_kernel_soft_hash_score[grid](
+        q_probs, key_buckets, v_norm, seq_len_t, out,
+        H=H, HKV=HKV, L=L, R=R, T=T, BLOCK_T=BLOCK_T,
+        num_warps=warps, num_stages=2,
+    )
+    return out
+
+
+@_soft_hash_score_alloc.register_fake
+def _soft_hash_score_alloc_fake(q_probs, key_buckets, v_norm, seq_len_t):
+    B, H = q_probs.shape[0], q_probs.shape[1]
+    T = key_buckets.shape[3]
+    return q_probs.new_empty((B, H, T), dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -311,13 +379,17 @@ def build_sparse_list_decode(
             key_buckets = key_buckets.to(torch.int16)
         key_buckets = key_buckets.contiguous()
 
-        if os.environ.get("SOCKET_TRITON_SCORER", "1") == "1":
-            # Triton scorer: bit-exact (same fp32 adds, same l order), but needs no `allowed`
-            # tensor, reads v_norm in its native dtype, and gathers q_probs from the native
-            # bf16 table instead of a materialized fp32 copy.
+        _impl = _SCORER_IMPL
+        if _impl == "triton":
+            # Mutating triton_op form.
             scores = torch.empty((B, H, maxlen), device=device, dtype=torch.float32)
             soft_hash_score_op(q_probs.contiguous(), key_buckets,
                                v_norm_bht.contiguous(), seq_len_t.reshape(()), scores)
+        elif _impl == "tritonalloc":
+            # Same kernel, non-mutating custom_op form (allocates its own output).
+            scores = torch.ops.socket.soft_hash_score_alloc(
+                q_probs.contiguous(), key_buckets,
+                v_norm_bht.contiguous(), seq_len_t.reshape(()))
         else:
             # LEGACY CUDA scorer (SOCKET_TRITON_SCORER=0): kept so the gates can compare
             # against byte-identical baseline math in the same build.

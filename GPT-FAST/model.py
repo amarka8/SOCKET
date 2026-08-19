@@ -18,9 +18,13 @@ from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
 # True only when a LEGACY (pre-optimization) path that consumes the [B,H,maxlen] bool
 # `allowed` tensor is selected. Read once at import -> a torch.compile guard, not a
 # graph break.
+_SCORER_IMPL = os.environ.get(
+    "SOCKET_SCORER_IMPL",
+    "triton" if os.environ.get("SOCKET_TRITON_SCORER", "0") == "1" else "cuda",
+).strip().lower()
 _NEEDS_ALLOWED_MASK = (
-    os.environ.get("SOCKET_TRITON_SCORER", "1") != "1"
-    or os.environ.get("SOCKET_FUSED_LIST", "1") != "1"
+    _SCORER_IMPL == "cuda"                       # the CUDA scorer takes allowed_ext
+    or os.environ.get("SOCKET_FUSED_LIST", "1") != "1"   # eager list assembly gathers it
 )
 
 
