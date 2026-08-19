@@ -29,6 +29,11 @@ _SCORER_IMPL = os.environ.get(
     "triton" if os.environ.get("SOCKET_TRITON_SCORER", "0") == "1" else "cuda",
 ).strip().lower()
 
+# Empty-chunk NaN guard (see the stage1 comment). Default ON. SOCKET_NAN_GUARD=0 compiles it
+# out and REPRODUCES THE ORIGINAL BUG -- used by tests/test_empty_chunk_nan.py and to measure
+# the guard's cost.
+_NAN_GUARD = os.environ.get("SOCKET_NAN_GUARD", "1") == "1"
+
 _SOFT_HASH_EXT = None
 
 def _get_soft_hash_ext():
@@ -497,6 +502,7 @@ def _fwd_kernel_sparse_decode_stage1(
     BLOCK_SEQ: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NAN_GUARD: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -573,7 +579,13 @@ def _fwd_kernel_sparse_decode_stage1(
         # exp() argument in that case is -inf - 0 = -inf -> 0.0, so the chunk contributes
         # nothing and max_logic legitimately stays -inf. When new_max_logic is finite the
         # expression is unchanged, so this is bit-identical on every non-degenerate chunk.
-        _safe_max = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic).to(tl.float32)
+        # NAN_GUARD is a constexpr so the guard compiles OUT entirely when disabled; that
+        # makes its cost measurable and lets the regression test reproduce the original bug
+        # in this same build (SOCKET_NAN_GUARD=0).
+        if NAN_GUARD:
+            _safe_max = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic).to(tl.float32)
+        else:
+            _safe_max = new_max_logic
 
         exp_logic = tl.exp(att_value - _safe_max).to(tl.float32)
         logic_scale = tl.exp(max_logic - _safe_max).to(tl.float32)
@@ -596,11 +608,15 @@ def _fwd_kernel_sparse_decode_stage1(
         # A block whose slots are ALL padding yields sum_exp == 0; 0/0 = nan and
         # log(0) = -inf. Emit a zero partial with logexpsum = -inf so stage2's merge
         # discards it (its weight is exp(-inf - m) = 0). Unchanged when sum_exp > 0.
-        _empty = sum_exp == 0.0
-        _safe_sum = tl.where(_empty, 1.0, sum_exp)
-        tl.store(Mid_O + off_mid_o, acc / _safe_sum)
-        tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum,
-                 tl.where(_empty, float("-inf"), max_logic + tl.log(_safe_sum)))
+        if NAN_GUARD:
+            _empty = sum_exp == 0.0
+            _safe_sum = tl.where(_empty, 1.0, sum_exp)
+            tl.store(Mid_O + off_mid_o, acc / _safe_sum)
+            tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum,
+                     tl.where(_empty, float("-inf"), max_logic + tl.log(_safe_sum)))
+        else:
+            tl.store(Mid_O + off_mid_o, acc / sum_exp)
+            tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum, max_logic + tl.log(sum_exp))
 
 
 @triton.jit
@@ -615,6 +631,7 @@ def _fwd_kernel_sparse_decode_stage2(
     stride_obs, stride_oh, stride_od,
     BLOCK_SEQ: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
+    NAN_GUARD: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -642,7 +659,10 @@ def _fwd_kernel_sparse_decode_stage2(
         # Same empty guard as stage1: a partial from an all-padding block carries
         # logexpsum = -inf, and merging it while the running max is still -inf would
         # evaluate exp(-inf - -inf) = nan. Bit-identical whenever new_max_logic is finite.
-        _safe_max2 = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic).to(tl.float32)
+        if NAN_GUARD:
+            _safe_max2 = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic).to(tl.float32)
+        else:
+            _safe_max2 = new_max_logic
         old_scale = tl.exp(max_logic - _safe_max2).to(tl.float32)
         exp_logic = tl.exp(tlogic - _safe_max2).to(tl.float32)
         acc = (acc * old_scale + exp_logic * tv).to(tl.float32)
@@ -652,7 +672,10 @@ def _fwd_kernel_sparse_decode_stage2(
     off_o = cur_batch * stride_obs + cur_head * stride_oh + offs_d
     # Defensive: sum_exp == 0 only if EVERY slot for this (b,h) was padding, which cannot
     # happen while sink > 0, but 0/0 would silently produce NaN logits if it ever did.
-    tl.store(O + off_o, acc / tl.where(sum_exp == 0.0, 1.0, sum_exp))
+    if NAN_GUARD:
+        tl.store(O + off_o, acc / tl.where(sum_exp == 0.0, 1.0, sum_exp))
+    else:
+        tl.store(O + off_o, acc / sum_exp)
 
 
 def _sparse_decode_stage1_impl(
@@ -711,6 +734,7 @@ def _sparse_decode_stage1_impl(
         BLOCK_SEQ=block_seq,
         BLOCK_DMODEL=D,
         BLOCK_N=BLOCK_N,
+        NAN_GUARD=_NAN_GUARD,
         num_warps=4,
         num_stages=2,
     )
@@ -740,6 +764,7 @@ def _sparse_decode_stage2_impl(
         out.stride(0), out.stride(1), out.stride(2),
         BLOCK_SEQ=block_seq,
         BLOCK_DMODEL=D,
+        NAN_GUARD=_NAN_GUARD,
         num_warps=4,
         num_stages=2,
     )
