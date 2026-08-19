@@ -15,6 +15,14 @@ if REPO_ROOT not in sys.path:
 
 from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
 
+# True only when a LEGACY (pre-optimization) path that consumes the [B,H,maxlen] bool
+# `allowed` tensor is selected. Read once at import -> a torch.compile guard, not a
+# graph break.
+_NEEDS_ALLOWED_MASK = (
+    os.environ.get("SOCKET_TRITON_SCORER", "1") != "1"
+    or os.environ.get("SOCKET_FUSED_LIST", "1") != "1"
+)
+
 
 # ---------------------------------------------------------------------------
 # FA2/FA3 dense-attention backend selection (PLUMBING ONLY — does not touch the
@@ -286,6 +294,14 @@ class ModelArgs:
     window_size: int = 120
 
     def __post_init__(self):
+        # BENCHMARK-ONLY: n_layer is env-overridable so the 1-layer microbench config and the
+        # full 32-layer model can be driven from ONE source tree (the previous setup used a
+        # hand-edited COPY of GPT-FAST, which silently drifts from any kernel change). Absent
+        # SOCKET_N_LAYER the value from transformer_configs is used unchanged -> no behavior
+        # change for any existing caller.
+        _nl_env = os.environ.get("SOCKET_N_LAYER")
+        if _nl_env is not None:
+            self.n_layer = int(_nl_env)
         # L and heavy_const are env-overridable so a single build can sweep configs (the
         # original repo hard-codes them; we expose SOCKET_L / SOCKET_HEAVY_CONST to match
         # the reference fork's sweep harness without changing any SOCKET math).
@@ -747,8 +763,16 @@ class Attention(nn.Module):
         # seq_len_t = pos.max()+1 = true filled length, kept as an on-device scalar tensor (no
         # .item()) so it drives index ARITHMETIC (window start) without changing any SHAPE.
         seq_len_t = pos.max().to(torch.int32) + 1
-        allowed = torch.arange(maxlen, device=pos.device) <= pos.max()
-        allowed_bht = allowed.view(1, 1, maxlen).expand(bsz, self.n_head, maxlen).contiguous()
+        # The `allowed` mask is exactly `t < seq_len` -- the SAME value for every head and
+        # every one of the 32 layers -- yet it was materialized ([1,H,maxlen] bool, a 4.6 MB
+        # expand().contiguous() at 140K) and consumed once per layer per decode step. The
+        # fused scorer / fused list-assembly take the seq_len scalar instead, so skip building
+        # it entirely unless a LEGACY path is selected.
+        if _NEEDS_ALLOWED_MASK:
+            allowed = torch.arange(maxlen, device=pos.device) <= pos.max()
+            allowed_bht = allowed.view(1, 1, maxlen).expand(bsz, self.n_head, maxlen).contiguous()
+        else:
+            allowed_bht = None
 
         with CUDATimer(cuda_timing) as t_relayout:
             # PER-KV-HEAD scorer: do NOT repeat_interleave the (identical-per-GQA-group) key

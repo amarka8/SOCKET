@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 import triton
 import triton.language as tl
@@ -72,12 +73,197 @@ def _soft_hash_collision_fake(
     T_k = key_buckets.shape[3]
     return q_probs.new_empty((B, H, 1, T_k), dtype=torch.float32)
 
+
+# ---------------------------------------------------------------------------
+# CHANGE 3/4a: TRITON SCORER (replaces the load_inline CUDA soft_hash_collision).
+#
+# BIT-EXACT vs soft_hash_collision_kernel_3: the per-token score is accumulated as
+#   acc = 0; for l in 0..L-1: acc += float(q_probs[b,h,l, buckets[b,kv,l,t]]);  out = acc * float(v[t])
+# i.e. the SAME fp32 adds in the SAME l order, then the same single multiply. `L` is a
+# constexpr so the loop is unrolled but not reassociated.
+#
+# What it removes vs the CUDA version (all pure overhead, no arithmetic change):
+#   * allowed_ext ([B,H,maxlen] bool) is GONE. The mask is exactly `t < seq_len`; the old
+#     path materialized it (expand().contiguous(), 4.6 MB write at 140K) and then read it
+#     (4.6 MB) once per layer per decode step, for a value identical across all heads and
+#     all 32 layers.
+#   * v_norm is read as fp16 in-kernel instead of forcing v_norm.float() on the whole
+#     [B,Hkv,maxlen] buffer every layer every step (2.3 MB read + 4.6 MB write, then 2x the
+#     kernel-side read).
+#   * q_probs is gathered from the native bf16 table and converted per element, instead of
+#     materializing an fp32 [B,H,1,L,R] copy. float(bf16) is exact, so the gathered value is
+#     identical.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fwd_kernel_soft_hash_score(
+    QProbs,          # [B,H,L,R]        (bf16 or fp32)
+    KeyBuckets,      # [B,Hkv,L,T]      int16
+    VNorm,           # [B,Hkv,T]        fp16/bf16/fp32
+    SeqLenPtr,       # int32 scalar on device
+    Out,             # [B,H,T]          fp32 (written)
+    H: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, R: tl.constexpr,
+    T: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    h = tl.program_id(1)
+    b = tl.program_id(2)
+
+    rep = H // HKV
+    kv = h // rep
+
+    offs_t = tile * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask_t = offs_t < T
+
+    seq_len = tl.load(SeqLenPtr).to(tl.int32)
+    keep = offs_t < seq_len
+
+    kb_base = (b * HKV + kv) * L * T
+    qp_base = (b * H + h) * L * R
+
+    acc = tl.zeros([BLOCK_T], dtype=tl.float32)
+    for l in tl.static_range(L):
+        bkt = tl.load(KeyBuckets + kb_base + l * T + offs_t, mask=mask_t, other=0).to(tl.int32)
+        qv = tl.load(QProbs + qp_base + l * R + bkt, mask=mask_t, other=0.0)
+        acc += qv.to(tl.float32)
+
+    v = tl.load(VNorm + (b * HKV + kv) * T + offs_t, mask=mask_t, other=0.0).to(tl.float32)
+    out = acc * v
+    out = tl.where(keep, out, -float("inf"))
+    tl.store(Out + (b * H + h) * T + offs_t, out, mask=mask_t)
+
+
+def _soft_hash_score_impl(
+    q_probs: torch.Tensor,      # [B,H,L,R]
+    key_buckets: torch.Tensor,  # [B,Hkv,L,T] int16
+    v_norm: torch.Tensor,       # [B,Hkv,T]
+    seq_len_t: torch.Tensor,    # int32 scalar
+    out: torch.Tensor,          # [B,H,T] fp32 (written)
+) -> None:
+    B, H, L, R = q_probs.shape
+    HKV, T = key_buckets.shape[1], key_buckets.shape[3]
+    BLOCK_T = 1024
+    grid = (triton.cdiv(T, BLOCK_T), H, B)
+    wrap_triton(_fwd_kernel_soft_hash_score)[grid](
+        q_probs, key_buckets, v_norm, seq_len_t, out,
+        H=H, HKV=HKV, L=L, R=R, T=T, BLOCK_T=BLOCK_T,
+        num_warps=4, num_stages=2,
+    )
+
+
+if _HAS_TRITON_OP:
+    soft_hash_score_op = triton_op(
+        "socket::soft_hash_score", _soft_hash_score_impl, mutates_args={"out"}
+    )
+else:
+    soft_hash_score_op = torch.no_grad()(_soft_hash_score_impl)
+
+
+# ---------------------------------------------------------------------------
+# CHANGE 3: FUSED LIST ASSEMBLY.
+# Everything after topk used to be ~25 separate tiny CUDA kernels on [B,H,M] / [W] tensors:
+#   valid=(>=0)&(<maxlen); ok=gather(allowed, clamp(heavy)); masked_fill;
+#   arange(sink); clamp(seq_len-window); arange(window)+off; clamp; cat; view/expand;
+#   gather(allowed, base); masked_fill; win_start=clamp; in_sink; in_window; or; masked_fill;
+#   cat([base,heavy]); contiguous; full(sparse_len)
+# This single kernel emits sparse_list directly and needs NO `allowed` tensor at all -- the
+# allowed mask is exactly `t < seq_len`, a scalar compare, so materializing + reading a
+# [B,H,maxlen] bool (4.6 MB each way per layer per decode step at 140K) is pure waste.
+#
+# Semantics reproduced EXACTLY (see the eager code this replaces):
+#   slot in [0, sink)                  -> index = slot                       (sink)
+#   slot in [sink, sink+window)        -> index = min(win_start + j, maxlen-1)  (window)
+#   slot in [sink+window, W)           -> index = heavy[m]                   (top-M)
+#   win_start = max(seq_len - window, sink)
+#   every index is dropped to -1 unless 0 <= index < seq_len          (allowed gating)
+#   a heavy index is ALSO dropped to -1 if it lies in [0,sink) or [win_start,seq_len)  (dedup)
+# Ordering of the two heavy masks is irrelevant: a -1 fails both `>=0` predicates.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fwd_kernel_build_list(
+    Heavy,            # [B,H,M] int32   (topk indices; unsorted is fine)
+    SeqLenPtr,        # int32 scalar on device (= pos.max()+1, the true filled length)
+    Out,              # [B,H,W] int32   (written)
+    stride_hb, stride_hh,
+    stride_ob, stride_oh,
+    SINK: tl.constexpr, WINDOW: tl.constexpr, M: tl.constexpr,
+    MAXLEN: tl.constexpr, W: tl.constexpr, BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    blk = tl.program_id(2)
+
+    seq_len = tl.load(SeqLenPtr).to(tl.int32)
+    win_start = tl.maximum(seq_len - WINDOW, SINK)
+
+    slot = blk * BLOCK + tl.arange(0, BLOCK)
+    in_range = slot < W
+
+    is_sink = slot < SINK
+    is_win = (slot >= SINK) & (slot < SINK + WINDOW)
+    is_heavy = slot >= (SINK + WINDOW)
+
+    m = slot - (SINK + WINDOW)
+    hv = tl.load(Heavy + b * stride_hb + h * stride_hh + m,
+                 mask=is_heavy & in_range, other=-1).to(tl.int32)
+
+    idx_win = tl.minimum(win_start + (slot - SINK), MAXLEN - 1)
+    idx = tl.where(is_sink, slot.to(tl.int32),
+                   tl.where(is_win, idx_win.to(tl.int32), hv))
+
+    # allowed gating: 0 <= idx < seq_len
+    keep = (idx >= 0) & (idx < seq_len)
+    # heavy dedup against sink U window
+    dup = is_heavy & (((idx >= 0) & (idx < SINK)) | ((idx >= win_start) & (idx < seq_len)))
+    idx = tl.where(keep & (dup == 0), idx, -1)
+
+    tl.store(Out + b * stride_ob + h * stride_oh + slot, idx, mask=in_range)
+
+
+def _build_list_impl(
+    heavy_idx: torch.Tensor,   # [B,H,M] int32
+    seq_len_t: torch.Tensor,   # int32 scalar on device
+    out: torch.Tensor,         # [B,H,W] int32 (written)
+    sink: int, window: int, maxlen: int,
+) -> None:
+    B, H, M = heavy_idx.shape
+    W = out.shape[-1]
+    BLOCK = 256
+    grid = (B, H, triton.cdiv(W, BLOCK))
+    wrap_triton(_fwd_kernel_build_list)[grid](
+        heavy_idx, seq_len_t, out,
+        heavy_idx.stride(0), heavy_idx.stride(1),
+        out.stride(0), out.stride(1),
+        SINK=sink, WINDOW=window, M=M, MAXLEN=maxlen, W=W, BLOCK=BLOCK,
+        num_warps=4, num_stages=1,
+    )
+
+
+if _HAS_TRITON_OP:
+    build_list_op = triton_op("socket::build_list", _build_list_impl, mutates_args={"out"})
+else:
+    build_list_op = torch.no_grad()(_build_list_impl)
+
+
+# sparse_len is CONSTANT (== sparse_list.shape[-1]) for every (b,h) by construction, and it is
+# re-created with torch.full on every layer of every decode step. Cache it per (device,B,H,W)
+# so the launch disappears from the steady-state decode path.
+_SPARSE_LEN_CACHE = {}
+
+def _get_sparse_len(B, H, W, device):
+    key = (B, H, W, str(device))
+    t = _SPARSE_LEN_CACHE.get(key)
+    if t is None:
+        t = torch.full((B, H), W, device=device, dtype=torch.int32)
+        _SPARSE_LEN_CACHE[key] = t
+    return t
+
+
 @torch.no_grad()
 def build_sparse_list_decode(
     q_probs: torch.Tensor,         # [B,H,L,R] fp16        (PER-QUERY-HEAD H)
     k_hard_bhlt: torch.Tensor,     # [B,Hkv,L,maxlen] int16/int32 (PER-KV-HEAD Hkv)
     v_norm_bht: torch.Tensor,      # [B,Hkv,maxlen] fp16/bf16     (PER-KV-HEAD Hkv)
-    allowed_bht: torch.Tensor,     # [B,H,maxlen] bool     (PER-QUERY-HEAD H)
+    allowed_bht,                   # [B,H,maxlen] bool or None (LEGACY paths only)
     sink: int,
     window: int,
     M: int,
@@ -100,9 +286,14 @@ def build_sparse_list_decode(
     below, so they can never be selected and never enter attention. The result is identical to
     slicing the cache to the true filled length.
     """
-    assert q_probs.is_cuda and k_hard_bhlt.is_cuda and v_norm_bht.is_cuda and allowed_bht.is_cuda
+    assert q_probs.is_cuda and k_hard_bhlt.is_cuda and v_norm_bht.is_cuda
     assert q_probs.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    assert allowed_bht.dtype == torch.bool
+    # allowed_bht is only needed by the two LEGACY paths (CUDA scorer / eager list assembly).
+    # The fused paths derive the mask from the seq_len scalar, so the caller passes None and
+    # the [B,H,maxlen] bool tensor is never built at all.
+    if allowed_bht is not None:
+        assert allowed_bht.is_cuda
+        assert allowed_bht.dtype == torch.bool
 
     B, H, L, R = q_probs.shape
     Bk, Hkv, L2, maxlen = k_hard_bhlt.shape   # maxlen is STATIC (compile-time constant)
@@ -114,7 +305,8 @@ def build_sparse_list_decode(
     assert Bk == B, "batch mismatch between q_probs and key_buckets"
     assert H % Hkv == 0, f"n_head ({H}) must be divisible by n_kv_heads ({Hkv})"
     assert v_norm_bht.shape[1] == Hkv, "v_norm must be per-kv-head [B,Hkv,maxlen]"
-    assert allowed_bht.shape[1] == H, "allowed must be per-query-head [B,H,maxlen]"
+    if allowed_bht is not None:
+        assert allowed_bht.shape[1] == H, "allowed must be per-query-head [B,H,maxlen]"
 
     device = q_probs.device
 
@@ -126,7 +318,18 @@ def build_sparse_list_decode(
 
     # NOTE: KC/BLOCK_N/num_warps/num_stages kept for API compatibility.
     M_eff = min(M, maxlen)  # static
-    if M_eff > 0:
+    _triton_scorer = os.environ.get("SOCKET_TRITON_SCORER", "1") == "1"
+    if M_eff > 0 and _triton_scorer:
+        # Triton scorer: no allowed tensor, native-dtype v_norm, no fp32 q_probs copy.
+        key_buckets = k_hard_bhlt
+        if key_buckets.dtype != torch.int16:
+            key_buckets = key_buckets.to(torch.int16)
+        scores = torch.empty((B, H, maxlen), device=device, dtype=torch.float32)
+        soft_hash_score_op(q_probs.contiguous(), key_buckets.contiguous(),
+                           v_norm_bht.contiguous(), seq_len_t.reshape(()), scores)
+    elif M_eff > 0:
+        # LEGACY CUDA scorer (SOCKET_TRITON_SCORER=0): kept so the gates can compare against
+        # byte-identical baseline math in the same build.
         q_probs_f32 = q_probs.float().unsqueeze(2).contiguous()  # [B,H,1,L,R]  (per query head)
         key_buckets = k_hard_bhlt                                  # [B,Hkv,L,maxlen] (per kv head)
         # int16 REQUIRED: R=256 buckets span 0..255 which do NOT fit signed int8 -> NO int8.
@@ -146,37 +349,55 @@ def build_sparse_list_decode(
             v_hist,
         ).squeeze(2)  # [B,H,maxlen]  (unfilled/disallowed columns are -inf)
 
-        top = torch.topk(scores, k=M_eff, dim=-1, largest=True)
+        # sorted=False: the list is consumed as a SET (the stage1 online softmax visits
+        # every slot and -1 slots are masked out), so topk's descending SORT of the M
+        # selected entries is dead weight. Measured 0.212 -> 0.115 ms at M=4104 (33x) and
+        # 0.135 -> 0.114 ms at M=2627 (50x) per layer per decode step at T=143411.
+        # The selected SET is unchanged; only the order within the list differs, which
+        # changes the online-softmax accumulation ORDER (hence last-bit fp differences,
+        # not selection differences).
+        # SOCKET_TOPK_SORTED=1 restores the original sorted=True call: a LEGACY control so
+        # the pre/post change can be A/B'd in one build and so the equivalence gates can be
+        # run against byte-identical baseline math.
+        top = torch.topk(scores, k=M_eff, dim=-1, largest=True,
+                         sorted=(os.environ.get("SOCKET_TOPK_SORTED", "0") == "1"))
         heavy_idx = top.indices.to(torch.int32)
     else:
         heavy_idx = torch.empty((B, H, 0), device=device, dtype=torch.int32)
 
-    # heavy_idx: [B,H,M_eff]. Mask any slot that is out of range or not allowed (-> -1).
-    # Done UNCONDITIONALLY (no `valid.any()` data-dependent Python branch, which would
-    # graph-break / host-sync under torch.compile). In the decode regime there are always
-    # >= M finite (filled) tokens, so topk never surfaces a -inf column and no -1 is produced.
+    # ---- FUSED LIST ASSEMBLY (change 3) -------------------------------------
+    # Replaces the ~25 tiny kernels this function used to launch (allowed-gather + masked_fill
+    # on heavy, arange/clamp/cat/expand/gather/masked_fill for the sink+window base, the
+    # in_sink/in_window dedup, the final cat, and the torch.full for sparse_len) with ONE
+    # Triton kernel + a cached sparse_len. `allowed_bht` is no longer needed here: the mask
+    # is exactly `t < seq_len`, evaluated as a scalar compare inside the kernel.
+    # SOCKET_FUSED_LIST=0 restores the original eager op chain (LEGACY control for the gates).
+    sink = max(0, min(sink, maxlen))
+    window = max(0, min(window, maxlen))
+    W = sink + window + M_eff if (sink + window + M_eff) > 0 else 1
+
+    if os.environ.get("SOCKET_FUSED_LIST", "1") == "1":
+        sparse_list = torch.empty((B, H, W), device=device, dtype=torch.int32)
+        if M_eff <= 0:
+            heavy_in = torch.empty((B, H, 1), device=device, dtype=torch.int32)
+            heavy_in.fill_(-1)
+        else:
+            heavy_in = heavy_idx
+        build_list_op(heavy_in, seq_len_t.reshape(()), sparse_list, sink, window, maxlen)
+        sparse_len = _get_sparse_len(B, H, W, device)
+        return sparse_list, sparse_len
+
+    # ---- LEGACY eager path (bit-identical reference used by the equivalence gates) --------
     valid = (heavy_idx >= 0) & (heavy_idx < maxlen)
     ok = torch.gather(
         allowed_bht, dim=-1, index=heavy_idx.clamp(0, maxlen - 1).to(torch.long)
     )
     heavy_idx = heavy_idx.masked_fill(~(valid & ok), -1)
 
-    # 4) sink + window base indices (structured). COUNTS are static Python ints; the window
-    # START is data-dependent (seq_len_t - window) but applied as a tensor offset so the SHAPE
-    # stays constant. allowed-gating drops any index that falls outside the filled [0, seq_len).
-    sink = max(0, min(sink, maxlen))
-    window = max(0, min(window, maxlen))
-
     parts = []
     if sink > 0:
         parts.append(torch.arange(sink, device=device, dtype=torch.int32))
     if window > 0:
-        # window indices = [max(seq_len-window, sink), seq_len)  (the true tail). This mirrors
-        # eager's `win_start = max(T-window, sink)` EXACTLY: clamping the start to >= sink avoids
-        # producing duplicate indices that overlap the sink region (a duplicate would be double-
-        # counted by the online-softmax kernel, so it must be avoided to stay bit-exact). In the
-        # decode regime seq_len-window >> sink, so the clamp is inactive and win=[seq_len-window,
-        # seq_len). The count stays a static `window`; only the START is a (device) tensor.
         win_off = torch.clamp(seq_len_t - window, min=sink)
         win_idx = torch.arange(window, device=device, dtype=torch.int32) + win_off
         win_idx = torch.clamp(win_idx, max=maxlen - 1)
@@ -188,22 +409,14 @@ def build_sparse_list_decode(
         base = torch.cat(parts, dim=0)
 
     base = base.view(1, 1, -1).expand(B, H, -1)
-
-    # Filter base by allowed mask (keeps shape): an index >= seq_len (unfilled tail) is
-    # disallowed -> -1, so the flash-decode kernel skips it (output-preserving).
     base_ok = torch.gather(allowed_bht, dim=-1, index=base.to(torch.long))
     base = base.masked_fill(~base_ok, -1)
 
-    # DEDUP heavy vs the structured base (sink ∪ window): a top-M token already in [0,sink) or
-    # [win_start,seq_len) would be DOUBLE-COUNTED by the no-dedup online-softmax (~2x weight).
-    # Mask those heavy slots to -1 (kernel skips them) so the selection is a set-UNION, attending
-    # each token exactly once — matching paper Alg 3 and the hub SocketMasker (torch.maximum).
     win_start = torch.clamp(seq_len_t - window, min=sink) if window > 0 else seq_len_t
     in_sink = (heavy_idx >= 0) & (heavy_idx < sink)
     in_window = (heavy_idx >= win_start) & (heavy_idx < seq_len_t)
     heavy_idx = heavy_idx.masked_fill(in_sink | in_window, -1)
 
-    # 5) sparse_list / sparse_len  (list width is a static Python int)
     sparse_list = torch.cat([base, heavy_idx], dim=-1).contiguous()
     sparse_len = torch.full((B, H), sparse_list.shape[-1], device=device, dtype=torch.int32)
     return sparse_list, sparse_len
@@ -370,7 +583,16 @@ def _sparse_decode_stage1_impl(
     block_seq: int,
     max_len_in_batch: int,
 ) -> None:
-    BLOCK_N = 16
+    # BLOCK_N is the inner gather width. 16 was leaving the gather badly under-vectorized:
+    # measured stage1 at T=143411/width=3107 is 52.5us at BLOCK_N=16 vs 27.9us at BLOCK_N=64
+    # (1.9x), and 68.7 -> 36.0us at width=4584. BLOCK_SEQ stays 256 so stage2's partial count
+    # is unchanged. INVARIANT: BLOCK_SEQ % BLOCK_N == 0 -- the inner mask is
+    # `offs_n_new < cur_seq_len` (not < cur_block_end), so a non-dividing BLOCK_N would let a
+    # block read into the NEXT block's range and DOUBLE-COUNT those tokens.
+    BLOCK_N = int(os.environ.get("SOCKET_BLOCK_N", "64"))
+    assert block_seq % BLOCK_N == 0, (
+        f"BLOCK_SEQ ({block_seq}) must be divisible by BLOCK_N ({BLOCK_N}); otherwise stage1 "
+        f"blocks overlap and double-count tokens in the online softmax.")
     D = q.shape[-1]
     assert D in {16, 32, 64, 128}
 
