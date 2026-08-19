@@ -40,15 +40,22 @@ SEQ_LEN = 4096
 
 
 def _build(pad_chunk: bool):
-    """Sparse list whose SECOND BLOCK_N chunk is entirely padding when pad_chunk=True."""
+    """Sparse list whose FIRST BLOCK_N chunk of a BLOCK_SEQ block is entirely padding.
+
+    The position matters. stage1 resets max_logic = -inf at the start of EVERY BLOCK_SEQ
+    block and walks it in BLOCK_N chunks. exp(-inf - -inf) = nan only arises while the
+    running max is STILL -inf, i.e. when the empty chunk precedes any valid token in its
+    block. An empty chunk that FOLLOWS a valid one is harmless (new_max_logic is finite),
+    which is why the bug is positional and why descending-score ordering hid it.
+    """
     width = BLOCK_SEQ
     lst = torch.full((B, HQ, width), -1, dtype=torch.int32, device="cuda")
     for h in range(HQ):
         idx = torch.arange(width, device="cuda", dtype=torch.int32) % SEQ_LEN
         lst[0, h] = idx
         if pad_chunk:
-            # blank exactly one BLOCK_N-wide chunk -> that chunk is all -inf in the kernel
-            lst[0, h, BLOCK_N:2 * BLOCK_N] = -1
+            # blank the LEADING BLOCK_N-wide chunk of the block
+            lst[0, h, 0:BLOCK_N] = -1
     return lst
 
 
@@ -108,3 +115,44 @@ def test_bug_reproduces_without_guard():
     assert not torch.isfinite(out).all(), (
         "expected the pre-fix NaN with SOCKET_NAN_GUARD=0; if this passes, the test no "
         "longer reproduces the bug it is guarding against")
+
+
+def _main():
+    """Standalone runner (pytest cannot import in this cluster's module stack: its anyio
+    dependency pulls in ssl, which fails with an OPENSSL_3.3.0 mismatch)."""
+    guard = os.environ.get("SOCKET_NAN_GUARD", "1") == "1"
+    print(f"SOCKET_NAN_GUARD={'1 (fixed)' if guard else '0 (pre-fix code path)'}")
+    rc = 0
+
+    try:
+        test_no_padding_is_finite()
+        print("  PASS  test_no_padding_is_finite")
+    except AssertionError as e:
+        rc = 1
+        print(f"  FAIL  test_no_padding_is_finite: {e}")
+
+    if guard:
+        try:
+            test_fully_padded_chunk_is_finite_and_correct()
+            print("  PASS  test_fully_padded_chunk_is_finite_and_correct")
+        except AssertionError as e:
+            rc = 1
+            print(f"  FAIL  test_fully_padded_chunk_is_finite_and_correct: {e}")
+    else:
+        try:
+            test_bug_reproduces_without_guard()
+            print("  PASS  test_bug_reproduces_without_guard (the NaN IS present, as expected)")
+        except AssertionError as e:
+            rc = 1
+            print(f"  FAIL  test_bug_reproduces_without_guard: {e}")
+        # and show that the FIXED assertion would have failed here
+        out = _run(_build(pad_chunk=True))
+        n = int((~torch.isfinite(out)).sum())
+        print(f"  [proof] unguarded kernel on a leading fully-padded chunk: "
+              f"{n}/{out.numel()} non-finite -> the guarded assertion would FAIL")
+    print("OK" if rc == 0 else "FAILURES")
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
