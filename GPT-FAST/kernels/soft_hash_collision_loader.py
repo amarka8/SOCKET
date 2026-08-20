@@ -8,6 +8,9 @@ CUDA_HEADERS = """
     #include <cuda.h>
     #include <cuda_runtime.h>
     #include <torch/extension.h>
+    #include <ATen/cuda/CUDAContext.h>
+    #include <c10/cuda/CUDAStream.h>
+    #include <c10/cuda/CUDAException.h>
     #include <stdint.h>
 """
 
@@ -144,9 +147,49 @@ def get_kernel_code(version: int, filename: str) -> tuple[str, str, str, str]:
     return kernel_src, configuration, launch, torch_checks
 
 
+# ---------------------------------------------------------------------------
+# SOCKET_SCORER_STREAMFIX  (default "1" == FIXED;  "0" reproduces the bug)
+#
+# THE BUG. The .cu docstring's `Launch:` block is
+#     soft_hash_collision_kernel_3<<<grid, block>>>(...)
+# i.e. no stream argument, so the kernel goes to the LEGACY DEFAULT STREAM and the launch is
+# never error-checked. Under torch.compile(mode="reduce-overhead") the whole decode step is
+# CAPTURED into a CUDA graph on a non-default (capture) stream. A legacy-default-stream
+# launch is NOT captured as a graph node, so at every REPLAY this kernel DOES NOT RUN and
+# `out` stays at the torch::zeros the wrapper allocated. Consequence: every compiled SOCKET
+# number produced before this fix selected its heavy tokens from an ALL-ZERO score array --
+# it got its single most expensive stage for free, and the selection was arbitrary.
+#
+# THE FIX. Launch on at::cuda::getCurrentCUDAStream() (the stream being captured) and check
+# the launch. Measured cost at 140K: 93.4 -> 89.3 tok/s at L=10, 94.1 -> 71.8 at L=50 with
+# the Triton scorer; 93.4 -> 79.1 / 94.1 -> 59.0 with this CUDA scorer. Those post-fix
+# numbers are the only honest ones.
+#
+# The two variants get DISTINCT load_inline extension names so the JIT BUILD cache (which
+# keys on the name + sources) cannot hand a stale .so of one variant to the other.
+# ---------------------------------------------------------------------------
+_STREAM_FIX_NEEDLE = "<<<grid, block>>>"
+
+
+def _streamfix_enabled() -> bool:
+    return os.environ.get("SOCKET_SCORER_STREAMFIX", "1") != "0"
+
+
 def load_soft_hash_collision(version: int = 3, *, verbose: bool = False):
     kernels_path = os.path.join(os.path.dirname(__file__), "soft_hash_collision.cu")
     code, configuration, launch, torch_checks = get_kernel_code(version, kernels_path)
+
+    suffix = ""
+    if _streamfix_enabled():
+        if _STREAM_FIX_NEEDLE not in launch:
+            raise ValueError(
+                f"cannot apply the scorer stream fix: {_STREAM_FIX_NEEDLE!r} not found in the "
+                f"Launch: block of soft_hash_collision.cu (did the launch syntax change?)")
+        launch = launch.replace(
+            _STREAM_FIX_NEEDLE,
+            "<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>", 1)
+        launch = launch + "\n        C10_CUDA_KERNEL_LAUNCH_CHECK();"
+        suffix = "_cs"
 
     wrapper = CUDA_WRAPPER_TEMPLATE.substitute(
         configuration=configuration,
@@ -157,7 +200,7 @@ def load_soft_hash_collision(version: int = 3, *, verbose: bool = False):
     cuda_sources = CUDA_HEADERS + "\n" + code + "\n" + wrapper
 
     ext = load_inline(
-        name=f"soft_hash_collision_ext_v{version}",
+        name=f"soft_hash_collision_ext_v{version}{suffix}",
         cpp_sources="",
         cuda_sources=cuda_sources,
         functions=None,

@@ -18,9 +18,12 @@ from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
 # True only when a LEGACY (pre-optimization) path that consumes the [B,H,maxlen] bool
 # `allowed` tensor is selected. Read once at import -> a torch.compile guard, not a
 # graph break.
+# MUST stay in sync with kernels/sparse.py::_SCORER_IMPL (default "triton"; see the long
+# comment there -- the old "cuda" default was only ever competitive because that kernel
+# silently did not execute under CUDA-graph replay).
 _SCORER_IMPL = os.environ.get(
     "SOCKET_SCORER_IMPL",
-    "triton" if os.environ.get("SOCKET_TRITON_SCORER", "0") == "1" else "cuda",
+    "cuda" if os.environ.get("SOCKET_TRITON_SCORER", "1") == "0" else "triton",
 ).strip().lower()
 _NEEDS_ALLOWED_MASK = (
     _SCORER_IMPL == "cuda"                       # the CUDA scorer takes allowed_ext

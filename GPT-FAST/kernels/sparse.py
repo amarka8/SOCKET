@@ -19,14 +19,25 @@ except Exception:  # pragma: no cover - very old torch
     def wrap_triton(k):  # type: ignore
         return k
 
-# Which scorer implementation to use: "cuda" (the load_inline kernel, DEFAULT),
-# "triton" (mutating triton_op) or "tritonalloc" (same kernel, non-mutating custom_op).
-# Default is "cuda" because both Triton forms, despite winning the isolated microbenchmark,
-# LOSE end-to-end under torch.compile -- see the comment on _soft_hash_score_alloc.
-# SOCKET_TRITON_SCORER=1 is still honoured as a shorthand for "triton".
+# Which scorer implementation to use: "triton" (mutating triton_op, DEFAULT),
+# "cuda" (the load_inline kernel) or "tritonalloc" (same triton kernel, non-mutating
+# custom_op).
+#
+# THE DEFAULT USED TO BE "cuda", justified by "both Triton forms LOSE end-to-end under
+# torch.compile". That comparison was invalid: the CUDA scorer launched on the legacy
+# default stream, so under CUDA-graph replay it NEVER RAN (see
+# soft_hash_collision_loader.py::_streamfix_enabled) -- "cuda" was being timed with its most
+# expensive stage skipped entirely and its output left at zero. With the stream fix in place
+# and both scorers actually executing, measured back-to-back on one GPU at 140K:
+#     L=10:  cuda 79.1  vs  triton 89.4 tok/s   (+13%)
+#     L=50:  cuda 59.0  vs  triton 72.0 tok/s   (+22%)
+# The Triton scorer also drops the [B,H,maxlen] `allowed` mask build and the fp32 casts of
+# q_probs / v_norm (see _NEEDS_ALLOWED_MASK in model.py). So: Triton is the default.
+# SOCKET_TRITON_SCORER=1 is still honoured as a shorthand for "triton"; the "cuda" scorer is
+# kept because the equivalence gates use it as byte-identical baseline math.
 _SCORER_IMPL = os.environ.get(
     "SOCKET_SCORER_IMPL",
-    "triton" if os.environ.get("SOCKET_TRITON_SCORER", "0") == "1" else "cuda",
+    "cuda" if os.environ.get("SOCKET_TRITON_SCORER", "1") == "0" else "triton",
 ).strip().lower()
 
 # Empty-chunk NaN guard (see the stage1 comment). Default ON. SOCKET_NAN_GUARD=0 compiles it
