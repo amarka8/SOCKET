@@ -136,6 +136,95 @@ def _get_soft_hash_ext():
 
 
 # ---------------------------------------------------------------------------
+# HISTOGRAM / RADIX THRESHOLD SELECTION  (kernels/radix_select.cu)
+#
+#   SOCKET_SELECT_IMPL = "radix" (DEFAULT)  exact 3-digit MSB-first radix threshold select
+#                      = "topk"             LEGACY aten::topk (multi-block topk, 21 kernels)
+#
+# WHY. aten::topk on the [B,H,maxlen] score array was the single biggest kernel group in the
+# compiled decode step: 98.0 us/layer over 21 kernels at 140K P10/L10 50x, against ~5.8 us of
+# unavoidable reads. The radix select streams the score array, materialises nothing, and
+# resolves the exact top-M threshold in 7 kernels / 4 streaming passes: 47.6 us/layer.
+# Measured end-to-end at 140K P10/L10 50x, one GPU, back-to-back, drift control +0.29%:
+# Triton scorer + topk 88.32 -> + radix 106.30 tok/s, +20.4%. At 100K +20.3%; at 140K P8/L50
+# +16.9%.
+#
+# EXACTNESS. key(f) = (bits(f) & 0x80000000) ? ~bits(f) : (bits(f) | 0x80000000) is monotone
+# over all floats, so -inf padding sorts last exactly as in topk. d = 0xFFFFFFFF - key is
+# split MSB-first into 11/11/10 bits; digit 3 has UNIT resolution, so three digits resolve
+# the threshold EXACTLY for any input distribution -- no adaptive shifts, no data-dependent
+# iteration count, no host sync, fixed launch structure (so it is CUDA-graph capturable, and
+# every one of the 7 rs_* kernels is verified to appear exactly 1.00x per layer per step in
+# the CUPTI trace of the graph REPLAY). The selected SCORE MULTISET always equals
+# aten::topk's; which tokens tied AT the threshold are kept is arbitrary in topk too.
+#
+# NOT TAKEN FROM THE SOURCE BRANCH: the SELECT_IMPL="fused" variant that also replaces the
+# soft-hash scorer. It measured neutral at L=10 (108.17 vs 106.30) and a clear loss at L=50
+# (67.87 vs 83.80) -- the hand-written deep-gather scorer cannot beat the Triton one. The
+# scorer stays standalone; radix_select.cu still contains the fused entry point but nothing
+# calls it.
+# ---------------------------------------------------------------------------
+_SELECT_IMPL = os.environ.get("SOCKET_SELECT_IMPL", "radix").strip().lower()
+# Tuned on the 140K P10/L10 refs (see fair/fused-radix-select/README.md):
+#   NB   = T-chunks per (b,h). 4 -> B*H*4 = 128 blocks ~= one per SM. Larger NB only adds
+#          private-histogram flush traffic (NB * B*H * 2048 * 4 bytes per level).
+#   THR  = 1024. Bytes in flight = blocks*THR*UNROLL*4; THR=256 runs the streaming passes at
+#          350 GB/s, THR=1024 at 3.2 TB/s. The single most important knob.
+#   STHR = 512 for the 3 tiny scan kernels (2048 bins / 512 threads = 4 bins per thread).
+#   HMODE= 1 (plain per-lane shared atomicAdd). Warp aggregation via __match_any_sync is
+#          2.7x SLOWER on the digit-2 histogram; MATCH.ANY.U32 is the expensive instruction
+#          and shared-atomic conflict replays are nearly free on Hopper.
+# These are ordinary runtime arguments to an opaque custom_op, NOT tl.constexpr values, so
+# reading them from the environment is safe w.r.t. the inductor cache-key hazard.
+_RS_NB = int(os.environ.get("SOCKET_RS_NB", "4"))
+_RS_THR = int(os.environ.get("SOCKET_RS_THR", "1024"))
+_RS_STHR = int(os.environ.get("SOCKET_RS_STHR", "512"))
+_RS_HMODE = int(os.environ.get("SOCKET_RS_HMODE", "1"))
+# SOCKET_RS_DET=1 (DEFAULT) makes the emit DETERMINISTIC: which tied-at-threshold tokens are
+# kept, and the slot each selected index lands in, become pure functions of the grid. Costs
+# one extra streaming pass (3.0% of throughput: 107.30 -> 104.09 tok/s at 140K P10/L10) and
+# buys eager == eager == COMPILED reproducibility, without which a "compiled == eager"
+# regression gate is impossible. With DET=0 the selection is still EXACT (same score
+# multiset) but the tie subset varies run to run.
+_RS_DET = int(os.environ.get("SOCKET_RS_DET", "1"))
+
+_RADIX_EXT = None
+
+
+def _get_radix_ext():
+    global _RADIX_EXT
+    if _RADIX_EXT is None:
+        from kernels.radix_select_loader import load_radix_select
+        _RADIX_EXT = load_radix_select()
+    return _RADIX_EXT
+
+
+# NOTE on the workspace: allocated with torch.empty INSIDE the op body, exactly like
+# socket::soft_hash_score_alloc's output. It needs no zero-init (every block writes its whole
+# private histogram slice, and the ctrl block is fully written by rs_scan1) and it is dead the
+# moment the op returns, so under cudagraph_trees it is an ordinary pool intermediate. It is
+# deliberately NOT a cached module-level tensor: a tensor cached across calls is allocated
+# inside the CUDA-graph pool on the recording call and reusing it on a later replay raises
+# "accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run".
+# Proven CUDA-graph safe by the RS_DET=1 gate (eager == eager == compiled == compiled).
+@torch.library.custom_op("socket::radix_topm", mutates_args=())
+def _radix_topm(scores: torch.Tensor, M: int) -> torch.Tensor:
+    ext = _get_radix_ext()
+    B, H, _ = scores.shape
+    out = torch.empty((B, H, M), device=scores.device, dtype=torch.int32)
+    ws = torch.empty(int(ext.workspace_ints(_RS_NB, B * H)),
+                     device=scores.device, dtype=torch.int32)
+    ext.radix_select(scores, out, ws, M, _RS_NB, _RS_THR, _RS_STHR, 127, _RS_HMODE, _RS_DET)
+    return out
+
+
+@_radix_topm.register_fake
+def _radix_topm_fake(scores: torch.Tensor, M: int) -> torch.Tensor:
+    B, H, _ = scores.shape
+    return scores.new_empty((B, H, M), dtype=torch.int32)
+
+
+# ---------------------------------------------------------------------------
 # torch.compile registration for the custom CUDA scorer.
 #
 # ext.soft_hash_collision is a *pybind11* C++ function (PYBIND11_MODULE in
@@ -498,16 +587,23 @@ def build_sparse_list_decode(
                 q_probs_f32, key_buckets, allowed_ext, v_hist,
             ).squeeze(2)  # [B,H,maxlen]  (unfilled/disallowed columns are -inf)
 
-        # sorted=False: the list is consumed as a SET (the stage1 online softmax visits every
-        # slot and -1 slots are masked out), so topk's descending SORT of the M selected
-        # entries is dead weight. Measured per layer per decode step at T=143411:
-        # 0.212 -> 0.115 ms at M=4104 (33x), 0.135 -> 0.114 ms at M=2627 (50x). The selected
-        # SET is unchanged; only the order within the list differs, which changes the
-        # online-softmax accumulation ORDER (last-bit fp differences, not selection changes).
-        # SOCKET_TOPK_SORTED=1 restores sorted=True (LEGACY control for A/B + the gates).
-        top = torch.topk(scores, k=M_eff, dim=-1, largest=True,
-                         sorted=(os.environ.get("SOCKET_TOPK_SORTED", "0") == "1"))
-        heavy_idx = top.indices.to(torch.int32)
+        if _SELECT_IMPL == "radix":
+            # Exact 3-digit radix threshold select: 7 kernels / 4 streaming passes instead of
+            # aten::topk's 21 kernels. 98.0 -> 47.6 us/layer at 140K P10/L10 50x. See the
+            # module-level SOCKET_SELECT_IMPL comment for the exactness argument.
+            heavy_idx = torch.ops.socket.radix_topm(scores.contiguous(), M_eff)
+        else:
+            # LEGACY aten::topk. sorted=False: the list is consumed as a SET (the stage1
+            # online softmax visits every slot and -1 slots are masked out), so topk's
+            # descending SORT of the M selected entries is dead weight. Measured per layer per
+            # decode step at T=143411: 0.212 -> 0.115 ms at M=4104 (33x), 0.135 -> 0.114 ms at
+            # M=2627 (50x). The selected SET is unchanged; only the order within the list
+            # differs, which changes the online-softmax accumulation ORDER (last-bit fp
+            # differences, not selection changes).
+            # SOCKET_TOPK_SORTED=1 restores sorted=True (LEGACY control for A/B + the gates).
+            top = torch.topk(scores, k=M_eff, dim=-1, largest=True,
+                             sorted=(os.environ.get("SOCKET_TOPK_SORTED", "0") == "1"))
+            heavy_idx = top.indices.to(torch.int32)
     else:
         heavy_idx = torch.empty((B, H, 0), device=device, dtype=torch.int32)
 
