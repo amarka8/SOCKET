@@ -45,6 +45,19 @@ _SCORER_IMPL = os.environ.get(
 # the guard's cost.
 _NAN_GUARD = os.environ.get("SOCKET_NAN_GUARD", "1") == "1"
 
+# STATIC SPARSE_LEN. build_sparse_list_decode always emits a RECTANGULAR list, so
+# sparse_len[b,h] == sparse_list.shape[-1] == W for every (b,h) -- a python int known at
+# trace time. Materializing it as a [B,H] int32 tensor cost TWO torch.full kernels per layer
+# per decode step (0.768 + 0.736 = 1.50 us/layer in the compiled trace) to write 2 int32s.
+#   0 = LEGACY [B,H] tensor (used by the equivalence gates)
+#   1 = pass W as an ordinary runtime scalar (DEFAULT; codegen unchanged, bit-identical)
+#   2 = pass W as a tl.constexpr -- MEASURED SLOWER: it makes the stage1 inner-loop bound a
+#       compile-time constant, the compiler fully unrolls 16 iterations, and stage1 loses
+#       more than the 1.50 us saved (32K: 269.01 -> 273.29 us/layer). Do not ship mode 2.
+# All three modes are bit-identical: it is the same number by three routes.
+_SLEN_MODE = int(os.environ.get("SOCKET_STATIC_SLEN", "1"))
+_STATIC_SLEN = _SLEN_MODE != 0
+
 
 # ---------------------------------------------------------------------------
 # CACHE-KEY ISOLATION FOR TRITON CONSTEXPR KNOBS  (SOCKET_CACHE_KNOB_ISOLATION, default ON)
@@ -626,11 +639,18 @@ def build_sparse_list_decode(
         else:
             heavy_in = heavy_idx
         build_list_op(heavy_in, seq_len_t.reshape(()), sparse_list, sink, window, maxlen)
-        # NOTE: sparse_len must be allocated FRESH here. Caching it across calls (it is a
-        # constant W for every (b,h)) breaks under torch.compile(mode="reduce-overhead"):
-        # the cached tensor is allocated inside the CUDA-graph memory pool on the first
-        # (recording) call, and reusing it on later replays raises "accessing tensor output
-        # of CUDAGraphs that has been overwritten by a subsequent run".
+        # STATIC SPARSE_LEN (default): sparse_len[b,h] == W for every (b,h) and W is a python
+        # int here, so return None and let the backend pass it as a scalar. That removes TWO
+        # torch.full kernels per layer per decode step whose only job was to write 2 int32s.
+        # SOCKET_STATIC_SLEN=0 restores the tensor (LEGACY control + the gates).
+        # NOTE for the tensor path: sparse_len must be allocated FRESH here. Caching it across
+        # calls (it is a constant W for every (b,h)) breaks under
+        # torch.compile(mode="reduce-overhead"): the cached tensor is allocated inside the
+        # CUDA-graph memory pool on the first (recording) call, and reusing it on later
+        # replays raises "accessing tensor output of CUDAGraphs that has been overwritten by
+        # a subsequent run".
+        if _STATIC_SLEN:
+            return sparse_list, None
         sparse_len = torch.full((B, H), W, device=device, dtype=torch.int32)
         return sparse_list, sparse_len
 
@@ -690,6 +710,10 @@ def _fwd_kernel_sparse_decode_stage1(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NAN_GUARD: tl.constexpr,
+    slen_scalar,                 # runtime int: the constant list width W (used iff SLEN_MODE)
+    SLEN_MODE: tl.constexpr,     # 0 = load from the Sparse_Len tensor, 1 = runtime scalar,
+                                 # 2 = compile-time constant (constexpr-folds the loop bound)
+    SLEN_CONST: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -698,8 +722,17 @@ def _fwd_kernel_sparse_decode_stage1(
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
 
-    cur_seq_len_ptr = Sparse_Len + cur_batch * stride_splen_b + cur_head * stride_splen_h
-    cur_seq_len = tl.load(cur_seq_len_ptr)
+    # STATIC SPARSE_LEN -- see kernels/sparse.py::_SLEN_MODE. Mode 1 (default) passes the
+    # same number as an ordinary runtime scalar, so codegen is unchanged and the result is
+    # bit-identical; it just removes the [B,H] tensor and the two torch.full kernels that
+    # filled it.
+    if SLEN_MODE == 0:
+        cur_seq_len_ptr = Sparse_Len + cur_batch * stride_splen_b + cur_head * stride_splen_h
+        cur_seq_len = tl.load(cur_seq_len_ptr)
+    elif SLEN_MODE == 1:
+        cur_seq_len = slen_scalar
+    else:
+        cur_seq_len = SLEN_CONST
 
     cur_block_start = seq_start_block * BLOCK_SEQ
     cur_block_end = tl.minimum(cur_seq_len, cur_block_start + BLOCK_SEQ)
@@ -819,14 +852,22 @@ def _fwd_kernel_sparse_decode_stage2(
     BLOCK_SEQ: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     NAN_GUARD: tl.constexpr,
+    slen_scalar,
+    SLEN_MODE: tl.constexpr,
+    SLEN_CONST: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
 
-    cur_seq_len_ptr = Sparse_Len + cur_batch * stride_splen_b + cur_head * stride_splen_h
-    cur_seq_len = tl.load(cur_seq_len_ptr)
+    if SLEN_MODE == 0:               # see the stage1 comment
+        cur_seq_len_ptr = Sparse_Len + cur_batch * stride_splen_b + cur_head * stride_splen_h
+        cur_seq_len = tl.load(cur_seq_len_ptr)
+    elif SLEN_MODE == 1:
+        cur_seq_len = slen_scalar
+    else:
+        cur_seq_len = SLEN_CONST
 
     block_n_size = (tl.where(cur_seq_len <= 0, 0, cur_seq_len + BLOCK_SEQ - 1) // BLOCK_SEQ)
 
@@ -875,6 +916,8 @@ def _sparse_decode_stage1_impl(
     mid_out_logsumexp: torch.Tensor,# [B,H,block_seq_num] fp32
     block_seq: int,
     max_len_in_batch: int,
+    slen_const: int = -1,
+    slen_mode: int = 0,
 ) -> None:
     # ---------------------------------------------------------------------------
     # STAGE1 LAUNCH CONFIG. BLOCK_N is the inner gather width and BLOCK_N/num_warps is the
@@ -944,6 +987,9 @@ def _sparse_decode_stage1_impl(
         BLOCK_DMODEL=D,
         BLOCK_N=BLOCK_N,
         NAN_GUARD=_NAN_GUARD,
+        slen_scalar=slen_const,
+        SLEN_MODE=slen_mode,
+        SLEN_CONST=slen_const,
         num_warps=NUM_WARPS,
         num_stages=2,
     )
@@ -955,6 +1001,8 @@ def _sparse_decode_stage2_impl(
     sparse_len: torch.Tensor,
     out: torch.Tensor,       # [B,H,D] fp16/bf16
     block_seq: int,
+    slen_const: int = -1,
+    slen_mode: int = 0,
 ) -> None:
     D = out.shape[-1]
     assert D in {16, 32, 64, 128}
@@ -974,6 +1022,9 @@ def _sparse_decode_stage2_impl(
         BLOCK_SEQ=block_seq,
         BLOCK_DMODEL=D,
         NAN_GUARD=_NAN_GUARD,
+        slen_scalar=slen_const,
+        SLEN_MODE=slen_mode,
+        SLEN_CONST=slen_const,
         num_warps=4,
         num_stages=2,
     )
@@ -1004,10 +1055,11 @@ def sparse_attention_fwd(
     key: torch.Tensor,        # [B,Kv,S,D]
     value: torch.Tensor,      # [B,Kv,S,D]
     sparse_list: torch.Tensor,# [B,H,Ktotal]
-    sparse_len: torch.Tensor, # [B,H]
+    sparse_len,               # [B,H] int32, or None to use the static W scalar
     block_seq: int = 256,
 ) -> torch.Tensor:
-    assert query.is_cuda and key.is_cuda and value.is_cuda and sparse_list.is_cuda and sparse_len.is_cuda
+    assert query.is_cuda and key.is_cuda and value.is_cuda and sparse_list.is_cuda
+    assert sparse_len is None or sparse_len.is_cuda
     B, H, D = query.shape
 
     # max_len_in_batch is the longest per-(b,h) sparse list. build_sparse_list_decode
@@ -1026,9 +1078,22 @@ def sparse_attention_fwd(
     mid_o_log = torch.empty((B, H, block_seq_num), dtype=torch.float32, device=query.device)
     out = torch.empty((B, H, D), dtype=query.dtype, device=query.device)
 
+    # STATIC SPARSE_LEN: sparse_len is None -> pass W to the kernels as a scalar and hand
+    # sparse_list in the Sparse_Len slot (that pointer is then never dereferenced -- see the
+    # SLEN_MODE branch in _fwd_kernel_sparse_decode_stage1). Bit-identical; removes two
+    # torch.full kernels per layer per decode step.
+    if sparse_len is None:
+        slen = max_len_in_batch
+        slen_mode = _SLEN_MODE          # 1 = runtime scalar (default), 2 = constexpr
+        len_t = sparse_list             # dummy pointer; never dereferenced
+    else:
+        slen = -1
+        slen_mode = 0
+        len_t = sparse_len
+
     sparse_decode_stage1(
-        query, key, value, sparse_list, sparse_len,
-        mid_o, mid_o_log, block_seq, max_len_in_batch,
+        query, key, value, sparse_list, len_t,
+        mid_o, mid_o_log, block_seq, max_len_in_batch, slen, slen_mode,
     )
-    sparse_decode_stage2(mid_o, mid_o_log, sparse_len, out, block_seq)
+    sparse_decode_stage2(mid_o, mid_o_log, len_t, out, block_seq, slen, slen_mode)
     return out

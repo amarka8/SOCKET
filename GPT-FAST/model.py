@@ -30,6 +30,39 @@ _NEEDS_ALLOWED_MASK = (
     or os.environ.get("SOCKET_FUSED_LIST", "1") != "1"   # eager list assembly gathers it
 )
 
+# ---------------------------------------------------------------------------
+# LAUNCH-OVERHEAD / KERNEL-COUNT switches (read ONCE at import -> torch.compile guards,
+# never a graph break). Default 1 = the optimized path; 0 restores the pre-optimization op
+# chain so every rung stays A/B-able from ONE frozen tree.
+#
+#   SOCKET_HOIST_STEP      seq_len_t (= pos.max()+1) is computed ONCE PER DECODE STEP in
+#                          Transformer.sparse_forward and threaded down, instead of being
+#                          recomputed identically in each of the 32 layers (2 kernels,
+#                          2.11 us/layer in the compiled trace). Bit-identical.
+#   SOCKET_FUSED_KVMETA    one Triton kernel replaces the 3-kernel
+#                          einsum -> ge -> pack_bits + vector_norm chain and writes the
+#                          k_hard / v_norm cache columns in place (5.24 us/layer).
+#   SOCKET_FUSED_KVWRITE   the same kernel also writes the k_cache / v_cache columns, so
+#                          KVCache.update is skipped entirely in decode (1.12 us/layer).
+#                          NOTE: this also stops maintaining KVCache.prefill_len, which is
+#                          write-only dead state in this repo (never read anywhere; grep it).
+#                          Requires SOCKET_FUSED_KVMETA=1.
+#   SOCKET_FUSED_SOFTHASH  one Triton kernel replaces the 4-kernel
+#                          einsum -> tanh/div -> einsum -> softmax chain (9.98 us/layer).
+#                          NOT bitwise: <=1 bf16 ulp (the two GEMMs become fp32 dots that are
+#                          rounded to bf16 at the same points, so the rounding SITES match but
+#                          the accumulation order inside each dot differs).
+#
+# All of these are DECODE-ONLY (seqlen == 1); prefill keeps the eager einsum chain and is
+# bit-identical.
+# ---------------------------------------------------------------------------
+_HOIST_STEP = os.environ.get("SOCKET_HOIST_STEP", "1") == "1"
+_FUSED_SOFTHASH = os.environ.get("SOCKET_FUSED_SOFTHASH", "0") == "1"
+_FUSED_KVMETA = os.environ.get("SOCKET_FUSED_KVMETA", "1") == "1"
+_FUSED_KVWRITE = (os.environ.get("SOCKET_FUSED_KVWRITE", "1") == "1") and _FUSED_KVMETA
+if _FUSED_SOFTHASH or _FUSED_KVMETA:
+    from kernels.fused_meta import fused_soft_hash, fused_kv_meta
+
 
 # ---------------------------------------------------------------------------
 # KV-cache storage layout policy.
@@ -618,8 +651,16 @@ class Transformer(nn.Module):
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
+        # PER-STEP HOIST: seq_len_t = pos.max()+1 is the true filled cache length. It is
+        # IDENTICAL for all 32 layers (it depends only on input_pos), yet the per-layer code
+        # recomputed it 32x -- 2 kernels each (a 1-element reduce + an add), 2.11 us/layer =
+        # 67 us/step in the compiled CUDA-graph replay. Compute it once here and thread it
+        # down. Bit-identical by construction (same expression, same inputs); stays an
+        # on-device int32 scalar so no shape becomes dynamic and no host sync appears.
+        seq_len_t = (input_pos.max().to(torch.int32) + 1).reshape(()) if _HOIST_STEP else None
+
         for layer in self.layers:
-            x = layer.sparse_forward(x, input_pos, freqs_cis, mask)
+            x = layer.sparse_forward(x, input_pos, freqs_cis, mask, seq_len_t)
         x = self.norm(x)
         # self.layers[0].attention.print_prof(reset=True)
         return self.output(x)
@@ -642,8 +683,10 @@ class TransformerBlock(nn.Module):
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
-    def sparse_forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
-        h = x + self.attention.sparse_forward(self.attention_norm(x), freqs_cis, mask, None, input_pos)
+    def sparse_forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor,
+                       seq_len_t: Optional[Tensor] = None) -> Tensor:
+        h = x + self.attention.sparse_forward(self.attention_norm(x), freqs_cis, mask, None,
+                                              input_pos, seq_len_t)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -732,6 +775,7 @@ class Attention(nn.Module):
         mask1: torch.Tensor,      # [1,1,S,Tmax] bool
         mask2: torch.Tensor,      # unused
         input_pos: Optional[torch.Tensor] = None,
+        seq_len_t_in: Optional[torch.Tensor] = None,   # per-STEP hoisted pos.max()+1
     ) -> torch.Tensor:
         assert input_pos is not None, "sparse_forward expects input_pos"
         if input_pos.dtype != torch.long:
@@ -766,10 +810,36 @@ class Attention(nn.Module):
 
         # Cache update (+ metadata)
         with CUDATimer(cuda_timing) as t_cache:
-            with torch.no_grad():
-                k_hard = self.hard_hash_keys(k)  # [B,S,Hl,L]
-                v_norm = torch.linalg.vector_norm(v.float(), ord=2, dim=-1).to(torch.float16)  # [B,S,Hl]
-            k_cache, v_cache = self.kv_cache.update(input_pos, k, v, v_norm=v_norm, k_hard=k_hard)  # [B,Hl,T,D]
+            # FUSED KV METADATA (decode only; seqlen == 1 is a COMPILE-TIME constant here).
+            # The eager chain in the else-branch is 3 kernels on <=40 KB of data (a cutlass
+            # bf16 gemm for k@planes, a pack_bits reduce, a vector_norm reduce) plus 2
+            # index_put writes, measured at 5.24 us/layer in the compiled trace. One Triton
+            # kernel computes both metadata columns and writes them straight into the cache
+            # buffers. It indexes k_cache/v_cache as [B,Hkv,T,D] -- guaranteed by the
+            # kv_cache.layout == "bhtd" assert at the top of this function.
+            if _FUSED_KVMETA and seqlen == 1:
+                if not _FUSED_KVWRITE:
+                    k_cache, v_cache = self.kv_cache.update(input_pos, k, v)  # [B,Hl,T,D]
+                fused_kv_meta(
+                    k[:, 0].contiguous(), v[:, 0].contiguous(), self.planes,
+                    input_pos.reshape(-1)[0],
+                    self.kv_cache.k_hard, self.kv_cache.v_norm,
+                    self.kv_cache.k_cache, self.kv_cache.v_cache,
+                    _FUSED_KVWRITE,
+                )
+                if _FUSED_KVWRITE:
+                    # The kernel wrote the k/v cache columns too, so KVCache.update is not
+                    # called at all in decode. Its ONLY other side effect was the
+                    # `prefill_len` running max, which is write-only dead state in this repo
+                    # (grep: never read anywhere).
+                    # Read the buffers AFTER the mutating op so the dependency is explicit
+                    # (functionalization would order it anyway; do not rely on that).
+                    k_cache, v_cache = self.kv_cache.k_cache, self.kv_cache.v_cache
+            else:
+                with torch.no_grad():
+                    k_hard = self.hard_hash_keys(k)  # [B,S,Hl,L]
+                    v_norm = torch.linalg.vector_norm(v.float(), ord=2, dim=-1).to(torch.float16)  # [B,S,Hl]
+                k_cache, v_cache = self.kv_cache.update(input_pos, k, v, v_norm=v_norm, k_hard=k_hard)  # [B,Hl,T,D]
         p["cache_update"] += t_cache.ms()
 
         # Token counters feed only the (disabled) profiling printout. They mutate Python ints
@@ -818,14 +888,22 @@ class Attention(nn.Module):
         pos = input_pos.view(-1)
         # seq_len_t = pos.max()+1 = true filled length, kept as an on-device scalar tensor (no
         # .item()) so it drives index ARITHMETIC (window start) without changing any SHAPE.
-        seq_len_t = pos.max().to(torch.int32) + 1
+        # PER-STEP HOIST: identical for all 32 layers, so Transformer.sparse_forward computes
+        # it once and passes it in. Falls back to the per-layer computation when the caller
+        # does not supply it (eager tests, SOCKET_HOIST_STEP=0).
+        if seq_len_t_in is not None:
+            seq_len_t = seq_len_t_in
+        else:
+            seq_len_t = pos.max().to(torch.int32) + 1
         # The `allowed` mask is exactly `t < seq_len` -- the SAME value for every head and
         # every one of the 32 layers -- yet it was materialized ([1,H,maxlen] bool, a 4.6 MB
         # expand().contiguous() at 140K) and consumed once per layer per decode step. The
         # fused scorer / fused list-assembly take the seq_len scalar instead, so skip building
         # it entirely unless a LEGACY path is selected.
         if _NEEDS_ALLOWED_MASK:
-            allowed = torch.arange(maxlen, device=pos.device) <= pos.max()
+            # `t <= pos.max()` == `t < seq_len_t`; using the hoisted scalar avoids a second
+            # pos.max() reduction. Identical mask.
+            allowed = torch.arange(maxlen, device=pos.device) < seq_len_t
             allowed_bht = allowed.view(1, 1, maxlen).expand(bsz, self.n_head, maxlen).contiguous()
         else:
             allowed_bht = None
@@ -862,7 +940,14 @@ class Attention(nn.Module):
         window = max(0, min(window, maxlen))
         M = max(0, min(M, maxlen))
 
-        q_probs = self.soft_hash(q_bhd)  # [B,H,L,R]
+        # FUSED soft_hash: ONE Triton kernel instead of
+        #   cutlass gemm (q@planes) -> tanh/div -> cutlass gemm (@protos_T) -> softmax
+        # = 4 kernels, 9.98 us/layer in the compiled trace, on <=1.6 MB of data.
+        if _FUSED_SOFTHASH:
+            q_probs = fused_soft_hash(q_bhd, self.planes, self.protos_T,
+                                      math.sqrt(self.head_dim), self.tau, q_bhd.dtype)
+        else:
+            q_probs = self.soft_hash(q_bhd)  # [B,H,L,R]
 
         with CUDATimer(cuda_timing) as t_index:
             sparse_list, sparse_len = build_sparse_list_decode(
@@ -881,7 +966,9 @@ class Attention(nn.Module):
             )
             if sparse_list.dtype != torch.int32:
                 sparse_list = sparse_list.to(torch.int32)
-            if sparse_len.dtype != torch.int32:
+            # sparse_len is None when the (always constant) list width is passed to the
+            # backend kernels as a scalar instead -- see kernels/sparse.py::_STATIC_SLEN.
+            if sparse_len is not None and sparse_len.dtype != torch.int32:
                 sparse_len = sparse_len.to(torch.int32)
         p["index_build"] += t_index.ms()
 
@@ -896,7 +983,7 @@ class Attention(nn.Module):
                 k_backend,        # [B,Hl,T,D]
                 v_backend,        # [B,Hl,T,D]
                 sparse_list,      # [B,H,Ktotal]
-                sparse_len,       # [B,H]
+                sparse_len,       # [B,H] int32, or None (static width, see _STATIC_SLEN)
                 block_seq=256,
             )
         p["sparse_kernel"] += t_sparse.ms()
