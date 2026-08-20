@@ -183,9 +183,14 @@ def generate(
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
-        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+        # decode_type selects the KV storage layout (see model.resolve_kv_layout): dense gets
+        # FA's native [B,T,Hkv,D] so decode needs no per-step relayout; sparse keeps
+        # [B,Hkv,T,D] and is untouched. The draft model always runs the dense path.
+        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length,
+                           decode_type=decode_type)
         if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length,
+                                     decode_type="dense")
 
     # Kernel warmup is handled EXCLUSIVELY by the SOCKET_DECODE_WARMUP untimed compiled decode
     # steps below (mirrors the proven FORK, which has no standalone pre-warm). A standalone
@@ -527,7 +532,17 @@ def main(
         torch.cuda.synchronize()
         t = time.perf_counter() - t0
 
-        if not interactive:
+        # GREPPABLE GENERATED-TOKEN STREAM. Sampling is argmax (see sample()), so for a given
+        # prompt+model the generated ids are DETERMINISTIC on the dense path; printing them makes
+        # "did this optimization change the output?" a one-line diff at any context length,
+        # instead of diffing a multi-MB detokenized dump. Outside the timed window.
+        try:
+            _gen = (y[0] if y.dim() > 1 else y)[prompt_length:].tolist()
+            print(f"[GEN-TOKENS] sample={i} n={len(_gen)} ids={','.join(str(int(_tk)) for _tk in _gen)}",
+                  flush=True)
+        except Exception as _e:
+            print(f"(gen-token dump skipped: {type(_e).__name__}: {_e})")
+        if not interactive and os.getenv("SOCKET_QUIET_TEXT", "0") != "1":
             # display-only detokenization; never let a tokenizer hiccup kill the timing print below.
             try:
                 toks = y[0].tolist() if y.dim() > 1 else y.tolist()

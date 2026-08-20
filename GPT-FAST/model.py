@@ -29,6 +29,24 @@ _NEEDS_ALLOWED_MASK = (
 
 
 # ---------------------------------------------------------------------------
+# KV-cache storage layout policy.
+#   dense  -> "bthd"  = [B, T, Hkv, D], flash_attn_with_kvcache's native layout, so dense
+#             decode hands FA the cache buffer with ZERO per-step relayout.
+#   sparse -> "bhtd"  = [B, Hkv, T, D], the layout the SOCKET gather kernels require. The
+#             sparse path is therefore BIT-IDENTICAL to before this change.
+# SOCKET_KV_LAYOUT overrides: "bhtd" reproduces the OLD (relayout-every-step) dense path
+# exactly, which is what the within-job dense control measurement runs.
+# ---------------------------------------------------------------------------
+def resolve_kv_layout(decode_type: str = "sparse") -> str:
+    env = os.environ.get("SOCKET_KV_LAYOUT", "auto").strip().lower()
+    if env in ("bhtd", "bthd"):
+        return env
+    if env not in ("", "auto"):
+        raise ValueError(f"SOCKET_KV_LAYOUT must be one of auto|bhtd|bthd, got {env!r}")
+    return "bthd" if decode_type == "dense" else "bhtd"
+
+
+# ---------------------------------------------------------------------------
 # FA2/FA3 dense-attention backend selection (PLUMBING ONLY — does not touch the
 # SOCKET sparse path). Copied verbatim from the reference fork so the dense
 # baseline can be timed under BOTH FA2 and FA3 in the same env.
@@ -389,7 +407,22 @@ transformer_configs = {
 
 class KVCache(nn.Module):
     """
-    KV is stored as (B, H, T, D).
+    KV storage layout is SELECTABLE (`layout`):
+
+      "bhtd" (default, LEGACY): k_cache/v_cache are (B, Hkv, T, D).  This is the layout the
+             SOCKET sparse path's gather kernels require, so the sparse path always uses it
+             and is bit-identical to before this change.
+
+      "bthd" (FAIR DENSE): k_cache/v_cache are (B, T, Hkv, D) — exactly the layout
+             flash_attn_with_kvcache consumes.  The dense decode path then hands the cache
+             buffer straight to FA with NO per-step relayout.  Previously dense decode did
+             `k.transpose(1,2).contiguous()` on the WHOLE cache every layer every step
+             (2 x 587 MB/layer at 140K -> ~9.2 ms/token over 32 layers, i.e. ~60% of dense
+             "attention" time was a layout copy, not attention).  This mirrors what the
+             SOCKET path already did for its `k_hard` buffer (see the RANK-1 note below).
+
+    Only k_cache/v_cache are affected; k_hard / v_norm / attn_out are SOCKET-only and
+    unchanged.
     """
 
     def __init__(
@@ -401,12 +434,16 @@ class KVCache(nn.Module):
         L: int,
         R: int,
         dtype=torch.bfloat16,
+        layout: str = "bhtd",
     ):
         super().__init__()
         B, H, T, D = max_batch_size, n_heads, max_seq_length, head_dim
 
-        self.register_buffer("k_cache", torch.zeros((B, H, T, D), dtype=dtype))
-        self.register_buffer("v_cache", torch.zeros((B, H, T, D), dtype=dtype))
+        assert layout in ("bhtd", "bthd"), f"unknown KV layout {layout!r}"
+        self.layout = layout
+        kv_shape = (B, T, H, D) if layout == "bthd" else (B, H, T, D)
+        self.register_buffer("k_cache", torch.zeros(kv_shape, dtype=dtype))
+        self.register_buffer("v_cache", torch.zeros(kv_shape, dtype=dtype))
 
         self.L = L
         self.R = R
@@ -444,7 +481,7 @@ class KVCache(nn.Module):
         assert k_val.ndim == 4 and v_val.ndim == 4
         assert k_val.shape[1] == S and v_val.shape[1] == S, "k/v S dim must match input_pos length"
 
-        Tcap = self.k_cache.size(2)
+        Tcap = self.k_cache.size(1) if self.layout == "bthd" else self.k_cache.size(2)
         # data-dependent bounds check: eager-only (skipped under compile/cudagraph; the caller
         # sizes the cache to T_new so it cannot overflow during the timed run).
         if not torch.compiler.is_compiling():
@@ -456,9 +493,15 @@ class KVCache(nn.Module):
                     f"Did you call setup_caches(max_seq_length >= max(input_pos)+1)?"
                 )
 
-        # [B,S,H,D] -> [B,H,S,D] and write into the T axis.
-        self.k_cache[:, :, input_pos, :] = k_val.permute(0, 2, 1, 3).contiguous()
-        self.v_cache[:, :, input_pos, :] = v_val.permute(0, 2, 1, 3).contiguous()
+        if self.layout == "bthd":
+            # Cache is ALREADY [B,T,H,D] == the incoming k_val layout: write the S new rows
+            # straight into the T axis, no permute, no relayout anywhere downstream.
+            self.k_cache[:, input_pos, :, :] = k_val
+            self.v_cache[:, input_pos, :, :] = v_val
+        else:
+            # [B,S,H,D] -> [B,H,S,D] and write into the T axis.
+            self.k_cache[:, :, input_pos, :] = k_val.permute(0, 2, 1, 3).contiguous()
+            self.v_cache[:, :, input_pos, :] = v_val.permute(0, 2, 1, 3).contiguous()
 
         if v_norm is not None:
             self.v_norm[:, :, input_pos] = v_norm.permute(0, 2, 1).contiguous()
@@ -491,7 +534,7 @@ class Transformer(nn.Module):
         self.max_batch_size = -1
         self.max_seq_length = -1
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, decode_type: str = "sparse"):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
 
@@ -502,6 +545,7 @@ class Transformer(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
 
+        kv_layout = resolve_kv_layout(decode_type)
         for b in self.layers:
             b.attention.kv_cache = KVCache(
                 max_batch_size,
@@ -510,6 +554,7 @@ class Transformer(nn.Module):
                 head_dim,
                 L=self.config.L,
                 R=self.config.R,
+                layout=kv_layout,
             ).to(device=device)
 
         self.freqs_cis = precompute_freqs_cis(
@@ -691,6 +736,10 @@ class Attention(nn.Module):
 
         bsz, seqlen, _ = x.shape
         assert self.kv_cache is not None, "Call setup_caches() first so kv_cache exists"
+        # SOCKET's gather kernels read [B,Hkv,T,D]; the fair-dense [B,T,Hkv,D] layout must never
+        # reach this path (resolve_kv_layout() only hands "bthd" to decode_type="dense").
+        assert self.kv_cache.layout == "bhtd", (
+            f"sparse decode requires the [B,Hkv,T,D] KV layout, got {self.kv_cache.layout!r}")
 
         p = self._prof
         # Profiling timers do device .synchronize() per stage per decode token, which would
@@ -872,10 +921,23 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
+        # FAIR-DENSE LAYOUT. With layout="bthd" the cache is stored [B,T,Hkv,D] — FA's native
+        # decode layout — so `k_bthd`/`v_bthd` below are the cache buffers THEMSELVES and the
+        # per-step full-cache transpose().contiguous() disappears entirely. `k`/`v` keep their
+        # historical [B,Hkv,T,D] meaning via a zero-copy transpose VIEW so the prefill /
+        # SDPA-control path below is untouched (its own .contiguous() materializes exactly the
+        # same bytes it always did). With layout="bhtd" (SOCKET, or SOCKET_KV_LAYOUT=bhtd)
+        # nothing changes at all.
+        k_bthd_cache = v_bthd_cache = None
         if self.kv_cache is not None:
-            k_cache, v_cache = self.kv_cache.update(input_pos, k, v)  # [B,Hl,T,D]
-            k = k_cache
-            v = v_cache
+            k_cache, v_cache = self.kv_cache.update(input_pos, k, v)
+            if self.kv_cache.layout == "bthd":
+                k_bthd_cache, v_bthd_cache = k_cache, v_cache      # [B,T,Hkv,D] (native)
+                k = k_cache.transpose(1, 2)                        # [B,Hkv,T,D] VIEW (no copy)
+                v = v_cache.transpose(1, 2)
+            else:
+                k = k_cache                                        # [B,Hkv,T,D]
+                v = v_cache
 
         q = q.transpose(1, 2)  # [B,Hq,S,D]
 
@@ -893,8 +955,14 @@ class Attention(nn.Module):
         )
         if seqlen == 1 and _use_flash and input_pos is not None and input_pos.numel() > 0:
             q_bshd = q.transpose(1, 2).contiguous()        # [B,1,Hq,D]
-            k_bthd = k.transpose(1, 2).contiguous()        # [B,maxlen,Hkv,D] (un-repeated; GQA-native)
-            v_bthd = v.transpose(1, 2).contiguous()
+            if k_bthd_cache is not None:
+                # ZERO-COPY: the cache is already [B,maxlen,Hkv,D]. This is the whole point of
+                # layout="bthd" — no 2 x 587 MB relayout per layer per step at 140K.
+                k_bthd = k_bthd_cache
+                v_bthd = v_bthd_cache
+            else:
+                k_bthd = k.transpose(1, 2).contiguous()    # [B,maxlen,Hkv,D] (un-repeated; GQA-native)
+                v_bthd = v.transpose(1, 2).contiguous()
             cache_seqlens = (input_pos.max().to(torch.int32) + 1).reshape(1).expand(bsz).contiguous()
             out_bshd = torch.ops.socket.flash_dense_decode(q_bshd, k_bthd, v_bthd, cache_seqlens)
             if not torch.compiler.is_compiling():
