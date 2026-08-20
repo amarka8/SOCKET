@@ -34,6 +34,86 @@ _SCORER_IMPL = os.environ.get(
 # the guard's cost.
 _NAN_GUARD = os.environ.get("SOCKET_NAN_GUARD", "1") == "1"
 
+
+# ---------------------------------------------------------------------------
+# CACHE-KEY ISOLATION FOR TRITON CONSTEXPR KNOBS  (SOCKET_CACHE_KNOB_ISOLATION, default ON)
+#
+# THE BUG THIS WORKS AROUND (measured; see fair/kernel-transmission/results/ and
+# fair/stage1-bandwidth/README.md):
+# `torch.library.triton_op` DECOMPOSES under FakeTensorMode -- torch/_library/triton.py runs
+# the python body during AOTAutograd tracing -- so any `os.environ.get(...)` inside the body
+# is evaluated at TRACE time and the resulting tl.constexpr is frozen into the compiled
+# artifact.  The value then lives in
+# torch._higher_order_ops.triton_kernel_wrap.kernel_side_table and the FX graph only carries
+# an INDEX into that table, so inductor's FX-graph cache key DOES NOT depend on it.  Two
+# processes that share TORCHINDUCTOR_CACHE_DIR and differ only in such a knob get a cache
+# HIT and silently run the FIRST process's kernel.
+#
+# Minimal repro (one triton_op whose kernel writes its own BLOCK constexpr into the output):
+#   shared cache, SOCKET_TESTBLOCK=16 -> ran 16   (populates the cache)
+#   shared cache, SOCKET_TESTBLOCK=64 -> ran 16   <-- STALE  (eager correctly ran 64)
+#   fresh cache,  SOCKET_TESTBLOCK=64 -> ran 64
+#   shared cache + TORCHINDUCTOR_FX_GRAPH_CACHE=0, SOCKET_TESTBLOCK=64 -> ran 64
+#
+# CONSEQUENCE FOR BENCHMARKING: every A/B of a constexpr knob run as several cells of ONE
+# job with one TORCHINDUCTOR_CACHE_DIR measured the SAME kernel twice.  That is exactly how
+# "BLOCK_N=64 is 1.9x faster in isolation but 0% end-to-end" was produced -- and shipped as
+# a revert (3bab93d).  Re-measured with per-cell caches, BLOCK_N=128/num_warps=8 is +9.7%.
+#
+# FIX: fold the knob values into the inductor cache directory, so a different knob is a
+# different cache namespace.  Done at import time, before anything can trigger a compile.
+# This is BELT AND BRACES ONLY: benchmark harnesses must STILL give every cell a fresh
+# TORCHINDUCTOR_CACHE_DIR and TRITON_CACHE_DIR, because knobs that are not listed here (or
+# an edit to a kernel body) are not covered.
+# ---------------------------------------------------------------------------
+_CONSTEXPR_KNOBS = (
+    # tl.constexpr values read from os.environ inside a triton_op body (the actual hazard)
+    "SOCKET_BLOCK_N",            # historical; stage1 now hardcodes 128 (see stage1 impl)
+    "SOCKET_BLOCK_SEQ",          # historical; the partition width is now the literal 256
+    "SOCKET_SCORER_BLOCK_T",
+    "SOCKET_SCORER_WARPS",
+    "SOCKET_NAN_GUARD",
+    "SOCKET_STATIC_SLEN",
+    "SOCKET_SH_IMPL",
+    "SOCKET_SH_WARPS",
+    "SOCKET_SH_ROUNDTRIP",
+    "SOCKET_KVMETA_IMPL",
+    "SOCKET_KVMETA_WARPS",
+    # knobs that change WHICH ops are traced. These do land in the FX graph, so they are
+    # already part of the cache key; listed anyway because the cost of an extra cache
+    # namespace is a recompile and the cost of a stale hit is a wrong published number.
+    "SOCKET_SCORER_IMPL",
+    "SOCKET_TRITON_SCORER",
+    "SOCKET_SELECT_IMPL",
+    "SOCKET_TOPK_SORTED",
+    "SOCKET_FUSED_LIST",
+    "SOCKET_HOIST_STEP",
+    "SOCKET_FUSED_SOFTHASH",
+    "SOCKET_FUSED_KVMETA",
+    "SOCKET_FUSED_KVWRITE",
+    "SOCKET_KV_LAYOUT",
+)
+
+
+def _isolate_inductor_cache_by_knobs():
+    if os.environ.get("SOCKET_CACHE_KNOB_ISOLATION", "1") != "1":
+        return None
+    import hashlib
+    sig = ";".join(f"{k}={os.environ.get(k, '')}" for k in _CONSTEXPR_KNOBS)
+    h = hashlib.sha1(sig.encode()).hexdigest()[:12]
+    base = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if base is None:
+        import tempfile
+        base = os.path.join(tempfile.gettempdir(),
+                            f"torchinductor_{os.environ.get('USER', 'u')}")
+    new = os.path.join(base, f"socket_knobs_{h}")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = new
+    os.makedirs(new, exist_ok=True)
+    return new
+
+
+_INDUCTOR_CACHE_DIR = _isolate_inductor_cache_by_knobs()
+
 _SOFT_HASH_EXT = None
 
 def _get_soft_hash_ext():
