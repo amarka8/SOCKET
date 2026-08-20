@@ -55,7 +55,7 @@ _NAN_GUARD = os.environ.get("SOCKET_NAN_GUARD", "1") == "1"
 #       compile-time constant, the compiler fully unrolls 16 iterations, and stage1 loses
 #       more than the 1.50 us saved (32K: 269.01 -> 273.29 us/layer). Do not ship mode 2.
 # All three modes are bit-identical: it is the same number by three routes.
-_SLEN_MODE = int(os.environ.get("SOCKET_STATIC_SLEN", "1"))
+_SLEN_MODE = int(os.environ.get("SOCKET_STATIC_SLEN", "0"))
 _STATIC_SLEN = _SLEN_MODE != 0
 
 

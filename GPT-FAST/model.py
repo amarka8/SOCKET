@@ -56,10 +56,10 @@ _NEEDS_ALLOWED_MASK = (
 # All of these are DECODE-ONLY (seqlen == 1); prefill keeps the eager einsum chain and is
 # bit-identical.
 # ---------------------------------------------------------------------------
-_HOIST_STEP = os.environ.get("SOCKET_HOIST_STEP", "1") == "1"
+_HOIST_STEP = os.environ.get("SOCKET_HOIST_STEP", "0") == "1"
 _FUSED_SOFTHASH = os.environ.get("SOCKET_FUSED_SOFTHASH", "1") == "1"
-_FUSED_KVMETA = os.environ.get("SOCKET_FUSED_KVMETA", "1") == "1"
-_FUSED_KVWRITE = (os.environ.get("SOCKET_FUSED_KVWRITE", "1") == "1") and _FUSED_KVMETA
+_FUSED_KVMETA = os.environ.get("SOCKET_FUSED_KVMETA", "0") == "1"
+_FUSED_KVWRITE = (os.environ.get("SOCKET_FUSED_KVWRITE", "0") == "1") and _FUSED_KVMETA
 if _FUSED_SOFTHASH or _FUSED_KVMETA:
     from kernels.fused_meta import fused_soft_hash, fused_kv_meta
 
