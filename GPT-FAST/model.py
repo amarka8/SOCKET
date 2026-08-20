@@ -57,7 +57,7 @@ _NEEDS_ALLOWED_MASK = (
 # bit-identical.
 # ---------------------------------------------------------------------------
 _HOIST_STEP = os.environ.get("SOCKET_HOIST_STEP", "1") == "1"
-_FUSED_SOFTHASH = os.environ.get("SOCKET_FUSED_SOFTHASH", "0") == "1"
+_FUSED_SOFTHASH = os.environ.get("SOCKET_FUSED_SOFTHASH", "1") == "1"
 _FUSED_KVMETA = os.environ.get("SOCKET_FUSED_KVMETA", "1") == "1"
 _FUSED_KVWRITE = (os.environ.get("SOCKET_FUSED_KVWRITE", "1") == "1") and _FUSED_KVMETA
 if _FUSED_SOFTHASH or _FUSED_KVMETA:
