@@ -780,23 +780,45 @@ def _sparse_decode_stage1_impl(
     block_seq: int,
     max_len_in_batch: int,
 ) -> None:
-    # BLOCK_N is the inner gather width. Widening it 16 -> 64 makes the stage1 KERNEL 1.9x
-    # faster (T=143411: 53.5 -> 28.2 us at width=3107, 70.3 -> 36.0 us at width=4584, output
-    # bitwise-identical) -- but that does NOT surface end to end. Measured same-GPU in the
-    # final config at 140K, BLOCK_N 16 vs 64: 89.26/89.33 (P10L10 33x), 93.06/92.80
-    # (P10L10 50x), 92.61/93.99 (P8L50 50x) -- mean +0.4%, inside the ~1% within-job drift.
-    # The decode step simply is not bound by stage1 at these shapes.
-    # Meanwhile BLOCK_N=64 is the ONLY change in this branch that alters the generated tokens
-    # on real text (it re-blocks the online softmax, so the fp accumulation order moves; with
-    # the selection as tie-degenerate as it is on this build -- see the protos_T note in the
-    # report -- that flips which tokens get attended and the greedy stream diverges within a
-    # few steps). Taking a reproducibility hit for no measured gain is a bad trade, so the
-    # DEFAULT stays at the baseline value 16 and 64 is left as an opt-in knob for shapes
-    # where stage1 does dominate.
-    # BLOCK_SEQ stays 256 so stage2's partial count is unchanged. INVARIANT: BLOCK_SEQ % BLOCK_N == 0 -- the inner mask is
-    # `offs_n_new < cur_seq_len` (not < cur_block_end), so a non-dividing BLOCK_N would let a
-    # block read into the NEXT block's range and DOUBLE-COUNT those tokens.
-    BLOCK_N = int(os.environ.get("SOCKET_BLOCK_N", "16"))
+    # ---------------------------------------------------------------------------
+    # STAGE1 LAUNCH CONFIG. BLOCK_N is the inner gather width and BLOCK_N/num_warps is the
+    # number of gathered 256 B rows each warp owns. At the historical (16, 4) that is FOUR
+    # rows per warp: 8 lanes cover one row, each lane loads 32 B, per-thread memory-level
+    # parallelism is 2 outstanding loads, and the kernel then serialises
+    # BLOCK_SEQ/BLOCK_N = 16 such chunks behind the online-softmax loop dependency. That is
+    # why stage1 ran at 0.95 TB/s of requested bytes on a GPU that delivers 3.60 TB/s on a
+    # contiguous read.
+    #
+    # THESE ARE LITERALS ON PURPOSE, NOT os.environ READS. They are tl.constexpr values
+    # consumed inside a torch.library.triton_op body, so an env read here is evaluated at
+    # TRACE time and is NOT part of inductor's FX-graph cache key -- two cells of one job
+    # sharing TORCHINDUCTOR_CACHE_DIR would silently run the same kernel. That artifact is
+    # exactly how the previous comment here ("1.9x in isolation, +0.4% end-to-end, inside the
+    # drift") was produced, twice, and shipped as a revert (3bab93d). See
+    # kernels/sparse.py::_isolate_inductor_cache_by_knobs.
+    #
+    # Re-measured with a FRESH TORCHINDUCTOR_CACHE_DIR per cell, 140K P10/L10 50x, compiled
+    # CUPTI trace + un-profiled wall, drift control -0.02%:
+    #     (BLOCK_N, num_warps)   stage1 us/layer   TB/s requested   tok/s
+    #     (16,  4)  [historical]      49.14              0.95        83.66
+    #     (64,  4)                    26.12              1.79        89.04
+    #     (128, 8)  [SHIPPED]         15.15              3.09        91.81
+    # and end-to-end under the full protocol (median of 5 warm decode-only samples):
+    # (16,4) 88.52 -> (128,8) 97.09 tok/s, +9.7%; at 33x 84.40 -> 94.98, +12.5%; on 140K REAL
+    # TEXT 87.95 -> 96.59, +9.8%. The wall saving equals the kernel saving 1:1 in every cell.
+    # GATE C (greedy tokens, 32K real text) is IDENTICAL for (16,4), (64,4), (128,4), (128,8):
+    # the old comment's claim that BLOCK_N=64 alters the generated tokens does not reproduce.
+    # See /scratch/sj157/socket_speed/fair/stage1-bandwidth/README.md.
+    #
+    # BLOCK_SEQ stays 256 (the caller's literal) so stage2's partial count is unchanged --
+    # stage2's merge trip count is W/BLOCK_SEQ, so narrowing the partition trades stage1 for
+    # stage2 (2.17 us at 12 partials, 3.17 at 23, 4.75 at 45).
+    # INVARIANT: BLOCK_SEQ % BLOCK_N == 0 -- the inner mask is `offs_n_new < cur_seq_len`
+    # (not < cur_block_end), so a non-dividing BLOCK_N would let a block read into the NEXT
+    # block's range and DOUBLE-COUNT those tokens.
+    # ---------------------------------------------------------------------------
+    BLOCK_N = 128
+    NUM_WARPS = 8
     assert block_seq % BLOCK_N == 0, (
         f"BLOCK_SEQ ({block_seq}) must be divisible by BLOCK_N ({BLOCK_N}); otherwise stage1 "
         f"blocks overlap and double-count tokens in the online softmax.")
@@ -826,7 +848,7 @@ def _sparse_decode_stage1_impl(
         BLOCK_DMODEL=D,
         BLOCK_N=BLOCK_N,
         NAN_GUARD=_NAN_GUARD,
-        num_warps=4,
+        num_warps=NUM_WARPS,
         num_stages=2,
     )
 
