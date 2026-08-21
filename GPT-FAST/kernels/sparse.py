@@ -564,6 +564,30 @@ def _fwd_kernel_sparse_decode_stage2(
     tl.store(O + off_o, acc / tl.where(sum_exp == 0.0, 1.0, sum_exp))
 
 
+# STAGE-1 LAUNCH CONFIG. Literals, for the inductor-cache-key reason spelled out at the
+# scorer's config above: these are tl.constexpr values consumed inside a triton_op body, so an
+# env read here is baked at trace time and is invisible to the FX-graph cache key. Reading
+# BLOCK_N from the environment is exactly what produced the bogus "1.9x in isolation, 0%
+# end-to-end" measurement that once got this win reverted.
+#
+# BLOCK_N is the inner gather width. At (16, 4) each warp owns four gathered 256 B rows,
+# per-thread MLP is 2 outstanding loads, and 16 such chunks serialise behind the online-softmax
+# loop dependency: 0.95 TB/s of requested bytes on a GPU that delivers 3.60 TB/s contiguous. At
+# (128, 8) stage1 drops 49.14 -> 15.15 us/layer (3.09 TB/s) at 140K P10/L10.
+# Lowering BLOCK_SEQ (the "occupancy" hypothesis) is NOT the lever -- 416 vs 3136 blocks changes
+# almost nothing; vector width is what mattered. BLOCK_SEQ stays 256 because it sets stage2's
+# merge trip count (W / BLOCK_SEQ).
+#
+# INVARIANT: BLOCK_SEQ % BLOCK_N == 0 whenever the list spans MORE THAN ONE partition,
+# asserted below. The inner mask is `offs_n_new < cur_seq_len`, not `< cur_block_end`, so a
+# non-dividing BLOCK_N lets a partition read past its own end into the next partition's range
+# and double-count those tokens in the online softmax. A single-partition call
+# (block_seq >= list width, which GPT-FAST/test_socket_compile_equiv.py's T9 fixture makes)
+# has no next partition, so it is harmless and is allowed.
+_STAGE1_BLOCK_N = 128
+_STAGE1_NUM_WARPS = 8
+
+
 def _sparse_decode_stage1_impl(
     q: torch.Tensor,            # [B,H,D]
     k: torch.Tensor,            # [B,Kv,S,D]
@@ -575,7 +599,11 @@ def _sparse_decode_stage1_impl(
     block_seq: int,
     max_len_in_batch: int,
 ) -> None:
-    BLOCK_N = 16
+    BLOCK_N = _STAGE1_BLOCK_N
+    assert block_seq % BLOCK_N == 0 or max_len_in_batch <= block_seq, (
+        f"BLOCK_SEQ ({block_seq}) must be divisible by BLOCK_N ({BLOCK_N}) when the list "
+        f"(width {max_len_in_batch}) spans more than one partition; otherwise stage1 partitions "
+        f"overlap and double-count tokens in the online softmax. A single partition is fine.")
     D = q.shape[-1]
     assert D in {16, 32, 64, 128}
 
@@ -601,7 +629,7 @@ def _sparse_decode_stage1_impl(
         BLOCK_SEQ=block_seq,
         BLOCK_DMODEL=D,
         BLOCK_N=BLOCK_N,
-        num_warps=4,
+        num_warps=_STAGE1_NUM_WARPS,
         num_stages=2,
     )
 
