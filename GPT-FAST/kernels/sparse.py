@@ -45,6 +45,10 @@ def _get_soft_hash_ext():
 #   => mutates_args=() ; output is a new f32 tensor [B,H,1,T_k].
 # The wrapper body calls the identical pybind kernel, so the runtime path is
 # bit-identical to the eager path.
+#
+# NOT ON THE DECODE PATH ANY MORE: build_sparse_list_decode uses the Triton scorer
+# (socket::soft_hash_score) below, which is bit-identical and strictly cheaper. This op is
+# kept as the byte-identical REFERENCE implementation the equivalence gates compare against.
 # ---------------------------------------------------------------------------
 @torch.library.custom_op("socket::soft_hash_collision", mutates_args=())
 def _soft_hash_collision_op(
@@ -71,6 +75,122 @@ def _soft_hash_collision_fake(
     H = q_probs.shape[1]
     T_k = key_buckets.shape[3]
     return q_probs.new_empty((B, H, 1, T_k), dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# TRITON SOFT-HASH SCORER  (socket::soft_hash_score)  -- the scorer the decode path uses.
+#
+# BIT-EXACT vs soft_hash_collision_kernel_3 above. The per-token score is
+#   acc = 0; for l in 0..L-1: acc += float(q_probs[b,h,l, buckets[b,kv,l,t]]); out = acc*float(v[t])
+# i.e. the SAME fp32 adds in the SAME l order, then the same single multiply. L is a constexpr
+# so the loop is unrolled but never reassociated. q_probs is read in its native dtype and
+# v_norm in its native dtype; float(bf16) and float(fp16) are EXACT, so the operands are the
+# same bit patterns the fp32-cast path fed the CUDA kernel.
+#
+# What it removes, with no arithmetic change:
+#   * the [B,H,maxlen] bool `allowed` tensor. The mask is exactly `t < seq_len`, a scalar
+#     compare; the CUDA scorer needed it materialized (expand().contiguous(), 4.6 MB write at
+#     140K) and then read it (4.6 MB), once per layer per decode step, for a value identical
+#     across all heads and all 32 layers.
+#   * the full-buffer v_norm.float() (2.3 MB read + 4.6 MB write per layer per step).
+#   * the fp32 [B,H,1,L,R] q_probs copy.
+# It is also a genuine triton_op, so torch.compile captures it as a CUDA-graph node without
+# the stream hazard the raw <<<>>> launch had.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fwd_kernel_soft_hash_score(
+    QProbs,          # [B,H,L,R]        (bf16 / fp16 / fp32)
+    KeyBuckets,      # [B,Hkv,L,T]      int16
+    VNorm,           # [B,Hkv,T]        (bf16 / fp16 / fp32)
+    SeqLenPtr,       # int32 scalar on device
+    Out,             # [B,H,T]          fp32 (written)
+    H: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, R: tl.constexpr,
+    T: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    h = tl.program_id(1)
+    b = tl.program_id(2)
+
+    rep = H // HKV
+    kv = h // rep
+
+    offs_t = tile * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask_t = offs_t < T
+
+    seq_len = tl.load(SeqLenPtr).to(tl.int32)
+    keep = offs_t < seq_len
+
+    kb_base = (b * HKV + kv) * L * T
+    qp_base = (b * H + h) * L * R
+
+    acc = tl.zeros([BLOCK_T], dtype=tl.float32)
+    for l in tl.static_range(L):
+        bkt = tl.load(KeyBuckets + kb_base + l * T + offs_t, mask=mask_t, other=0).to(tl.int32)
+        qv = tl.load(QProbs + qp_base + l * R + bkt, mask=mask_t, other=0.0)
+        acc += qv.to(tl.float32)
+
+    v = tl.load(VNorm + (b * HKV + kv) * T + offs_t, mask=mask_t, other=0.0).to(tl.float32)
+    out = acc * v
+    # Unfilled cache columns (t >= seq_len) get -inf, exactly as the CUDA scorer wrote them
+    # for !allowed_ext: `allowed` IS `t < seq_len` (model.py builds it as
+    # arange(maxlen) <= pos.max(), with seq_len_t = pos.max()+1).
+    out = tl.where(keep, out, -float("inf"))
+    tl.store(Out + (b * H + h) * T + offs_t, out, mask=mask_t)
+
+
+# LAUNCH CONFIG: HARDCODED LITERALS, deliberately not env-readable. These become tl.constexpr
+# values inside a torch.library.triton_op body, which Dynamo evaluates at TRACE time; the
+# resulting kernel enters inductor's FX-graph cache key only as an INDEX into
+# kernel_side_table, so the value itself is NOT part of the key. Two runs that share a
+# TORCHINDUCTOR_CACHE_DIR and differ only in such a value silently execute the FIRST one's
+# kernel. That artifact has already produced wrong measurements in this codebase (a "1.9x in
+# isolation, 0% end-to-end" reading that got a real win reverted). Keeping every constexpr a
+# literal removes the hazard at the root; benchmark harnesses should STILL give each cell a
+# fresh TORCHINDUCTOR_CACHE_DIR and TRITON_CACHE_DIR.
+#
+# The optimum is a constant ~4 ELEMENTS PER THREAD (BLOCK_T / (32*num_warps) == 4): the L-deep
+# gather loop makes anything wider spill. Measured at T=143411 against the CUDA scorer plus the
+# fp32 casts it forces (105.4 us at L=10, 251.3 us at L=50):
+#   L=10: (128,1)  47.7 us = 2.21x   [(1024,4) was 51.2 us]
+#   L=50: (256,2) 180.3 us = 1.39x   [(1024,4) was 298.3 us = 0.84x, a REGRESSION]
+# 40 (BLOCK_T, num_warps) variants were checked and every one is bitwise-equal to the CUDA
+# scorer, so this is purely a performance choice.
+_SCORER_BLOCK_T_SMALL_L, _SCORER_WARPS_SMALL_L = 128, 1
+_SCORER_BLOCK_T_LARGE_L, _SCORER_WARPS_LARGE_L = 256, 2
+
+
+def _scorer_launch_cfg(L: int):
+    if L <= 16:
+        return _SCORER_BLOCK_T_SMALL_L, _SCORER_WARPS_SMALL_L
+    return _SCORER_BLOCK_T_LARGE_L, _SCORER_WARPS_LARGE_L
+
+
+def _soft_hash_score_impl(
+    q_probs: torch.Tensor,      # [B,H,L,R]
+    key_buckets: torch.Tensor,  # [B,Hkv,L,T] int16
+    v_norm: torch.Tensor,       # [B,Hkv,T]
+    seq_len_t: torch.Tensor,    # int32 scalar on device
+    out: torch.Tensor,          # [B,H,T] fp32 (written)
+) -> None:
+    B, H, L, R = q_probs.shape
+    HKV, T = key_buckets.shape[1], key_buckets.shape[3]
+    BLOCK_T, warps = _scorer_launch_cfg(L)
+    wrap_triton(_fwd_kernel_soft_hash_score)[(triton.cdiv(T, BLOCK_T), H, B)](
+        q_probs, key_buckets, v_norm, seq_len_t, out,
+        H=H, HKV=HKV, L=L, R=R, T=T, BLOCK_T=BLOCK_T,
+        num_warps=warps, num_stages=2,
+    )
+
+
+if _HAS_TRITON_OP:
+    # mutates_args declares `out` so functionalization and cudagraph_trees handle it
+    # correctly; Dynamo does not trace into the body (no graph break under fullgraph=True).
+    soft_hash_score_op = triton_op(
+        "socket::soft_hash_score", _soft_hash_score_impl, mutates_args={"out"}
+    )
+else:
+    soft_hash_score_op = torch.no_grad()(_soft_hash_score_impl)
+
 
 @torch.no_grad()
 def build_sparse_list_decode(
@@ -127,24 +247,19 @@ def build_sparse_list_decode(
     # NOTE: KC/BLOCK_N/num_warps/num_stages kept for API compatibility.
     M_eff = min(M, maxlen)  # static
     if M_eff > 0:
-        q_probs_f32 = q_probs.float().unsqueeze(2).contiguous()  # [B,H,1,L,R]  (per query head)
-        key_buckets = k_hard_bhlt                                  # [B,Hkv,L,maxlen] (per kv head)
-        # int16 REQUIRED: R=256 buckets span 0..255 which do NOT fit signed int8 -> NO int8.
+        key_buckets = k_hard_bhlt                                # [B,Hkv,L,maxlen] (per kv head)
+        # int16 REQUIRED: R=1024 buckets span 0..1023 (and even R=256 spans 0..255), neither
+        # of which fits signed int8.
         if key_buckets.dtype != torch.int16:
             key_buckets = key_buckets.to(torch.int16)
-        key_buckets = key_buckets.contiguous()
-        allowed_ext = allowed_bht.unsqueeze(2).contiguous()       # [B,H,1,maxlen]   (per query head)
-        v_hist = v_norm_bht.float().unsqueeze(2).contiguous()     # [B,Hkv,1,maxlen] (per kv head)
 
-        # Call through the registered custom op (socket::soft_hash_collision)
-        # so torch.compile(fullgraph=True) sees a known op instead of an opaque
-        # pybind call. The op body calls the identical CUDA kernel -> bit-identical.
-        scores = torch.ops.socket.soft_hash_collision(
-            q_probs_f32,
-            key_buckets,
-            allowed_ext,
-            v_hist,
-        ).squeeze(2)  # [B,H,maxlen]  (unfilled/disallowed columns are -inf)
+        # Triton scorer (socket::soft_hash_score). Bit-identical to
+        # socket::soft_hash_collision -- the same fp32 adds in the same l order, the same
+        # single multiply -- but it needs no `allowed` tensor (the mask is the seq_len scalar
+        # compare), no fp32 q_probs copy and no v_norm.float(). See the kernel comment.
+        scores = torch.empty((B, H, maxlen), device=device, dtype=torch.float32)
+        soft_hash_score_op(q_probs.contiguous(), key_buckets.contiguous(),
+                           v_norm_bht.contiguous(), seq_len_t.reshape(()), scores)
 
         top = torch.topk(scores, k=M_eff, dim=-1, largest=True)
         heavy_idx = top.indices.to(torch.int32)
