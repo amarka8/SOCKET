@@ -750,16 +750,20 @@ class Attention(nn.Module):
         # maxlen = k_cache.shape[2] is the cache's static T dim, fixed at setup_caches() to
         # prompt_len + max_new_tokens -> COMPILE-TIME CONSTANT, so every shape below is static
         # and no host sync (prefill_len.item()) is needed. We score the FULL cache and rely on
-        # the `allowed` mask (index > pos.max() -> -inf in the scorer / dropped by the kernel)
-        # so the selected token set + attention output are identical to the eager `:T` path.
+        # the `t < seq_len` mask (unfilled columns -> -inf in the scorer / dropped by the index
+        # kernel) so the selected token set + attention output are identical to the eager
+        # `:T` path.
         maxlen = k_cache.shape[2]
 
         pos = input_pos.view(-1)
         # seq_len_t = pos.max()+1 = true filled length, kept as an on-device scalar tensor (no
         # .item()) so it drives index ARITHMETIC (window start) without changing any SHAPE.
         seq_len_t = pos.max().to(torch.int32) + 1
-        allowed = torch.arange(maxlen, device=pos.device) <= pos.max()
-        allowed_bht = allowed.view(1, 1, maxlen).expand(bsz, self.n_head, maxlen).contiguous()
+        # NO `allowed` TENSOR. It was `arange(maxlen) <= pos.max()` expanded to
+        # [B,n_head,maxlen] and made contiguous -- a 4.6 MB write at 140K, read back once per
+        # layer per decode step, carrying a value identical across every head and all 32
+        # layers. The scorer and the index-list kernel both take the seq_len scalar and apply
+        # `t < seq_len` directly, which is the same predicate.
 
         with CUDATimer(cuda_timing) as t_relayout:
             # PER-KV-HEAD scorer: do NOT repeat_interleave the (identical-per-GQA-group) key
@@ -800,7 +804,7 @@ class Attention(nn.Module):
                 q_probs,
                 k_hard_bhlt,
                 v_norm_bht,
-                allowed_bht,
+                None,          # allowed mask: no longer built, see above
                 sink=sink,
                 window=window,
                 M=M,

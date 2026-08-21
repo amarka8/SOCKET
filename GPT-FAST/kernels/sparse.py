@@ -192,12 +192,107 @@ else:
     soft_hash_score_op = torch.no_grad()(_soft_hash_score_impl)
 
 
+# ---------------------------------------------------------------------------
+# FUSED INDEX-LIST ASSEMBLY  (socket::build_list)
+#
+# Everything after the top-M select used to be ~24 separate tiny CUDA kernels on [B,H,M] and
+# [W] tensors:
+#   valid=(>=0)&(<maxlen); ok=gather(allowed, clamp(heavy)); masked_fill;
+#   arange(sink); clamp(seq_len-window); arange(window)+off; clamp; cat; view/expand;
+#   gather(allowed, base); masked_fill; win_start=clamp; in_sink; in_window; or; masked_fill;
+#   cat([base, heavy]); contiguous
+# One kernel emits sparse_list directly, and it needs NO `allowed` tensor: the mask is exactly
+# `t < seq_len`, a scalar compare, so materializing and re-reading a [B,H,maxlen] bool (4.6 MB
+# each way per layer per decode step at 140K) was pure waste. This is the last consumer of
+# `allowed`, so model.py stops building it entirely.
+#
+# The emitted list is BIT-IDENTICAL by construction -- it is pure integer index arithmetic,
+# reproducing exactly the semantics of the op chain it replaces:
+#   slot in [0, sink)             -> index = slot                              (sink)
+#   slot in [sink, sink+window)   -> index = min(win_start + j, maxlen-1)       (window)
+#   slot in [sink+window, W)      -> index = heavy[m]                          (top-M)
+#   win_start = max(seq_len - window, sink)
+#   every index is dropped to -1 unless 0 <= index < seq_len         (allowed gating)
+#   a heavy index is ALSO dropped to -1 if it lies in [0,sink) or [win_start,seq_len) (dedup,
+#   because the no-dedup online softmax would otherwise weight that token twice)
+# Ordering of the two heavy masks is irrelevant: a -1 fails both `>= 0` predicates.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fwd_kernel_build_list(
+    Heavy,            # [B,H,M] int32   (selected indices; order within the row is irrelevant)
+    SeqLenPtr,        # int32 scalar on device (= pos.max()+1, the true filled length)
+    Out,              # [B,H,W] int32   (written)
+    stride_hb, stride_hh,
+    stride_ob, stride_oh,
+    SINK: tl.constexpr, WINDOW: tl.constexpr, M: tl.constexpr,
+    MAXLEN: tl.constexpr, W: tl.constexpr, BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    blk = tl.program_id(2)
+
+    seq_len = tl.load(SeqLenPtr).to(tl.int32)
+    win_start = tl.maximum(seq_len - WINDOW, SINK)
+
+    slot = blk * BLOCK + tl.arange(0, BLOCK)
+    in_range = slot < W
+
+    is_sink = slot < SINK
+    is_win = (slot >= SINK) & (slot < SINK + WINDOW)
+    is_heavy = slot >= (SINK + WINDOW)
+
+    m = slot - (SINK + WINDOW)
+    hv = tl.load(Heavy + b * stride_hb + h * stride_hh + m,
+                 mask=is_heavy & in_range, other=-1).to(tl.int32)
+
+    idx_win = tl.minimum(win_start + (slot - SINK), MAXLEN - 1)
+    idx = tl.where(is_sink, slot.to(tl.int32),
+                   tl.where(is_win, idx_win.to(tl.int32), hv))
+
+    # allowed gating: 0 <= idx < seq_len
+    keep = (idx >= 0) & (idx < seq_len)
+    # heavy dedup against sink U window
+    dup = is_heavy & (((idx >= 0) & (idx < SINK)) | ((idx >= win_start) & (idx < seq_len)))
+    idx = tl.where(keep & (dup == 0), idx, -1)
+
+    tl.store(Out + b * stride_ob + h * stride_oh + slot, idx, mask=in_range)
+
+
+# BLOCK is a literal for the same inductor-cache-key reason as the scorer's launch config.
+_BUILD_LIST_BLOCK = 256
+
+
+def _build_list_impl(
+    heavy_idx: torch.Tensor,   # [B,H,M] int32
+    seq_len_t: torch.Tensor,   # int32 scalar on device
+    out: torch.Tensor,         # [B,H,W] int32 (written)
+    sink: int, window: int, maxlen: int,
+) -> None:
+    B, H, M = heavy_idx.shape
+    W = out.shape[-1]
+    BLOCK = _BUILD_LIST_BLOCK
+    grid = (B, H, triton.cdiv(W, BLOCK))
+    wrap_triton(_fwd_kernel_build_list)[grid](
+        heavy_idx, seq_len_t, out,
+        heavy_idx.stride(0), heavy_idx.stride(1),
+        out.stride(0), out.stride(1),
+        SINK=sink, WINDOW=window, M=M, MAXLEN=maxlen, W=W, BLOCK=BLOCK,
+        num_warps=4, num_stages=1,
+    )
+
+
+if _HAS_TRITON_OP:
+    build_list_op = triton_op("socket::build_list", _build_list_impl, mutates_args={"out"})
+else:
+    build_list_op = torch.no_grad()(_build_list_impl)
+
+
 @torch.no_grad()
 def build_sparse_list_decode(
     q_probs: torch.Tensor,         # [B,H,L,R] fp16        (PER-QUERY-HEAD H)
     k_hard_bhlt: torch.Tensor,     # [B,Hkv,L,maxlen] int16/int32 (PER-KV-HEAD Hkv)
     v_norm_bht: torch.Tensor,      # [B,Hkv,maxlen] fp16/bf16     (PER-KV-HEAD Hkv)
-    allowed_bht: torch.Tensor,     # [B,H,maxlen] bool     (PER-QUERY-HEAD H)
+    allowed_bht,                   # IGNORED, kept for call compatibility (see below)
     sink: int,
     window: int,
     M: int,
@@ -216,13 +311,17 @@ def build_sparse_list_decode(
     The true (growing) sequence length is carried ONLY as the on-device scalar `seq_len_t`
     (pos.max()+1) and is used purely for index ARITHMETIC (the sliding-window start), never for
     a shape. Unfilled cache columns (index >= seq_len_t) are masked to -inf by the `allowed`
-    mask both in the scorer (soft_hash_collision writes -inf there) and via the `base_ok` gather
-    below, so they can never be selected and never enter attention. The result is identical to
-    slicing the cache to the true filled length.
+    mask `t < seq_len_t`, applied inside the scorer (which writes -inf there) and inside the
+    index-list kernel, so they can never be selected and never enter attention. The result is
+    identical to slicing the cache to the true filled length.
+
+    `allowed_bht` is IGNORED. It used to carry a [B,H,maxlen] bool that was always exactly
+    `arange(maxlen) < seq_len_t` -- the same value for every head and every layer -- and both
+    consumers now derive it from the seq_len scalar instead. The parameter is kept so existing
+    callers (GPT-FAST/test_socket_compile_equiv.py) still work unchanged.
     """
-    assert q_probs.is_cuda and k_hard_bhlt.is_cuda and v_norm_bht.is_cuda and allowed_bht.is_cuda
+    assert q_probs.is_cuda and k_hard_bhlt.is_cuda and v_norm_bht.is_cuda
     assert q_probs.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    assert allowed_bht.dtype == torch.bool
 
     B, H, L, R = q_probs.shape
     Bk, Hkv, L2, maxlen = k_hard_bhlt.shape   # maxlen is STATIC (compile-time constant)
@@ -234,7 +333,6 @@ def build_sparse_list_decode(
     assert Bk == B, "batch mismatch between q_probs and key_buckets"
     assert H % Hkv == 0, f"n_head ({H}) must be divisible by n_kv_heads ({Hkv})"
     assert v_norm_bht.shape[1] == Hkv, "v_norm must be per-kv-head [B,Hkv,maxlen]"
-    assert allowed_bht.shape[1] == H, "allowed must be per-query-head [B,H,maxlen]"
 
     device = q_probs.device
 
@@ -266,61 +364,30 @@ def build_sparse_list_decode(
     else:
         heavy_idx = torch.empty((B, H, 0), device=device, dtype=torch.int32)
 
-    # heavy_idx: [B,H,M_eff]. Mask any slot that is out of range or not allowed (-> -1).
-    # Done UNCONDITIONALLY (no `valid.any()` data-dependent Python branch, which would
-    # graph-break / host-sync under torch.compile). In the decode regime there are always
-    # >= M finite (filled) tokens, so topk never surfaces a -inf column and no -1 is produced.
-    valid = (heavy_idx >= 0) & (heavy_idx < maxlen)
-    ok = torch.gather(
-        allowed_bht, dim=-1, index=heavy_idx.clamp(0, maxlen - 1).to(torch.long)
-    )
-    heavy_idx = heavy_idx.masked_fill(~(valid & ok), -1)
-
-    # 4) sink + window base indices (structured). COUNTS are static Python ints; the window
-    # START is data-dependent (seq_len_t - window) but applied as a tensor offset so the SHAPE
-    # stays constant. allowed-gating drops any index that falls outside the filled [0, seq_len).
+    # ---- FUSED LIST ASSEMBLY (socket::build_list) --------------------------------------
+    # Replaces the ~24 tiny kernels this function used to launch. See the kernel comment for
+    # the semantics, which are reproduced exactly.
     sink = max(0, min(sink, maxlen))
     window = max(0, min(window, maxlen))
+    if sink == 0 and window == 0:
+        # Degenerate config (never reached by the model: sink_size == window_size == 120).
+        # A window of 1 makes the kernel emit exactly the single index the op chain used as
+        # its fallback base, clamp(seq_len-1, min=0).
+        window = 1
+    W = sink + window + M_eff
 
-    parts = []
-    if sink > 0:
-        parts.append(torch.arange(sink, device=device, dtype=torch.int32))
-    if window > 0:
-        # window indices = [max(seq_len-window, sink), seq_len)  (the true tail). This mirrors
-        # eager's `win_start = max(T-window, sink)` EXACTLY: clamping the start to >= sink avoids
-        # producing duplicate indices that overlap the sink region (a duplicate would be double-
-        # counted by the online-softmax kernel, so it must be avoided to stay bit-exact). In the
-        # decode regime seq_len-window >> sink, so the clamp is inactive and win=[seq_len-window,
-        # seq_len). The count stays a static `window`; only the START is a (device) tensor.
-        win_off = torch.clamp(seq_len_t - window, min=sink)
-        win_idx = torch.arange(window, device=device, dtype=torch.int32) + win_off
-        win_idx = torch.clamp(win_idx, max=maxlen - 1)
-        parts.append(win_idx)
-
-    if len(parts) == 0:
-        base = (seq_len_t - 1).clamp(min=0).reshape(1).to(torch.int32)
+    sparse_list = torch.empty((B, H, W), device=device, dtype=torch.int32)
+    if M_eff <= 0:
+        heavy_in = torch.full((B, H, 1), -1, device=device, dtype=torch.int32)
     else:
-        base = torch.cat(parts, dim=0)
-
-    base = base.view(1, 1, -1).expand(B, H, -1)
-
-    # Filter base by allowed mask (keeps shape): an index >= seq_len (unfilled tail) is
-    # disallowed -> -1, so the flash-decode kernel skips it (output-preserving).
-    base_ok = torch.gather(allowed_bht, dim=-1, index=base.to(torch.long))
-    base = base.masked_fill(~base_ok, -1)
-
-    # DEDUP heavy vs the structured base (sink ∪ window): a top-M token already in [0,sink) or
-    # [win_start,seq_len) would be DOUBLE-COUNTED by the no-dedup online-softmax (~2x weight).
-    # Mask those heavy slots to -1 (kernel skips them) so the selection is a set-UNION, attending
-    # each token exactly once — matching paper Alg 3 and the hub SocketMasker (torch.maximum).
-    win_start = torch.clamp(seq_len_t - window, min=sink) if window > 0 else seq_len_t
-    in_sink = (heavy_idx >= 0) & (heavy_idx < sink)
-    in_window = (heavy_idx >= win_start) & (heavy_idx < seq_len_t)
-    heavy_idx = heavy_idx.masked_fill(in_sink | in_window, -1)
-
-    # 5) sparse_list / sparse_len  (list width is a static Python int)
-    sparse_list = torch.cat([base, heavy_idx], dim=-1).contiguous()
-    sparse_len = torch.full((B, H), sparse_list.shape[-1], device=device, dtype=torch.int32)
+        heavy_in = heavy_idx
+    build_list_op(heavy_in, seq_len_t.reshape(()), sparse_list, sink, window, maxlen)
+    # sparse_len is W for every (b,h) by construction (the list is rectangular, padded with
+    # -1). Left as a per-call torch.full: it is a 128-byte fill that inductor CSEs across the
+    # 32 layers of one graph, and caching a tensor across calls is unsafe under
+    # cudagraph_trees (a buffer allocated in the graph pool cannot be reused on a later
+    # replay).
+    sparse_len = torch.full((B, H), W, device=device, dtype=torch.int32)
     return sparse_list, sparse_len
 
 
