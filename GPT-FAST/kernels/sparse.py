@@ -744,7 +744,14 @@ def _fwd_kernel_sparse_decode_stage2(
 # (block_seq >= list width, which GPT-FAST/test_socket_compile_equiv.py's T9 fixture makes)
 # has no next partition, so it is harmless and is allowed.
 _STAGE1_BLOCK_N = 128
-_STAGE1_NUM_WARPS = 8
+# num_warps stays at main's 4, DELIBERATELY. Splitting the two knobs (GATE B, fixed index list,
+# T=32768): BLOCK_N 16->128 with num_warps=4 is BITWISE equal to main (max|diff| 0.0), while
+# num_warps 4->8 is the ENTIRE numerical difference (max|diff| 1.95e-3) and is worth only
+# +2.51% (P10/L10) / +2.20% (P8/L50) -- the smallest win in this branch. Taking it would make
+# stage1's output non-bitwise, so the branch's residual difference vs main would no longer be
+# "selection tie-breaking only". Keeping 4 preserves ~+6.9% of the ~+9.6% combined win with an
+# attention path that is bit-for-bit main's. Raise to 8 only if 2.5% is worth giving that up.
+_STAGE1_NUM_WARPS = 4
 
 
 def _sparse_decode_stage1_impl(
