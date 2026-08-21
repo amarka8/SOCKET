@@ -3,13 +3,21 @@
     Tiled-over-T_k kernel: one thread per t in a tile for fixed (b,h).
     This improves coalescing for key_buckets and allowed_ext when T_k is large.
 
+    STREAM. The launch below MUST name at::cuda::getCurrentCUDAStream(). A bare
+    kernel<<<grid, block>>>(...) goes to the LEGACY DEFAULT STREAM, and a legacy-default-stream
+    launch is NOT captured as a node when torch.compile(mode="reduce-overhead") records the
+    decode step into a CUDA graph -- so at every graph REPLAY the kernel would not run at all
+    and `out` would stay at the torch::zeros the wrapper allocated, i.e. every heavy token
+    would be selected from an all-zero score array. Also error-check the launch, because a
+    silent failure here looks exactly like a very fast kernel.
+
     Configuration:
     int threads = 256;
     dim3 block(threads, 1, 1);
     dim3 grid((T_k + threads - 1) / threads, H, B);
 
     Launch:
-    soft_hash_collision_kernel_3<<<grid, block>>>(
+    soft_hash_collision_kernel_3<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         q.data_ptr<float>(),
         key_buckets.data_ptr<int16_t>(),
         allowed_ext.data_ptr<bool>(),
@@ -22,6 +30,7 @@
         static_cast<int>(R),
         static_cast<int>(T_k)
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 */
 __global__ void soft_hash_collision_kernel_3(
     const float* __restrict__ q_probs,        // [B,H,1,L,R] contiguous (per query head)
