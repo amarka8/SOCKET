@@ -170,6 +170,16 @@ def _dense_attention(
 
     if not torch.compiler.is_compiling():
         _assert_backend("sdpa")
+    if attn_mask is None and input_pos is not None and input_pos.numel() > 0:
+        # setup_caches skips the O(T^2) causal buffer whenever a flash backend is live, so a
+        # fall-through to SDPA (flash unavailable, or the flash path above raised) would
+        # otherwise run NON-CAUSAL and be silently wrong -- a worse bug than the memory one.
+        # Rebuild exactly the slice that was dropped: row i of tril(ones)[input_pos] is
+        # (j <= input_pos[i]), i.e. [S,T] -> [1,1,S,T].
+        _T = k_bhtd.size(2)
+        attn_mask = (
+            torch.arange(_T, device=q_bhsd.device) <= input_pos.reshape(-1, 1)
+        )[None, None]
     return F.scaled_dot_product_attention(
         q_bhsd, k_bhtd, v_bhtd, attn_mask=attn_mask, dropout_p=0.0,
     )
@@ -509,9 +519,24 @@ class Transformer(nn.Module):
             self.config.rope_base,
         ).to(device=device)
 
-        self.causal_mask = torch.tril(
-            torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool, device=device)
-        )
+        # The [T,T] causal mask is O(T^2): 68.7 GB of bool at 256K, and torch.ones plus the
+        # tril output are both live, so the transient peak is twice that. It is consumed ONLY
+        # as the attn_mask argument of _dense_attention's SDPA fallback -- every
+        # FlashAttention path (prefill flash_attn_func, the flash_dense_decode op) derives
+        # causality from causal=True and never reads it, and SOCKET decode masks with
+        # `t < seq_len`. Allocating it unconditionally capped usable context at ~200-210K for
+        # a buffer no kernel dereferences. Allocate it only when there is no flash backend;
+        # otherwise leave it None and let the SDPA fallback rebuild the [S,T] slice it needs
+        # from input_pos, so a flash exception still gets a CORRECT causal mask instead of
+        # silently attending non-causally.
+        _flash_live = (os.getenv("USE_FLASHATTN3", "1") == "1" and _flash_attn_func is not None)
+        if _flash_live:
+            self.causal_mask = None
+        else:
+            self.causal_mask = torch.tril(
+                torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool,
+                           device=device)
+            )
 
     def _check_input_pos(self, input_pos: Tensor):
         if input_pos.dtype != torch.long:
@@ -529,7 +554,7 @@ class Transformer(nn.Module):
         return input_pos
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
-        assert self.freqs_cis is not None and self.causal_mask is not None, "Caches must be initialized first"
+        assert self.freqs_cis is not None, "Caches must be initialized first"
         input_pos = self._check_input_pos(input_pos)
 
         # Optional extra safety:
@@ -541,7 +566,8 @@ class Transformer(nn.Module):
             if mn < 0 or mx >= self.config.vocab_size:
                 raise RuntimeError(f"Token id out of vocab: [{mn},{mx}] vs vocab_size={self.config.vocab_size}")
 
-        mask = self.causal_mask[None, None, input_pos]  # [1,1,S,T]
+        # None when a flash backend is live (see setup_caches); the SDPA fallback rebuilds it.
+        mask = None if self.causal_mask is None else self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]           # [S, ...]
         x = self.tok_embeddings(idx)
 
@@ -551,13 +577,13 @@ class Transformer(nn.Module):
         return self.output(x)
 
     def sparse_forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
-        assert self.freqs_cis is not None and self.causal_mask is not None, "Caches must be initialized first"
+        assert self.freqs_cis is not None, "Caches must be initialized first"
         input_pos = self._check_input_pos(input_pos)
 
         if idx.dtype != torch.long:
             idx = idx.long()
 
-        mask = self.causal_mask[None, None, input_pos]
+        mask = None if self.causal_mask is None else self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
