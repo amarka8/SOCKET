@@ -9,3 +9,6 @@ output
 processed_dataset/
 # benchmark run outputs / logs / scratch (reproducible artifacts)
 socket_bench/
+
+# agent worktrees / local tooling state (1.8G, not source)
+.claude/
