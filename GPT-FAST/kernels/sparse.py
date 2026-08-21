@@ -291,8 +291,19 @@ def _fwd_kernel_sparse_decode_stage1(
         cur_max_logic = tl.max(att_value, axis=0)
         new_max_logic = tl.maximum(cur_max_logic, max_logic).to(tl.float32)
 
-        exp_logic = tl.exp(att_value - new_max_logic).to(tl.float32)
-        logic_scale = tl.exp(max_logic - new_max_logic).to(tl.float32)
+        # EMPTY-CHUNK GUARD. If every slot in this BLOCK_N chunk is padding (-1) or past
+        # cur_seq_len, att_value is all -inf; with max_logic also still -inf (no valid token
+        # seen yet in this BLOCK_SEQ block) new_max_logic is -inf and BOTH exp() calls below
+        # evaluate exp(-inf - -inf) = exp(nan) = nan, poisoning acc/sum_exp for the whole
+        # block. Stage2 then merges the NaN partial and it reaches the logits.
+        # Substituting 0.0 for the max while the running max is still -inf is EXACT: every
+        # exp() argument is then -inf - 0 = -inf -> 0.0, so the chunk contributes nothing and
+        # max_logic legitimately stays -inf. When new_max_logic is finite the expression is
+        # unchanged, so this is bit-identical on every non-degenerate chunk.
+        _safe_max = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic).to(tl.float32)
+
+        exp_logic = tl.exp(att_value - _safe_max).to(tl.float32)
+        logic_scale = tl.exp(max_logic - _safe_max).to(tl.float32)
 
         acc = (acc * logic_scale + tl.sum(exp_logic[:, None] * v, axis=0)).to(tl.float32)
         sum_exp = (sum_exp * logic_scale + tl.sum(exp_logic, axis=0)).to(tl.float32)
@@ -309,8 +320,14 @@ def _fwd_kernel_sparse_decode_stage1(
         off_mid_o_logexpsum = (
             cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh + seq_start_block
         )
-        tl.store(Mid_O + off_mid_o, acc / sum_exp)
-        tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum, max_logic + tl.log(sum_exp))
+        # A block whose slots are ALL padding yields sum_exp == 0; 0/0 = nan and log(0) =
+        # -inf. Emit a zero partial with logexpsum = -inf so stage2's merge discards it (its
+        # weight is exp(-inf - m) = 0). Unchanged whenever sum_exp > 0.
+        _empty = sum_exp == 0.0
+        _safe_sum = tl.where(_empty, 1.0, sum_exp)
+        tl.store(Mid_O + off_mid_o, acc / _safe_sum)
+        tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum,
+                 tl.where(_empty, float("-inf"), max_logic + tl.log(_safe_sum)))
 
 
 @triton.jit
@@ -349,14 +366,20 @@ def _fwd_kernel_sparse_decode_stage2(
 
         # fp32-pinned (same Inductor type-consistency reason as stage1); numerically identical.
         new_max_logic = tl.maximum(tlogic, max_logic).to(tl.float32)
-        old_scale = tl.exp(max_logic - new_max_logic).to(tl.float32)
-        exp_logic = tl.exp(tlogic - new_max_logic).to(tl.float32)
+        # Same empty guard as stage1: a partial from an all-padding block carries
+        # logexpsum = -inf, and merging it while the running max is still -inf would
+        # evaluate exp(-inf - -inf) = nan. Bit-identical whenever new_max_logic is finite.
+        _safe_max2 = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic).to(tl.float32)
+        old_scale = tl.exp(max_logic - _safe_max2).to(tl.float32)
+        exp_logic = tl.exp(tlogic - _safe_max2).to(tl.float32)
         acc = (acc * old_scale + exp_logic * tv).to(tl.float32)
         sum_exp = (sum_exp * old_scale + exp_logic).to(tl.float32)
         max_logic = new_max_logic
 
     off_o = cur_batch * stride_obs + cur_head * stride_oh + offs_d
-    tl.store(O + off_o, acc / sum_exp)
+    # Defensive: sum_exp == 0 only if EVERY slot for this (b,h) was padding, which cannot
+    # happen while sink > 0, but 0/0 would silently produce NaN logits if it ever did.
+    tl.store(O + off_o, acc / tl.where(sum_exp == 0.0, 1.0, sum_exp))
 
 
 def _sparse_decode_stage1_impl(
