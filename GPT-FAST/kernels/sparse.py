@@ -213,6 +213,73 @@ def _fwd_kernel_soft_hash_score(
     tl.store(Out + (b * H + h) * T + offs_t, out, mask=mask_t)
 
 
+# ---------------------------------------------------------------------------
+# GQA-GROUP BUCKET SHARING.
+#
+# key_buckets is stored PER-KV-HEAD ([B,Hkv,L,T]) but the kernel above runs PER-QUERY-HEAD
+# (grid axis 1 = H), so the rep = H // Hkv query heads of one GQA group each stream the SAME
+# bucket row: the scorer ISSUES rep times the unique bucket bytes. At L=50, T=143411 the
+# unique tensor is 109.4 MiB.
+#
+# This kernel puts ONE block on each (kv head, tile) and serves the whole group from it: the
+# bucket vector is loaded ONCE per l and reused by four explicitly-unrolled 1D
+# gathers/accumulators. No 2D broadcast, so the address arithmetic per gather is identical to
+# the per-query-head kernel; a [rep, BLOCK_T] 2D accumulator instead measured worse. Bucket
+# load instructions, and the L1/L2 read requests they generate, drop exactly 4-fold.
+#
+# BIT-IDENTICAL to the per-query-head kernel. The score is
+#     out[h,t] = (sum_l q_probs[h,l,bucket[kv(h),l,t]]) * ||v_t||
+# accumulated in fp32 in increasing l. Reordering the launch grid changes nothing, and sharing
+# one LOAD between several accumulators changes no arithmetic: every add still happens in the
+# same order with the same operands.
+#
+# rep == 4 for Llama-3.1-8B (H=32, Hkv=8). Other reps fall back to the per-query-head kernel,
+# which is also what the rep == 1 callers in test_socket_compile_equiv.py get.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fwd_kernel_soft_hash_score_gqa4(
+    QProbs,          # [B,H,L,R]        (bf16 / fp16 / fp32)
+    KeyBuckets,      # [B,Hkv,L,T]      int16
+    VNorm,           # [B,Hkv,T]        (bf16 / fp16 / fp32)
+    SeqLenPtr,       # int32 scalar on device
+    Out,             # [B,H,T]          fp32 (written)
+    H: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, R: tl.constexpr,
+    T: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    kv = tl.program_id(1)
+    b = tl.program_id(2)
+
+    offs_t = tile * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask_t = offs_t < T
+    seq_len = tl.load(SeqLenPtr).to(tl.int32)
+    keep = offs_t < seq_len
+
+    kb_base = (b * HKV + kv) * L * T
+    qp = QProbs + (b * H + kv * 4) * L * R
+    LR: tl.constexpr = L * R
+
+    a0 = tl.zeros([BLOCK_T], dtype=tl.float32)
+    a1 = tl.zeros([BLOCK_T], dtype=tl.float32)
+    a2 = tl.zeros([BLOCK_T], dtype=tl.float32)
+    a3 = tl.zeros([BLOCK_T], dtype=tl.float32)
+    for l in tl.static_range(L):
+        # ONE bucket load per l; the four gathers reuse it from registers.
+        bkt = tl.load(KeyBuckets + kb_base + l * T + offs_t, mask=mask_t, other=0).to(tl.int32)
+        off = l * R + bkt
+        a0 += tl.load(qp + off, mask=mask_t, other=0.0).to(tl.float32)
+        a1 += tl.load(qp + LR + off, mask=mask_t, other=0.0).to(tl.float32)
+        a2 += tl.load(qp + 2 * LR + off, mask=mask_t, other=0.0).to(tl.float32)
+        a3 += tl.load(qp + 3 * LR + off, mask=mask_t, other=0.0).to(tl.float32)
+
+    v = tl.load(VNorm + (b * HKV + kv) * T + offs_t, mask=mask_t, other=0.0).to(tl.float32)
+    ob = Out + (b * H + kv * 4) * T + offs_t
+    tl.store(ob, tl.where(keep, a0 * v, -float("inf")), mask=mask_t)
+    tl.store(ob + T, tl.where(keep, a1 * v, -float("inf")), mask=mask_t)
+    tl.store(ob + 2 * T, tl.where(keep, a2 * v, -float("inf")), mask=mask_t)
+    tl.store(ob + 3 * T, tl.where(keep, a3 * v, -float("inf")), mask=mask_t)
+
+
 # LAUNCH CONFIG: HARDCODED LITERALS, deliberately not env-readable. These become tl.constexpr
 # values inside a torch.library.triton_op body, which Dynamo evaluates at TRACE time; the
 # resulting kernel enters inductor's FX-graph cache key only as an INDEX into
@@ -230,11 +297,19 @@ def _fwd_kernel_soft_hash_score(
 #   L=50: (256,2) 180.3 us = 1.39x   [(1024,4) was 298.3 us = 0.84x, a REGRESSION]
 # 40 (BLOCK_T, num_warps) variants were checked and every one is bitwise-equal to the CUDA
 # scorer, so this is purely a performance choice.
+# The GQA-shared kernel keeps the same ~4 elements per thread per accumulator, so one block
+# covering rep query heads wants rep times the warps.
 _SCORER_BLOCK_T_SMALL_L, _SCORER_WARPS_SMALL_L = 128, 1
 _SCORER_BLOCK_T_LARGE_L, _SCORER_WARPS_LARGE_L = 256, 2
+_SCORER_GQA4_BLOCK_T_SMALL_L, _SCORER_GQA4_WARPS_SMALL_L = 128, 2
+_SCORER_GQA4_BLOCK_T_LARGE_L, _SCORER_GQA4_WARPS_LARGE_L = 256, 4
 
 
-def _scorer_launch_cfg(L: int):
+def _scorer_launch_cfg(L: int, gqa4: bool):
+    if gqa4:
+        if L <= 16:
+            return _SCORER_GQA4_BLOCK_T_SMALL_L, _SCORER_GQA4_WARPS_SMALL_L
+        return _SCORER_GQA4_BLOCK_T_LARGE_L, _SCORER_GQA4_WARPS_LARGE_L
     if L <= 16:
         return _SCORER_BLOCK_T_SMALL_L, _SCORER_WARPS_SMALL_L
     return _SCORER_BLOCK_T_LARGE_L, _SCORER_WARPS_LARGE_L
@@ -249,12 +324,20 @@ def _soft_hash_score_impl(
 ) -> None:
     B, H, L, R = q_probs.shape
     HKV, T = key_buckets.shape[1], key_buckets.shape[3]
-    BLOCK_T, warps = _scorer_launch_cfg(L)
-    wrap_triton(_fwd_kernel_soft_hash_score)[(triton.cdiv(T, BLOCK_T), H, B)](
-        q_probs, key_buckets, v_norm, seq_len_t, out,
-        H=H, HKV=HKV, L=L, R=R, T=T, BLOCK_T=BLOCK_T,
-        num_warps=warps, num_stages=2,
-    )
+    gqa4 = (H // HKV) == 4
+    BLOCK_T, warps = _scorer_launch_cfg(L, gqa4)
+    if gqa4:
+        wrap_triton(_fwd_kernel_soft_hash_score_gqa4)[(triton.cdiv(T, BLOCK_T), HKV, B)](
+            q_probs, key_buckets, v_norm, seq_len_t, out,
+            H=H, HKV=HKV, L=L, R=R, T=T, BLOCK_T=BLOCK_T,
+            num_warps=warps, num_stages=2,
+        )
+    else:
+        wrap_triton(_fwd_kernel_soft_hash_score)[(triton.cdiv(T, BLOCK_T), H, B)](
+            q_probs, key_buckets, v_norm, seq_len_t, out,
+            H=H, HKV=HKV, L=L, R=R, T=T, BLOCK_T=BLOCK_T,
+            num_warps=warps, num_stages=2,
+        )
 
 
 if _HAS_TRITON_OP:
