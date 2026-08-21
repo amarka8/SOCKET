@@ -286,6 +286,17 @@ class ModelArgs:
     window_size: int = 120
 
     def __post_init__(self):
+        # n_layer is env-overridable because transformer_configs hardcodes n_layer=1 for EVERY
+        # model, including llama-3.1-8b: the checkpoint's remaining 31 layers are simply not
+        # instantiated, and load_state_dict(strict=False) drops them silently. Without this
+        # override the real 32-layer model cannot be run from this tree at all, and the 1-layer
+        # microbench config cannot be run from the same tree as the full model -- the previous
+        # setup benchmarked a hand-edited COPY of GPT-FAST, which drifts from any kernel change.
+        # Absent SOCKET_N_LAYER the transformer_configs value is used unchanged, so no existing
+        # caller changes behaviour.
+        _nl_env = os.environ.get("SOCKET_N_LAYER")
+        if _nl_env is not None:
+            self.n_layer = int(_nl_env)
         # L and heavy_const are env-overridable so a single build can sweep configs (the
         # original repo hard-codes them; we expose SOCKET_L / SOCKET_HEAVY_CONST to match
         # the reference fork's sweep harness without changing any SOCKET math).
