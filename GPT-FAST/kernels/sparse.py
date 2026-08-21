@@ -29,6 +29,81 @@ def _get_soft_hash_ext():
 
 
 # ---------------------------------------------------------------------------
+# EXACT TOP-M BY 3-DIGIT RADIX THRESHOLD SELECT  (kernels/radix_select.cu)
+#
+# Replaces aten::topk on the [B,H,maxlen] score array, which was the single biggest kernel
+# group in the compiled decode step: 98.0 us/layer over 21 kernels at 140K P10/L10, against
+# ~5.8 us of unavoidable reads. The radix select streams the score array, materialises
+# nothing, and resolves the exact top-M threshold in 7 kernels / 4 streaming passes:
+# 47.6 us/layer.
+#
+# EXACTNESS. key(f) = (bits(f) & 0x80000000) ? ~bits(f) : (bits(f) | 0x80000000) is strictly
+# monotone over ALL floats, so the -inf written into unfilled cache columns sorts last exactly
+# as it does under topk. d = 0xFFFFFFFF - key is split MSB-first into 11/11/10 bits; digit 3
+# has UNIT resolution, so three digits resolve the threshold EXACTLY for any input
+# distribution -- no adaptive shifts, no data-dependent iteration count, no host sync, fixed
+# launch structure (hence CUDA-graph capturable). The selected SCORE MULTISET always equals
+# aten::topk's. The INDEX set need not: the threshold score is frequently tied (hundreds of
+# exact ties at the boundary here, because the hash planes are overwritten with
+# normal_(0,0.02) at load and selection degenerates to top-M by ||v||), and which tied token a
+# top-k implementation keeps is arbitrary in topk too.
+#
+# TUNING. Ordinary runtime arguments to an opaque custom_op, NOT tl.constexpr values, so
+# hardcoding them here is a maintenance choice rather than a cache-correctness requirement:
+#   NB   = 4 T-chunks per (b,h) -> B*H*4 = 128 blocks, about one per SM. Larger NB only adds
+#          private-histogram flush traffic (NB * B*H * 2048 * 4 bytes per level).
+#   THR  = 1024. Bytes in flight = blocks*THR*UNROLL*4; THR=256 runs the streaming passes at
+#          350 GB/s, THR=1024 at 3.2 TB/s. The single most important knob.
+#   STHR = 512 for the three tiny scan kernels (2048 bins / 512 threads = 4 bins per thread).
+#   HMODE= 1, a plain per-lane shared atomicAdd. Warp aggregation via __match_any_sync is
+#          2.7x SLOWER on the digit-2 histogram: MATCH.ANY.U32 is the expensive instruction and
+#          shared-atomic conflict replays are nearly free on Hopper.
+#   STAGES = 127, i.e. all seven real stages and not the read-only bandwidth probe (bit 128).
+#   DET  = 1. Makes the emit DETERMINISTIC: which tied-at-threshold tokens are kept, and the
+#          slot each selected index lands in, become pure functions of the grid. Costs one
+#          extra streaming pass -- 3.0% of throughput, 107.30 -> 104.09 tok/s at 140K P10/L10
+#          -- and buys eager == eager == compiled == compiled reproducibility, without which a
+#          "compiled == eager" regression gate cannot exist. Kept ON for that reason.
+# ---------------------------------------------------------------------------
+_RS_NB, _RS_THR, _RS_STHR, _RS_HMODE, _RS_STAGES, _RS_DET = 4, 1024, 512, 1, 127, 1
+
+_RADIX_EXT = None
+
+
+def _get_radix_ext():
+    global _RADIX_EXT
+    if _RADIX_EXT is None:
+        from kernels.radix_select_loader import load_radix_select
+        _RADIX_EXT = load_radix_select()
+    return _RADIX_EXT
+
+
+# The workspace is allocated with torch.empty INSIDE the op body. It needs no zero-init (every
+# block writes its whole private histogram slice, and the ctrl block is fully written by
+# rs_scan1) and it is dead the moment the op returns, so under cudagraph_trees it is an
+# ordinary pool intermediate. It is deliberately NOT a cached module-level tensor: a tensor
+# cached across calls is allocated inside the CUDA-graph pool on the recording call, and
+# reusing it on a later replay raises "accessing tensor output of CUDAGraphs that has been
+# overwritten by a subsequent run".
+@torch.library.custom_op("socket::radix_topm", mutates_args=())
+def _radix_topm(scores: torch.Tensor, M: int) -> torch.Tensor:
+    ext = _get_radix_ext()
+    B, H, _ = scores.shape
+    out = torch.empty((B, H, M), device=scores.device, dtype=torch.int32)
+    ws = torch.empty(int(ext.workspace_ints(_RS_NB, B * H)),
+                     device=scores.device, dtype=torch.int32)
+    ext.radix_select(scores, out, ws, M, _RS_NB, _RS_THR, _RS_STHR, _RS_STAGES,
+                     _RS_HMODE, _RS_DET)
+    return out
+
+
+@_radix_topm.register_fake
+def _radix_topm_fake(scores: torch.Tensor, M: int) -> torch.Tensor:
+    B, H, _ = scores.shape
+    return scores.new_empty((B, H, M), dtype=torch.int32)
+
+
+# ---------------------------------------------------------------------------
 # torch.compile registration for the custom CUDA scorer.
 #
 # ext.soft_hash_collision is a *pybind11* C++ function (PYBIND11_MODULE in
@@ -359,8 +434,9 @@ def build_sparse_list_decode(
         soft_hash_score_op(q_probs.contiguous(), key_buckets.contiguous(),
                            v_norm_bht.contiguous(), seq_len_t.reshape(()), scores)
 
-        top = torch.topk(scores, k=M_eff, dim=-1, largest=True)
-        heavy_idx = top.indices.to(torch.int32)
+        # Exact 3-digit radix threshold select: 7 kernels / 4 streaming passes instead of
+        # aten::topk's 21 kernels. See the module-level comment for the exactness argument.
+        heavy_idx = torch.ops.socket.radix_topm(scores, M_eff)
     else:
         heavy_idx = torch.empty((B, H, 0), device=device, dtype=torch.int32)
 
