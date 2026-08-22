@@ -69,21 +69,24 @@ def _get_soft_hash_ext():
 # which has already produced a wrong measurement in this project.  (This path never calls
 # torch.compile, but the discipline costs nothing and keeps the two stacks consistent.)
 #
-#   SOCKET_SCORER = cuda | triton
-#       cuda   (default) ext.soft_hash_collision, the load_inline CUDA scorer.  Needs
-#              PER-QUERY-HEAD buckets [B,H,L,T].
-#       triton GPT-FAST Triton scorer with GQA-group bucket sharing.  Needs PER-KV-HEAD
-#              buckets [B,Hkv,L,T]; the prefill stores that layout instead.
+#   SOCKET_SCORER = triton | cuda
+#       triton (DEFAULT) GPT-FAST Triton scorer with GQA-group bucket sharing.  Needs
+#              PER-KV-HEAD buckets [B,Hkv,L,T]; the prefill stores that layout instead.
+#       cuda   ext.soft_hash_collision, the load_inline CUDA scorer.  Needs PER-QUERY-HEAD
+#              buckets [B,H,L,T].
 #
-#   SOCKET_SELECT = topk | radix
-#       topk   (default) torch.topk
-#       radix  GPT-FAST exact 3-digit radix threshold select (radix_select.cu)
+#   SOCKET_SELECT = radix | topk
+#       radix  (DEFAULT) GPT-FAST exact 3-digit radix threshold select (radix_select.cu)
+#       topk   torch.topk
 #
-#   SOCKET_LIST = torch | triton
-#       torch  (default) the arange/cat/gather op chain already in this file
-#       triton GPT-FAST one-kernel list assembly (socket::build_list)
+#   SOCKET_LIST = triton | torch
+#       triton (DEFAULT) GPT-FAST one-kernel list assembly (socket::build_list)
+#       torch  the arange/cat/gather op chain already in this file
 #
 #   SOCKET_DEDUP = 0 | 1
+#       Left at 0 DELIBERATELY: unlike the three switches above it changes WHICH tokens are
+#       attended, not which kernel computes them, so flipping it would move the accuracy
+#       numbers rather than the throughput ones.
 #       1 masks a heavy index that ALSO lies in sink or window to -1.  Without it the
 #       cat([base, heavy]) list feeds such a token to the online softmax TWICE (the reference
 #       masker unions dense masks with torch.maximum and cannot double-count).  Only
@@ -92,9 +95,14 @@ def _get_soft_hash_ext():
 #   SOCKET_TARGET_SPARSITY = R    total kept = round(T_k / R), i.e. M = round(T_k/R)-sink-window
 #   SOCKET_GATE = 1               run the in-forward equivalence gates (see socket_gate.py)
 # =============================================================================
-_ARM_SCORER = os.environ.get("SOCKET_SCORER", "cuda").strip().lower()
-_ARM_SELECT = os.environ.get("SOCKET_SELECT", "topk").strip().lower()
-_ARM_LIST = os.environ.get("SOCKET_LIST", "torch").strip().lower()
+# DEFAULTS ARE THE GPT-FAST KERNELS.  The throughput SOCKET is quoted at for long context was
+# measured with the Triton scorer + radix select + Triton list assembly, so those are what this
+# path runs too -- otherwise the HF eval and the GPT-FAST timing describe different code.  The
+# older in-file implementations stay reachable (SOCKET_SCORER=cuda, SOCKET_SELECT=topk,
+# SOCKET_LIST=torch) for A/B against the numbers published before this change.
+_ARM_SCORER = os.environ.get("SOCKET_SCORER", "triton").strip().lower()
+_ARM_SELECT = os.environ.get("SOCKET_SELECT", "radix").strip().lower()
+_ARM_LIST = os.environ.get("SOCKET_LIST", "triton").strip().lower()
 _ARM_DEDUP = os.environ.get("SOCKET_DEDUP", "0").strip() == "1"
 _ARM_GATE = os.environ.get("SOCKET_GATE", "0").strip() == "1"
 _GATE_LAYERS = tuple(int(x) for x in os.environ.get("SOCKET_GATE_LAYERS", "0,15").split(",") if x != "")
@@ -136,6 +144,28 @@ def _port():
     return _PORT
 
 
+def _gate_module():
+    """socket_gate.py, the equivalence-gate helpers used only under SOCKET_GATE=1.
+
+    It is NOT part of this checkout -- the gates were run out of a scratch worktree and the
+    module was never committed.  Raise something that says so, rather than letting a bare
+    "No module named socket_gate" suggest a path problem.
+    """
+    try:
+        from . import socket_gate as G
+    except ImportError:
+        try:
+            import socket_gate as G  # running the file outside the package context
+        except ImportError as exc:
+            raise ImportError(
+                "SOCKET_GATE=1 needs socket_gate.py next to this file, which is not in this "
+                "checkout. The gates are a development aid; the kernel arms themselves "
+                "(SOCKET_SCORER/SOCKET_SELECT/SOCKET_LIST) do not need it. Unset SOCKET_GATE "
+                "to run without them."
+            ) from exc
+    return G
+
+
 @torch.no_grad()
 def build_sparse_list_decode(
     q_probs: torch.Tensor,          # [B,H,L,R]   fp16/bf16/fp32   PER-QUERY-HEAD
@@ -157,10 +187,11 @@ def build_sparse_list_decode(
     `v_mag` were built from `repeat_kv(k)` / `repeat_kv(v)`, so they carry H = 32 QUERY-head
     rows in which the rep = H//Hkv rows of a GQA group are byte-identical copies.  GPT-FAST
     stores the unique Hkv = 8 rows and recovers the query head's row in-kernel as h // rep.
-    The two are the same data; only the leading dimension differs.  See `_bucket_layout_slice`
-    for where the [B,H,...] -> [B,Hkv,...] slice happens and why `[:, ::rep]` is the right
-    slice (repeat_kv maps out-head h -> in-head h // rep, so heads 0, rep, 2*rep, ... ARE
-    kv heads 0, 1, 2, ...).
+    The two are the same data; only the leading dimension differs.  The [B,H,...] ->
+    [B,Hkv,...] slice is taken once at PREFILL (see the BUCKET / ||v|| LAYOUT comment in
+    forward, guarded by `_BUCKET_LAYOUT == "kv"`), and `[:, ::rep]` is the right slice because
+    repeat_kv maps out-head h -> in-head h // rep, so heads 0, rep, 2*rep, ... ARE kv heads
+    0, 1, 2, ...
     """
     assert q_probs.is_cuda and k_hard_bhlt.is_cuda and v_norm_bht.is_cuda and allowed_bht.is_cuda
     assert allowed_bht.dtype == torch.bool
@@ -783,10 +814,7 @@ class LlamaAttention(nn.Module):
     def _run_gate(self, kb_q, vn_q, q_probs, allowed_bht, seq_len_t, planes, protosT,
                   rep, M, sink, window, T_k):
         """Run the equivalence gates on THIS step's real tensors. See socket_gate.py."""
-        try:
-            from . import socket_gate as G
-        except ImportError:
-            import socket_gate as G
+        G = _gate_module()
         port = _port()
         tag = f"L{self.layer_idx}/s{self._gate_steps}"
 
@@ -1106,10 +1134,7 @@ class LlamaAttention(nn.Module):
             # G4: the guards from 9dc668b are on THIS kernel (repo-root
             # kernels/socket_triton_kernels.py). Confirm no NaN/inf escaped and that -1
             # padding slots were tolerated rather than turned into an OOB gather.
-            try:
-                from . import socket_gate as G
-            except ImportError:
-                import socket_gate as G
+            G = _gate_module()
             G.gate_finite(f"L{self.layer_idx}/s{getattr(self, '_gate_steps', 0)}",
                           out_bhd, sparse_list)
         out = out_bhd.unsqueeze(2).transpose(1, 2).contiguous().reshape(B, 1, -1)
