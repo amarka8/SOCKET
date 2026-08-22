@@ -59,74 +59,205 @@ def _get_soft_hash_ext():
         _SOFT_HASH_EXT = load_soft_hash_collision(3)
     return _SOFT_HASH_EXT
 
+
+# =============================================================================
+# ARM SWITCHES for the GPT-FAST kernel port.
+#
+# Each knob is read ONCE, HERE, into a plain Python constant.  Nothing downstream reads the
+# environment, and in particular no tl.constexpr is ever fed from an env read inside a traced
+# region -- such a value is baked at trace time and is NOT part of inductor's FX cache key,
+# which has already produced a wrong measurement in this project.  (This path never calls
+# torch.compile, but the discipline costs nothing and keeps the two stacks consistent.)
+#
+#   SOCKET_SCORER = cuda | triton
+#       cuda   (default) ext.soft_hash_collision, the load_inline CUDA scorer.  Needs
+#              PER-QUERY-HEAD buckets [B,H,L,T].
+#       triton GPT-FAST Triton scorer with GQA-group bucket sharing.  Needs PER-KV-HEAD
+#              buckets [B,Hkv,L,T]; the prefill stores that layout instead.
+#
+#   SOCKET_SELECT = topk | radix
+#       topk   (default) torch.topk
+#       radix  GPT-FAST exact 3-digit radix threshold select (radix_select.cu)
+#
+#   SOCKET_LIST = torch | triton
+#       torch  (default) the arange/cat/gather op chain already in this file
+#       triton GPT-FAST one-kernel list assembly (socket::build_list)
+#
+#   SOCKET_DEDUP = 0 | 1
+#       1 masks a heavy index that ALSO lies in sink or window to -1.  Without it the
+#       cat([base, heavy]) list feeds such a token to the online softmax TWICE (the reference
+#       masker unions dense masks with torch.maximum and cannot double-count).  Only
+#       evaluable since 9dc668b added the empty-chunk NaN guard.
+#
+#   SOCKET_TARGET_SPARSITY = R    total kept = round(T_k / R), i.e. M = round(T_k/R)-sink-window
+#   SOCKET_GATE = 1               run the in-forward equivalence gates (see socket_gate.py)
+# =============================================================================
+_ARM_SCORER = os.environ.get("SOCKET_SCORER", "cuda").strip().lower()
+_ARM_SELECT = os.environ.get("SOCKET_SELECT", "topk").strip().lower()
+_ARM_LIST = os.environ.get("SOCKET_LIST", "torch").strip().lower()
+_ARM_DEDUP = os.environ.get("SOCKET_DEDUP", "0").strip() == "1"
+_ARM_GATE = os.environ.get("SOCKET_GATE", "0").strip() == "1"
+_GATE_LAYERS = tuple(int(x) for x in os.environ.get("SOCKET_GATE_LAYERS", "0,15").split(",") if x != "")
+_GATE_STEPS = int(os.environ.get("SOCKET_GATE_STEPS", "3"))
+_CAPTURE_DIR = os.environ.get("SOCKET_CAPTURE_DIR", "")
+_TARGET_SPARSITY = float(os.environ["SOCKET_TARGET_SPARSITY"]) \
+    if os.environ.get("SOCKET_TARGET_SPARSITY") else None
+
+assert _ARM_SCORER in ("cuda", "triton"), f"SOCKET_SCORER={_ARM_SCORER}"
+assert _ARM_SELECT in ("topk", "radix"), f"SOCKET_SELECT={_ARM_SELECT}"
+assert _ARM_LIST in ("torch", "triton"), f"SOCKET_LIST={_ARM_LIST}"
+
+# Buckets and ||v|| are stored PER-KV-HEAD only when the Triton scorer needs that layout.
+# Keeping the two in lockstep is what makes the "cuda" arm bit-for-bit the arm that produced
+# the default path: it sees the exact tensors it always saw.
+_BUCKET_LAYOUT = "kv" if _ARM_SCORER == "triton" else "q"
+# The gate needs BOTH layouts at once, so it forces the per-query-head store and derives the
+# per-kv-head view from it (which also proves the group rows really are identical).
+if _ARM_GATE:
+    _BUCKET_LAYOUT = "q"
+
+_PORT = None
+
+
+def _port():
+    """GPT-FAST kernels, loaded by EXPLICIT FILE PATH.
+
+    `GPT-FAST/kernels` and the repo-root `kernels` collide on the top-level name `kernels`;
+    importing by package name gets whichever won sys.path and killed an earlier attempt at
+    this port.  socket_port does the spec_from_file_location dance.
+    """
+    global _PORT
+    if _PORT is None:
+        try:
+            from . import socket_port as _p
+        except ImportError:
+            import socket_port as _p  # running the file outside the package context
+        _PORT = _p
+    return _PORT
+
+
 @torch.no_grad()
 def build_sparse_list_decode(
-    q_probs: torch.Tensor,         # [B,H,L,R] fp16/bf16/fp32
-    k_hard_bhlt: torch.Tensor,      # [B,H,L,T] int16/int32
-    v_norm_bht: torch.Tensor,       # [B,H,T] fp16/bf16/fp32
-    allowed_bht: torch.Tensor,      # [B,H,T] bool
+    q_probs: torch.Tensor,          # [B,H,L,R]   fp16/bf16/fp32   PER-QUERY-HEAD
+    k_hard_bhlt: torch.Tensor,      # [B,Hb,L,T]  int16/int32      Hb == H (cuda) or Hkv (triton)
+    v_norm_bht: torch.Tensor,       # [B,Hb,T]    fp16/bf16/fp32   same Hb as k_hard_bhlt
+    allowed_bht: torch.Tensor,      # [B,H,T]     bool             PER-QUERY-HEAD
     sink: int,
     window: int,
     M: int,
+    seq_len_t: torch.Tensor = None,  # int32 scalar on device; defaults to T
     KC: int = 8,
     BLOCK_N: int = 512,
     num_warps: int = 8,
     num_stages: int = 2,
 ):
+    """Returns (sparse_list [B,H,W] int32, sparse_len [B,H] int32, scores [B,H,T] fp32|None).
+
+    LAYOUT CONTRACT -- the main hazard in this port.  In this HF path `key_buckets` and
+    `v_mag` were built from `repeat_kv(k)` / `repeat_kv(v)`, so they carry H = 32 QUERY-head
+    rows in which the rep = H//Hkv rows of a GQA group are byte-identical copies.  GPT-FAST
+    stores the unique Hkv = 8 rows and recovers the query head's row in-kernel as h // rep.
+    The two are the same data; only the leading dimension differs.  See `_bucket_layout_slice`
+    for where the [B,H,...] -> [B,Hkv,...] slice happens and why `[:, ::rep]` is the right
+    slice (repeat_kv maps out-head h -> in-head h // rep, so heads 0, rep, 2*rep, ... ARE
+    kv heads 0, 1, 2, ...).
+    """
     assert q_probs.is_cuda and k_hard_bhlt.is_cuda and v_norm_bht.is_cuda and allowed_bht.is_cuda
     assert allowed_bht.dtype == torch.bool
 
     B, H, L, R = q_probs.shape
-    _, _, L2, T = k_hard_bhlt.shape
-    assert L2 == L
+    Bk, Hb, L2, T = k_hard_bhlt.shape
+    assert L2 == L and Bk == B
+    assert v_norm_bht.shape == (B, Hb, T), \
+        f"v_norm {tuple(v_norm_bht.shape)} must match key_buckets head dim Hb={Hb}"
 
     device = q_probs.device
+    if seq_len_t is None:
+        seq_len_t = torch.tensor(T, device=device, dtype=torch.int32)
+    else:
+        seq_len_t = seq_len_t.to(device=device, dtype=torch.int32).reshape(())
+
     M_eff = min(M, T)
+    scores = None
     if M_eff > 0:
-        ext = _get_soft_hash_ext()
-        q_probs_f32 = q_probs.float().unsqueeze(2).contiguous()  # [B,H,1,L,R]
-        key_buckets = k_hard_bhlt
-        if key_buckets.dtype != torch.int16:
-            key_buckets = key_buckets.to(torch.int16)
-        key_buckets = key_buckets.contiguous()
-        allowed_ext = allowed_bht.unsqueeze(2).contiguous()       # [B,H,1,T]
-        v_hist = v_norm_bht.float().unsqueeze(2).contiguous()     # [B,H,1,T]
+        # ---------------- SCORER ----------------
+        if _ARM_SCORER == "triton":
+            assert H % Hb == 0, f"H={H} not a multiple of the stored head dim Hb={Hb}"
+            key_buckets = k_hard_bhlt
+            if key_buckets.dtype != torch.int16:
+                key_buckets = key_buckets.to(torch.int16)
+            scores = torch.empty((B, H, T), device=device, dtype=torch.float32)
+            _port().soft_hash_score_rt(
+                q_probs.contiguous(), key_buckets.contiguous(),
+                v_norm_bht.contiguous(), seq_len_t, scores,
+            )
+        else:
+            assert Hb == H, "the CUDA scorer needs per-query-head buckets [B,H,L,T]"
+            ext = _get_soft_hash_ext()
+            q_probs_f32 = q_probs.float().unsqueeze(2).contiguous()  # [B,H,1,L,R]
+            key_buckets = k_hard_bhlt
+            if key_buckets.dtype != torch.int16:
+                key_buckets = key_buckets.to(torch.int16)
+            key_buckets = key_buckets.contiguous()
+            allowed_ext = allowed_bht.unsqueeze(2).contiguous()       # [B,H,1,T]
+            v_hist = v_norm_bht.float().unsqueeze(2).contiguous()     # [B,H,1,T]
+            scores = ext.soft_hash_collision(
+                q_probs_f32, key_buckets, allowed_ext, v_hist,
+            ).squeeze(2)  # [B,H,T]
 
-        scores = ext.soft_hash_collision(
-            q_probs_f32,
-            key_buckets,
-            allowed_ext,
-            v_hist,
-        ).squeeze(2)  # [B,H,T]
-
-        top = torch.topk(scores, k=M_eff, dim=-1, largest=True)
-        heavy_idx = top.indices.to(torch.int32)
+        # ---------------- SELECT ----------------
+        if _ARM_SELECT == "radix":
+            heavy_idx = _port().radix_topm(scores, M_eff)          # [B,H,M] int32
+        else:
+            heavy_idx = torch.topk(scores, k=M_eff, dim=-1, largest=True).indices.to(torch.int32)
     else:
         heavy_idx = torch.empty((B, H, 0), device=device, dtype=torch.int32)
 
     sink = max(0, min(sink, T))
     window = max(0, min(window, T))
 
-    parts = []
-    if sink > 0:
-        parts.append(torch.arange(sink, device=device, dtype=torch.int32))
-    if window > 0:
-        win_start = max(T - window, sink)
-        if win_start < T:
-            parts.append(torch.arange(win_start, T, device=device, dtype=torch.int32))
-
-    if len(parts) == 0:
-        base = torch.tensor([T - 1], device=device, dtype=torch.int32)
+    # ---------------- LIST ASSEMBLY ----------------
+    if _ARM_LIST == "triton":
+        s2, w2 = (sink, window) if (sink or window) else (0, 1)
+        W = s2 + w2 + M_eff
+        sparse_list = torch.empty((B, H, W), device=device, dtype=torch.int32)
+        heavy_in = heavy_idx if M_eff > 0 else torch.full((B, H, 1), -1, device=device,
+                                                          dtype=torch.int32)
+        _port().build_list_rt(heavy_in.contiguous(), seq_len_t, sparse_list,
+                              s2, w2, T, _ARM_DEDUP)
     else:
-        base = torch.cat(parts, dim=0)
+        parts = []
+        if sink > 0:
+            parts.append(torch.arange(sink, device=device, dtype=torch.int32))
+        if window > 0:
+            win_start = max(T - window, sink)
+            if win_start < T:
+                parts.append(torch.arange(win_start, T, device=device, dtype=torch.int32))
 
-    base = base.view(1, 1, -1).expand(B, H, -1)
-    base_ok = torch.gather(allowed_bht, dim=-1, index=base.to(torch.long))
-    base = base.masked_fill(~base_ok, -1)
+        if len(parts) == 0:
+            base = torch.tensor([T - 1], device=device, dtype=torch.int32)
+        else:
+            base = torch.cat(parts, dim=0)
 
-    sparse_list = torch.cat([base, heavy_idx], dim=-1).contiguous()
+        base = base.view(1, 1, -1).expand(B, H, -1)
+        base_ok = torch.gather(allowed_bht, dim=-1, index=base.to(torch.long))
+        base = base.masked_fill(~base_ok, -1)
+
+        if _ARM_DEDUP and heavy_idx.numel() > 0:
+            # DEDUP. The reference masker unions the sink/window and heavy masks with
+            # torch.maximum, so a token in BOTH is attended ONCE. Concatenating the two index
+            # lists instead lets the online softmax count such a token TWICE. Masking the
+            # offending heavy slots to -1 restores reference semantics; the attention kernel
+            # skips -1 slots (guarded in 9dc668b).
+            win_start = max(T - window, sink) if window > 0 else T
+            in_sink = (heavy_idx >= 0) & (heavy_idx < sink)
+            in_win = (heavy_idx >= win_start) & (heavy_idx < T)
+            heavy_idx = heavy_idx.masked_fill(in_sink | in_win, -1)
+
+        sparse_list = torch.cat([base, heavy_idx], dim=-1).contiguous()
+
     sparse_len = torch.full((B, H), sparse_list.shape[-1], device=device, dtype=torch.int32)
-    return sparse_list, sparse_len
+    return sparse_list, sparse_len, scores
 
 def _torch_version_gte(target: str) -> bool:
     try:
@@ -648,6 +779,60 @@ class LlamaAttention(nn.Module):
             return int(size * N)
         return int(size)
 
+    @torch.no_grad()
+    def _run_gate(self, kb_q, vn_q, q_probs, allowed_bht, seq_len_t, planes, protosT,
+                  rep, M, sink, window, T_k):
+        """Run the equivalence gates on THIS step's real tensors. See socket_gate.py."""
+        try:
+            from . import socket_gate as G
+        except ImportError:
+            import socket_gate as G
+        port = _port()
+        tag = f"L{self.layer_idx}/s{self._gate_steps}"
+
+        # PER-KV-HEAD view of the per-query-head store, plus the check that the rep rows of a
+        # GQA group are byte-identical -- the assumption `[:, ::rep]` rests on. If a silent
+        # transpose ever crept in, this is where it dies.
+        kb_kv = kb_q[:, ::rep].contiguous()
+        vn_kv = vn_q[:, ::rep].contiguous()
+        if not torch.equal(kb_q, kb_kv.repeat_interleave(rep, dim=1)):
+            raise AssertionError(f"{tag}: GQA group bucket rows are NOT identical -- the "
+                                 f"[:, ::rep] per-kv-head slice would be WRONG")
+        if not torch.equal(vn_q, vn_kv.repeat_interleave(rep, dim=1)):
+            raise AssertionError(f"{tag}: GQA group ||v|| rows are NOT identical")
+
+        G.gate_liveness(tag, planes, protosT, q_probs)
+        scores_tri, scores_cuda = G.gate_scorer(tag, q_probs, kb_kv, vn_kv, kb_q, vn_q,
+                                                allowed_bht, seq_len_t, port)
+        M_eff = min(M, T_k)
+        if M_eff > 0:
+            G.gate_select(tag, scores_cuda, M_eff, port)
+            G.gate_head_overlap(tag, scores_cuda, rep, k=256)
+            # List assembly: the Triton one-kernel build vs this file's torch op chain, with
+            # dedup ON in both (the torch chain cannot express the -1 masking otherwise).
+            heavy = torch.topk(scores_cuda, k=M_eff, dim=-1).indices.to(torch.int32)
+            B, H = heavy.shape[0], heavy.shape[1]
+            W = sink + window + M_eff
+            lst_tri = torch.empty((B, H, W), device=heavy.device, dtype=torch.int32)
+            port.build_list_rt(heavy.contiguous(), seq_len_t, lst_tri, sink, window, T_k, True)
+            base = torch.cat([
+                torch.arange(sink, device=heavy.device, dtype=torch.int32),
+                torch.arange(max(T_k - window, sink), T_k, device=heavy.device, dtype=torch.int32),
+            ]).view(1, 1, -1).expand(B, H, -1)
+            base = base.masked_fill(~torch.gather(allowed_bht, -1, base.long()), -1)
+            ws = max(T_k - window, sink)
+            hv = heavy.masked_fill(((heavy >= 0) & (heavy < sink)) |
+                                   ((heavy >= ws) & (heavy < T_k)), -1)
+            G.gate_list(tag, lst_tri, torch.cat([base, hv], dim=-1).contiguous())
+        if _CAPTURE_DIR:
+            G.dump_capture(
+                os.path.join(_CAPTURE_DIR, f"cap_l{self.layer_idx}_s{self._gate_steps}.pt"),
+                q_probs=q_probs, kb_kv=kb_kv, vn_kv=vn_kv, allowed=allowed_bht[:, :1],
+                seq_len=int(seq_len_t.item()), M=int(M_eff), sink=sink, window=window,
+                rep=rep, T_k=int(T_k), layer=int(self.layer_idx),
+                planes=planes, protos_T=protosT,
+            )
+
 
     def _get_states_container(
         self,
@@ -751,14 +936,28 @@ class LlamaAttention(nn.Module):
             v_mag = torch.empty((B, H, max_seq), device=device, dtype=torch.float16)
             v_mag[..., :T_k] = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_mag.dtype)
 
+            # BUCKET / ||v|| LAYOUT.  Both tensors above were built from repeat_kv'd K and V,
+            # so their H = 32 rows are rep = H//Hkv byte-identical copies of Hkv = 8 unique
+            # rows: repeat_kv maps out-head h -> in-head h//rep, which makes rows
+            # 0, rep, 2*rep, ... exactly kv heads 0, 1, 2, ...  `[:, ::rep]` therefore takes
+            # the unique rows, which is the [B,Hkv,L,T] / [B,Hkv,T] layout the GPT-FAST
+            # scorer indexes as h//rep in-kernel.  The slice is taken from the SAME tensor
+            # the CUDA arm consumes, so no arithmetic differs between the arms -- only how
+            # many redundant copies of it are stored and streamed.
+            rep = int(self.num_key_value_groups)
+            if _BUCKET_LAYOUT == "kv" and rep > 1:
+                key_buckets = key_buckets[:, ::rep].contiguous()      # [B,Hkv,L,T_k]
+                v_mag = v_mag[:, ::rep].contiguous()                  # [B,Hkv,max_seq]
+
             states[self.layer_idx] = {
                 "P": P, "L": L, "R": R,
                 "planes": planes,                 # cache planes for deterministic reuse
-                "key_buckets": key_buckets,       # [B,H,L,T_cached]
-                "v_mag": v_mag,                   # [B,H,max_seq]
+                "key_buckets": key_buckets,       # [B,Hb,L,T_cached]  Hb = H or Hkv
+                "v_mag": v_mag,                   # [B,Hb,max_seq]
                 "max_seq": max_seq,
                 "device": device,
-                "B": B, "H": H,
+                "B": B, "H": H, "rep": rep,
+                "layout": _BUCKET_LAYOUT,
             }
             return out, None, {"bucket_sparse": False}
 
@@ -772,9 +971,11 @@ class LlamaAttention(nn.Module):
         L = int(st["L"])
         R = int(st["R"])
         planes = st["planes"]
-        key_buckets = st["key_buckets"]   # [B,H,L,T_cached]
-        v_mag = st["v_mag"]
+        key_buckets = st["key_buckets"]   # [B,Hb,L,T_cached]  Hb = H (cuda arm) or Hkv (triton)
+        v_mag = st["v_mag"]               # [B,Hb,max_seq]
         max_seq = int(st["max_seq"])
+        rep = int(st.get("rep", self.num_key_value_groups))
+        layout = st.get("layout", "q")
 
         # ---- keep cached key_buckets in sync by appending ONLY the new token ----
         # cached length might already match (depending on how HF calls forward)
@@ -783,22 +984,34 @@ class LlamaAttention(nn.Module):
             # hash only the new keys at the end (assumes monotonic decode)
             k_new = k_full[:, :, T_cached:T_k, :]  # [B,H,delta,D] (usually delta=1)
             bkt_new = self.hard_hash(k_new, planes).to(torch.int16)  # [B,H,L,delta]
+            if layout == "kv" and rep > 1:
+                # same [:, ::rep] slice as at prefill: keep the append in the stored layout
+                bkt_new = bkt_new[:, ::rep]
             key_buckets = torch.cat([key_buckets, bkt_new], dim=-1)
             st["key_buckets"] = key_buckets
 
         # ---- update v norm cache for the new token(s) ----
+        # Computed from v_full exactly as before (identical arithmetic in both arms), then
+        # sliced to the stored layout.
         if T_k <= max_seq:
-            v_mag[..., :T_k] = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_mag.dtype)
+            _vn_full = torch.linalg.vector_norm(v_full.float(), ord=2, dim=-1).to(v_mag.dtype)
+            v_mag[..., :T_k] = _vn_full[:, ::rep] if (layout == "kv" and rep > 1) else _vn_full
 
         # ---------------------------
         # external allowed mask -> allowed_bht
         # ---------------------------
+        # seq_len_t is the SAME predicate expressed as a device scalar: `allowed` is exactly
+        # `arange(T_k) <= pos.max()`, i.e. `t < pos.max()+1`.  The Triton scorer and the
+        # Triton list builder take the scalar; the CUDA scorer and the torch op chain take the
+        # materialized bool.  Kept on-device so nothing here forces a host sync.
         if attention_mask is not None:
             pos = cache_position.view(-1)
             allowed = torch.arange(T_k, device=pos.device) <= pos.max()
             allowed_bht = allowed.view(1, 1, T_k).expand(B, H, T_k).contiguous()
+            seq_len_t = (pos.max() + 1).to(torch.int32)
         else:
             allowed_bht = torch.ones((B, H, T_k), device=device, dtype=torch.bool)
+            seq_len_t = torch.tensor(T_k, device=device, dtype=torch.int32)
 
         # ---------------------------
         # budget + sparse list
@@ -806,7 +1019,15 @@ class LlamaAttention(nn.Module):
         sink = int(getattr(self.config, "sink_size", 20))
         window = int(getattr(self.config, "window_size", 20))
         M_cfg = getattr(self.config, "heavy_const", getattr(self.config, "heavy_size", 0.1))
-        M = self._effective_size(M_cfg, T_k)
+        # SOCKET_TARGET_SPARSITY=R makes the TOTAL kept budget exactly round(T_k/R), i.e.
+        # M = round(T_k/R) - sink - window, matching the convention every decode benchmark in
+        # this project uses. Without it, heavy_const is a FRACTION of T_k and sink+window are
+        # added ON TOP, so the realized sparsity is denser than the nominal number and drifts
+        # with T_k. Read once at import into _TARGET_SPARSITY.
+        if _TARGET_SPARSITY:
+            M = max(0, int(round(T_k / _TARGET_SPARSITY)) - sink - window)
+        else:
+            M = self._effective_size(M_cfg, T_k)
         M = max(0, min(int(M), T_k))
 
         protosT = self.get_protos_T(
@@ -824,7 +1045,18 @@ class LlamaAttention(nn.Module):
 
         k_hard_bhlt = key_buckets[..., :T_k].contiguous()
 
-        sparse_list, sparse_len = build_sparse_list_decode(
+        # ---------------- in-forward equivalence gates (SOCKET_GATE=1) ----------------
+        # Runs on the REAL tensors of this step. Forces the per-query-head bucket store (see
+        # _BUCKET_LAYOUT) so both layouts exist at once, and derives the per-kv-head view here
+        # -- which also checks, on real data, that the rep rows of a GQA group really are
+        # byte-identical (the assumption the whole [:, ::rep] slice rests on).
+        if _ARM_GATE and self.layer_idx in _GATE_LAYERS and \
+                getattr(self, "_gate_steps", 0) < _GATE_STEPS:
+            self._gate_steps = getattr(self, "_gate_steps", 0) + 1
+            self._run_gate(k_hard_bhlt, v_norm_bht, q_probs, allowed_bht, seq_len_t,
+                           planes, protosT, rep, M, sink, window, T_k)
+
+        sparse_list, sparse_len, _scores = build_sparse_list_decode(
             q_probs,
             k_hard_bhlt,
             v_norm_bht,
@@ -832,6 +1064,7 @@ class LlamaAttention(nn.Module):
             sink=sink,
             window=window,
             M=M,
+            seq_len_t=seq_len_t,
             KC=8,
             BLOCK_N=512,
             num_warps=8,
@@ -848,10 +1081,15 @@ class LlamaAttention(nn.Module):
         if os.environ.get("SOCKET_SMOKE_LOG") and self.layer_idx == 0 and not getattr(self, "_smoke_logged", False):
             self._smoke_logged = True
             kept = int(sparse_len[0, 0].item())
+            # `kept` counts LIST SLOTS. With dedup on, some are -1 and are skipped by the
+            # attention kernel, so the true kept-token count is <= kept: report both.
+            live = int((sparse_list[0, 0] >= 0).sum().item())
             print(
-                f"[SOCKET-SMOKE] layer0 decode SPARSE: T_k={T_k} kept={kept} "
+                f"[SOCKET-SMOKE] layer0 decode SPARSE: T_k={T_k} kept={kept} live={live} "
                 f"sink={sink} window={window} M={M} "
-                f"frac_kept={kept / max(T_k, 1):.4f}",
+                f"frac_kept={kept / max(T_k, 1):.4f} frac_live={live / max(T_k, 1):.4f} "
+                f"ARM scorer={_ARM_SCORER} select={_ARM_SELECT} list={_ARM_LIST} "
+                f"dedup={int(_ARM_DEDUP)} layout={layout} rep={rep}",
                 flush=True,
             )
 
@@ -864,6 +1102,16 @@ class LlamaAttention(nn.Module):
             sparse_len,
             block_seq=256,
         )
+        if _ARM_GATE and self.layer_idx in _GATE_LAYERS and getattr(self, "_gate_steps", 0) <= _GATE_STEPS:
+            # G4: the guards from 9dc668b are on THIS kernel (repo-root
+            # kernels/socket_triton_kernels.py). Confirm no NaN/inf escaped and that -1
+            # padding slots were tolerated rather than turned into an OOB gather.
+            try:
+                from . import socket_gate as G
+            except ImportError:
+                import socket_gate as G
+            G.gate_finite(f"L{self.layer_idx}/s{getattr(self, '_gate_steps', 0)}",
+                          out_bhd, sparse_list)
         out = out_bhd.unsqueeze(2).transpose(1, 2).contiguous().reshape(B, 1, -1)
         out = self.o_proj(out)
 

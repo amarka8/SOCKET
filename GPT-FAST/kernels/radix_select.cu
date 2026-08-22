@@ -1,10 +1,9 @@
 // ---------------------------------------------------------------------------
 // Histogram / radix THRESHOLD selection: an exact top-M index select.
 //
-// Replaces aten::topk(scores, M) -- mbtopk: 4 full radix passes + gatherTopK + 15 cleanup
-// ops over an 18.4 MB fp32 array, 21 kernels, 103.7 us/layer measured in the compiled
-// decode step -- with a 3-digit MSB-first radix select that streams the score array and
-// materialises nothing.
+// Replaces aten::topk(scores, M) -- mbtopk: four full radix passes plus gatherTopK and a
+// tail of cleanup ops over the fp32 score array -- with a 3-digit MSB-first radix select
+// that streams the score array and materialises nothing.
 //
 // EXACTNESS (GATE A'): the emitted set is
 //     {t : score_t > theta}  U  {exactly (M - #above) arbitrary t with score_t == theta}
@@ -28,14 +27,13 @@
 // block).  Nothing syncs to the host and the launch structure is fixed, so the pipeline is
 // CUDA-graph capturable.
 //
-// WHY STATIC AND NOT ADAPTIVE (measured, not assumed): the histogram passes are bound by
-// SHARED-MEMORY ATOMIC THROUGHPUT, and the atomic count is
+// WHY STATIC AND NOT ADAPTIVE: the histogram passes are bound by SHARED-MEMORY ATOMIC
+// THROUGHPUT, and the atomic count is
 //   (#elements / 32) * (avg distinct bins per warp).
 // Spreading the values over more bins -- which is what an adaptive min/max-relative shift
 // does -- therefore makes the FIRST pass more expensive, not cheaper. Coarse-then-fine is
-// the right shape: on the " hello"xN 140K prompt digit1 puts everything in 2 bins (8.9 us
-// for 18.4 MB against a 5.8 us pure-read floor), digit2 splits it into ~9, and digit3 only
-// ever sees the survivors of one digit2 bin.
+// the right shape: digit1 lands most values in a handful of bins, digit2 splits those, and
+// digit3 only ever sees the survivors of one digit2 bin.
 //
 // PASSES (each a coalesced streaming read of `scores`):
 //   P1 digit1 histogram                           | S1 scan -> b1, c1, need1
@@ -67,8 +65,7 @@
 #define SH1 21
 #define SH2 10
 // Memory-level parallelism: these are streaming reads, so what matters is bytes in flight =
-// blocks*threads*UNROLL*4. NB=4/THR=256 gives 128 KB and runs at 350 GB/s; NB=4/THR=1024
-// with UNROLL=4 gives 2 MB and hits 3.2 TB/s. Buy parallelism with threads+ILP, not with
+// blocks*threads*UNROLL*4. Buy that parallelism with threads and ILP rather than with more
 // blocks: the private-histogram flush costs NB * B*H * 2048 * 4 bytes.
 #define UNROLL 4
 
@@ -107,19 +104,16 @@ __device__ __forceinline__ unsigned f2d(float f) { return 0xFFFFFFFFu - f2key(f)
 
 // HMODE selects the histogram accumulation strategy. 1 = PRODUCTION.
 //   0 warp-aggregated (__match_any_sync) shared atomicAdd
-//   1 plain per-lane shared atomicAdd                       <-- fastest, measured
+//   1 plain per-lane shared atomicAdd                       <-- production
 //   2 aggregation arithmetic with a plain shared STORE (diagnostic; wrong histogram)
 //   3 no histogram at all (diagnostic; isolates the streaming read)
 //
-// MEASURED, and the opposite of the textbook advice: on the " hello"xN 140K prompt (2-9
-// distinct bins for the whole 143362-element array, i.e. maximal same-address conflict)
-// plain per-lane atomicAdd BEATS warp aggregation, 18.4 MB in
-//     digit1 hist  6.4 us (plain) vs  9.5 us (aggregated),  read floor 5.7 us
-//     digit2 hist  9.8 us (plain) vs 26.1 us (aggregated)
-// __match_any_sync (MATCH.ANY.U32) is the expensive part, not the atomic: replacing only
-// the atomic with a store (HMODE 2) still costs 8.1/31.0 us. Shared-atomic conflict replays
-// are nearly free on Hopper. Replicating the shared histogram to cut cross-warp contention
-// (2/4/8 copies) was also measured and is a small LOSS at every factor, which confirms the
+// This is the opposite of the textbook advice. When the scores concentrate in few distinct
+// bins -- maximal same-address conflict -- plain per-lane atomicAdd still beats warp
+// aggregation, because __match_any_sync (MATCH.ANY.U32) is the expensive instruction rather
+// than the atomic: replacing only the atomic with a store (HMODE 2) is no cheaper. Shared-
+// atomic conflict replays are inexpensive on Hopper. Replicating the shared histogram to cut
+// cross-warp contention is a small loss at every replication factor, which confirms the
 // atomics were never the bottleneck.
 template <int HMODE>
 __device__ __forceinline__ void hist_add(unsigned* s_cnt, int bin) {
@@ -202,8 +196,8 @@ __global__ __launch_bounds__(1024) void rs_hist1(const float* __restrict__ score
 // ---------------------------------------------------------------------------
 // SCAN. One block per (b,h): reduce the NB private histograms, prefix-scan the 2048 bins
 // ascending, locate the boundary bin. Warp-shuffle scan (2 __syncthreads) rather than a
-// shared Hillis-Steele (16 __syncthreads): with only B*H=32 blocks there is no other work
-// on the SM to hide sync latency behind, and the naive version cost 6.3 us per scan.
+// shared Hillis-Steele (16 __syncthreads): with only B*H blocks there is no other work on
+// the SM to hide sync latency behind, so the barrier count dominates.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ unsigned warp_incl_scan(unsigned v) {
 #pragma unroll

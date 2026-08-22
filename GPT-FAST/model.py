@@ -288,10 +288,10 @@ class ModelArgs:
     heavy_const: int = 860  # budget
     tau: float = 0.3  # soft-hash softmax temperature (matches sparse-attention-hub default)
     # sink/window streaming-attention base. These were previously read only via
-    # getattr(config, 'sink_size', 120) with NO field, so the benchmark's 33.3x sparsity
+    # getattr(config, 'sink_size', 120) with NO field, so the realized sparsity
     # (budget = sink + window + heavy_const = 120 + 120 + HEAVY) silently depended on the
     # getattr fallback. Made explicit (same 120/120 -> identical selection/sparsity) so the
-    # contract is visible. Do NOT change these values: they set the measured sparsity.
+    # contract is visible. Do NOT change these values: they set the realized sparsity.
     sink_size: int = 120
     window_size: int = 120
 
@@ -301,7 +301,7 @@ class ModelArgs:
         # instantiated, and load_state_dict(strict=False) drops them silently. Without this
         # override the real 32-layer model cannot be run from this tree at all, and the 1-layer
         # microbench config cannot be run from the same tree as the full model -- the previous
-        # setup benchmarked a hand-edited COPY of GPT-FAST, which drifts from any kernel change.
+        # setup used a hand-edited COPY of GPT-FAST, which drifts from any kernel change.
         # Absent SOCKET_N_LAYER the transformer_configs value is used unchanged, so no existing
         # caller changes behaviour.
         _nl_env = os.environ.get("SOCKET_N_LAYER")
@@ -546,7 +546,7 @@ class Transformer(nn.Module):
             self.config.rope_base,
         ).to(device=device)
 
-        # The [T,T] causal mask is O(T^2): 68.7 GB of bool at 256K, and torch.ones plus the
+        # The [T,T] causal mask is O(T^2) bool, and torch.ones plus the
         # tril output are both live, so the transient peak is twice that. It is consumed ONLY
         # as the attn_mask argument of _dense_attention's SDPA fallback -- every
         # FlashAttention path (prefill flash_attn_func, the flash_dense_decode op) derives
@@ -743,7 +743,7 @@ class Attention(nn.Module):
         p = self._prof
         # Profiling timers do device .synchronize() per stage per decode token, which would
         # serialize the launch-bound decode path AND inject syncs into the compiled region.
-        # Default OFF (no _prof_enabled flag) so throughput is measured fairly and the graph
+        # Default OFF (no _prof_enabled flag) so the timed path is unperturbed and the graph
         # stays cudagraph-capturable. Bit-exact either way.
         cuda_timing = x.is_cuda and bool(getattr(self, "_prof_enabled", False))
 
@@ -817,7 +817,7 @@ class Attention(nn.Module):
         # .item()) so it drives index ARITHMETIC (window start) without changing any SHAPE.
         seq_len_t = pos.max().to(torch.int32) + 1
         # NO `allowed` TENSOR. It was `arange(maxlen) <= pos.max()` expanded to
-        # [B,n_head,maxlen] and made contiguous -- a 4.6 MB write at 140K, read back once per
+        # [B,n_head,maxlen] and made contiguous -- a full-buffer write, read back once per
         # layer per decode step, carrying a value identical across every head and all 32
         # layers. The scorer and the index-list kernel both take the seq_len scalar and apply
         # `t < seq_len` directly, which is the same predicate.

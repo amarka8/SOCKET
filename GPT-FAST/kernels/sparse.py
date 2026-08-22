@@ -31,11 +31,9 @@ def _get_soft_hash_ext():
 # ---------------------------------------------------------------------------
 # EXACT TOP-M BY 3-DIGIT RADIX THRESHOLD SELECT  (kernels/radix_select.cu)
 #
-# Replaces aten::topk on the [B,H,maxlen] score array, which was the single biggest kernel
-# group in the compiled decode step: 98.0 us/layer over 21 kernels at 140K P10/L10, against
-# ~5.8 us of unavoidable reads. The radix select streams the score array, materialises
-# nothing, and resolves the exact top-M threshold in 7 kernels / 4 streaming passes:
-# 47.6 us/layer.
+# Replaces aten::topk on the [B,H,maxlen] score array. The radix select streams the score
+# array, materialises no intermediate buffer, and resolves the exact top-M threshold in
+# seven kernels over four streaming passes.
 #
 # EXACTNESS. key(f) = (bits(f) & 0x80000000) ? ~bits(f) : (bits(f) | 0x80000000) is strictly
 # monotone over ALL floats, so the -inf written into unfilled cache columns sorts last exactly
@@ -43,27 +41,25 @@ def _get_soft_hash_ext():
 # has UNIT resolution, so three digits resolve the threshold EXACTLY for any input
 # distribution -- no adaptive shifts, no data-dependent iteration count, no host sync, fixed
 # launch structure (hence CUDA-graph capturable). The selected SCORE MULTISET always equals
-# aten::topk's. The INDEX set need not: the threshold score is frequently tied (hundreds of
-# exact ties at the boundary here, because the hash planes are overwritten with
-# normal_(0,0.02) at load and selection degenerates to top-M by ||v||), and which tied token a
-# top-k implementation keeps is arbitrary in topk too.
+# aten::topk's. The INDEX set need not: the threshold score can be tied, and which tied token
+# a top-k implementation keeps is arbitrary in topk as well. Ties are dense whenever the hash
+# planes are overwritten at load time, since selection then reduces to top-M by ||v||.
 #
 # TUNING. Ordinary runtime arguments to an opaque custom_op, NOT tl.constexpr values, so
 # hardcoding them here is a maintenance choice rather than a cache-correctness requirement:
 #   NB   = 4 T-chunks per (b,h) -> B*H*4 = 128 blocks, about one per SM. Larger NB only adds
 #          private-histogram flush traffic (NB * B*H * 2048 * 4 bytes per level).
-#   THR  = 1024. Bytes in flight = blocks*THR*UNROLL*4; THR=256 runs the streaming passes at
-#          350 GB/s, THR=1024 at 3.2 TB/s. The single most important knob.
+#   THR  = 1024 threads. Bytes in flight = blocks*THR*UNROLL*4, so THR governs how much of
+#          the streaming passes' latency is hidden. The most sensitive knob here.
 #   STHR = 512 for the three tiny scan kernels (2048 bins / 512 threads = 4 bins per thread).
 #   HMODE= 1, a plain per-lane shared atomicAdd. Warp aggregation via __match_any_sync is
-#          2.7x SLOWER on the digit-2 histogram: MATCH.ANY.U32 is the expensive instruction and
-#          shared-atomic conflict replays are nearly free on Hopper.
+#          slower on the digit-2 histogram: MATCH.ANY.U32 is the expensive instruction, while
+#          shared-atomic conflict replays are cheap on Hopper.
 #   STAGES = 127, i.e. all seven real stages and not the read-only bandwidth probe (bit 128).
 #   DET  = 1. Makes the emit DETERMINISTIC: which tied-at-threshold tokens are kept, and the
 #          slot each selected index lands in, become pure functions of the grid. Costs one
-#          extra streaming pass -- 3.0% of throughput, 107.30 -> 104.09 tok/s at 140K P10/L10
-#          -- and buys eager == eager == compiled == compiled reproducibility, without which a
-#          "compiled == eager" regression gate cannot exist. Kept ON for that reason.
+#          extra streaming pass and gives eager == compiled reproducibility, without which a
+#          "compiled matches eager" regression gate cannot exist. Kept ON for that reason.
 # ---------------------------------------------------------------------------
 _RS_NB, _RS_THR, _RS_STHR, _RS_HMODE, _RS_STAGES, _RS_DET = 4, 1024, 512, 1, 127, 1
 
@@ -164,10 +160,9 @@ def _soft_hash_collision_fake(
 #
 # What it removes, with no arithmetic change:
 #   * the [B,H,maxlen] bool `allowed` tensor. The mask is exactly `t < seq_len`, a scalar
-#     compare; the CUDA scorer needed it materialized (expand().contiguous(), 4.6 MB write at
-#     140K) and then read it (4.6 MB), once per layer per decode step, for a value identical
-#     across all heads and all 32 layers.
-#   * the full-buffer v_norm.float() (2.3 MB read + 4.6 MB write per layer per step).
+#     compare; the CUDA scorer needed it materialized (expand().contiguous()) and then read
+#     back once per layer per decode step, for a value identical across all heads and layers.
+#   * the full-buffer v_norm.float() cast.
 #   * the fp32 [B,H,1,L,R] q_probs copy.
 # It is also a genuine triton_op, so torch.compile captures it as a CUDA-graph node without
 # the stream hazard the raw <<<>>> launch had.
@@ -224,8 +219,9 @@ def _fwd_kernel_soft_hash_score(
 # This kernel puts ONE block on each (kv head, tile) and serves the whole group from it: the
 # bucket vector is loaded ONCE per l and reused by four explicitly-unrolled 1D
 # gathers/accumulators. No 2D broadcast, so the address arithmetic per gather is identical to
-# the per-query-head kernel; a [rep, BLOCK_T] 2D accumulator instead measured worse. Bucket
-# load instructions, and the L1/L2 read requests they generate, drop exactly 4-fold.
+# the per-query-head kernel; a [rep, BLOCK_T] 2D accumulator is slower, because the broadcast
+# address arithmetic costs more than sharing the load saves. Bucket load instructions, and the
+# L1/L2 read requests they generate, drop exactly rep-fold.
 #
 # BIT-IDENTICAL to the per-query-head kernel. The score is
 #     out[h,t] = (sum_l q_probs[h,l,bucket[kv(h),l,t]]) * ||v_t||
@@ -285,18 +281,13 @@ def _fwd_kernel_soft_hash_score_gqa4(
 # resulting kernel enters inductor's FX-graph cache key only as an INDEX into
 # kernel_side_table, so the value itself is NOT part of the key. Two runs that share a
 # TORCHINDUCTOR_CACHE_DIR and differ only in such a value silently execute the FIRST one's
-# kernel. That artifact has already produced wrong measurements in this codebase (a "1.9x in
-# isolation, 0% end-to-end" reading that got a real win reverted). Keeping every constexpr a
-# literal removes the hazard at the root; benchmark harnesses should STILL give each cell a
-# fresh TORCHINDUCTOR_CACHE_DIR and TRITON_CACHE_DIR.
+# kernel, so an A/B over such a value can silently compare a kernel against itself. Keeping
+# every constexpr a literal removes the hazard at the root; benchmark harnesses should STILL
+# give each cell a fresh TORCHINDUCTOR_CACHE_DIR and TRITON_CACHE_DIR.
 #
 # The optimum is a constant ~4 ELEMENTS PER THREAD (BLOCK_T / (32*num_warps) == 4): the L-deep
-# gather loop makes anything wider spill. Measured at T=143411 against the CUDA scorer plus the
-# fp32 casts it forces (105.4 us at L=10, 251.3 us at L=50):
-#   L=10: (128,1)  47.7 us = 2.21x   [(1024,4) was 51.2 us]
-#   L=50: (256,2) 180.3 us = 1.39x   [(1024,4) was 298.3 us = 0.84x, a REGRESSION]
-# 40 (BLOCK_T, num_warps) variants were checked and every one is bitwise-equal to the CUDA
-# scorer, so this is purely a performance choice.
+# gather loop makes anything wider spill registers. Every (BLOCK_T, num_warps) variant is
+# bitwise-equal to the CUDA scorer, so the choice is purely a performance one.
 # The GQA-shared kernel keeps the same ~4 elements per thread per accumulator, so one block
 # covering rep query heads wants rep times the warps.
 _SCORER_BLOCK_T_SMALL_L, _SCORER_WARPS_SMALL_L = 128, 1
@@ -360,8 +351,8 @@ else:
 #   gather(allowed, base); masked_fill; win_start=clamp; in_sink; in_window; or; masked_fill;
 #   cat([base, heavy]); contiguous
 # One kernel emits sparse_list directly, and it needs NO `allowed` tensor: the mask is exactly
-# `t < seq_len`, a scalar compare, so materializing and re-reading a [B,H,maxlen] bool (4.6 MB
-# each way per layer per decode step at 140K) was pure waste. This is the last consumer of
+# `t < seq_len`, a scalar compare, so materializing and re-reading a [B,H,maxlen] bool
+# each way per layer per decode step) was pure waste. This is the last consumer of
 # `allowed`, so model.py stops building it entirely.
 #
 # The emitted list is BIT-IDENTICAL by construction -- it is pure integer index arithmetic,
@@ -725,17 +716,14 @@ def _fwd_kernel_sparse_decode_stage2(
 
 # STAGE-1 LAUNCH CONFIG. Literals, for the inductor-cache-key reason spelled out at the
 # scorer's config above: these are tl.constexpr values consumed inside a triton_op body, so an
-# env read here is baked at trace time and is invisible to the FX-graph cache key. Reading
-# BLOCK_N from the environment is exactly what produced the bogus "1.9x in isolation, 0%
-# end-to-end" measurement that once got this win reverted.
+# env read here is baked at trace time and is invisible to the FX-graph cache key, so an A/B
+# over such a value can silently compare a kernel against itself.
 #
-# BLOCK_N is the inner gather width. At (16, 4) each warp owns four gathered 256 B rows,
-# per-thread MLP is 2 outstanding loads, and 16 such chunks serialise behind the online-softmax
-# loop dependency: 0.95 TB/s of requested bytes on a GPU that delivers 3.60 TB/s contiguous. At
-# (128, 8) stage1 drops 49.14 -> 15.15 us/layer (3.09 TB/s) at 140K P10/L10.
-# Lowering BLOCK_SEQ (the "occupancy" hypothesis) is NOT the lever -- 416 vs 3136 blocks changes
-# almost nothing; vector width is what mattered. BLOCK_SEQ stays 256 because it sets stage2's
-# merge trip count (W / BLOCK_SEQ).
+# BLOCK_N is the inner gather width. At a narrow width each warp owns only a few gathered
+# 256 B rows, per-thread memory-level parallelism is a couple of outstanding loads, and the
+# resulting many chunks serialise behind the online-softmax loop dependency. Widening it
+# raises both. Block count is not the lever here; vector width is. BLOCK_SEQ stays 256
+# because it sets stage2's merge trip count (W / BLOCK_SEQ).
 #
 # INVARIANT: BLOCK_SEQ % BLOCK_N == 0 whenever the list spans MORE THAN ONE partition,
 # asserted below. The inner mask is `offs_n_new < cur_seq_len`, not `< cur_block_end`, so a
@@ -744,13 +732,11 @@ def _fwd_kernel_sparse_decode_stage2(
 # (block_seq >= list width, which GPT-FAST/test_socket_compile_equiv.py's T9 fixture makes)
 # has no next partition, so it is harmless and is allowed.
 _STAGE1_BLOCK_N = 128
-# num_warps stays at main's 4, DELIBERATELY. Splitting the two knobs (GATE B, fixed index list,
-# T=32768): BLOCK_N 16->128 with num_warps=4 is BITWISE equal to main (max|diff| 0.0), while
-# num_warps 4->8 is the ENTIRE numerical difference (max|diff| 1.95e-3) and is worth only
-# +2.51% (P10/L10) / +2.20% (P8/L50) -- the smallest win in this branch. Taking it would make
-# stage1's output non-bitwise, so the branch's residual difference vs main would no longer be
-# "selection tie-breaking only". Keeping 4 preserves ~+6.9% of the ~+9.6% combined win with an
-# attention path that is bit-for-bit main's. Raise to 8 only if 2.5% is worth giving that up.
+# num_warps stays at 4, DELIBERATELY. Of the two knobs, widening BLOCK_N is bitwise-neutral
+# while raising num_warps changes the reduction order and so perturbs stage1's output. Keeping
+# num_warps at 4 leaves the attention path bit-for-bit identical to the unmodified kernel, so
+# the only remaining difference from it is which tokens win an exact score tie during
+# selection. Raise it only if that property is worth trading away.
 _STAGE1_NUM_WARPS = 4
 
 
