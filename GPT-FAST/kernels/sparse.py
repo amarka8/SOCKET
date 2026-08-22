@@ -365,6 +365,12 @@ else:
 #   a heavy index is ALSO dropped to -1 if it lies in [0,sink) or [win_start,seq_len) (dedup,
 #   because the no-dedup online softmax would otherwise weight that token twice)
 # Ordering of the two heavy masks is irrelevant: a -1 fails both `>= 0` predicates.
+#
+# The dedup step is a constexpr switch (DEDUP) rather than unconditional, because the HF
+# path in pipeline/train_quest/modeling reuses this kernel and has to be able to reproduce
+# BOTH of its own arms -- its torch op chain concatenates the lists without deduplicating
+# unless SOCKET_DEDUP=1. GPT-FAST itself always passes True, which folds to exactly the code
+# this kernel emitted before the switch existed.
 # ---------------------------------------------------------------------------
 @triton.jit
 def _fwd_kernel_build_list(
@@ -375,6 +381,7 @@ def _fwd_kernel_build_list(
     stride_ob, stride_oh,
     SINK: tl.constexpr, WINDOW: tl.constexpr, M: tl.constexpr,
     MAXLEN: tl.constexpr, W: tl.constexpr, BLOCK: tl.constexpr,
+    DEDUP: tl.constexpr,
 ):
     b = tl.program_id(0)
     h = tl.program_id(1)
@@ -400,9 +407,14 @@ def _fwd_kernel_build_list(
 
     # allowed gating: 0 <= idx < seq_len
     keep = (idx >= 0) & (idx < seq_len)
-    # heavy dedup against sink U window
-    dup = is_heavy & (((idx >= 0) & (idx < SINK)) | ((idx >= win_start) & (idx < seq_len)))
-    idx = tl.where(keep & (dup == 0), idx, -1)
+    # heavy dedup against sink U window. DEDUP is a constexpr, so the arm not taken is
+    # folded away at compile time and the DEDUP=True path emits exactly the code it did
+    # before this switch existed.
+    if DEDUP:
+        dup = is_heavy & (((idx >= 0) & (idx < SINK)) | ((idx >= win_start) & (idx < seq_len)))
+        idx = tl.where(keep & (dup == 0), idx, -1)
+    else:
+        idx = tl.where(keep, idx, -1)
 
     tl.store(Out + b * stride_ob + h * stride_oh + slot, idx, mask=in_range)
 
@@ -415,7 +427,7 @@ def _build_list_impl(
     heavy_idx: torch.Tensor,   # [B,H,M] int32
     seq_len_t: torch.Tensor,   # int32 scalar on device
     out: torch.Tensor,         # [B,H,W] int32 (written)
-    sink: int, window: int, maxlen: int,
+    sink: int, window: int, maxlen: int, dedup: bool,
 ) -> None:
     B, H, M = heavy_idx.shape
     W = out.shape[-1]
@@ -426,6 +438,7 @@ def _build_list_impl(
         heavy_idx.stride(0), heavy_idx.stride(1),
         out.stride(0), out.stride(1),
         SINK=sink, WINDOW=window, M=M, MAXLEN=maxlen, W=W, BLOCK=BLOCK,
+        DEDUP=dedup,
         num_warps=4, num_stages=1,
     )
 
@@ -531,7 +544,7 @@ def build_sparse_list_decode(
         heavy_in = torch.full((B, H, 1), -1, device=device, dtype=torch.int32)
     else:
         heavy_in = heavy_idx
-    build_list_op(heavy_in, seq_len_t.reshape(()), sparse_list, sink, window, maxlen)
+    build_list_op(heavy_in, seq_len_t.reshape(()), sparse_list, sink, window, maxlen, True)
     # sparse_len is W for every (b,h) by construction (the list is rectangular, padded with
     # -1). Left as a per-call torch.full: it is a 128-byte fill that inductor CSEs across the
     # 32 layers of one graph, and caching a tensor across calls is unsafe under
