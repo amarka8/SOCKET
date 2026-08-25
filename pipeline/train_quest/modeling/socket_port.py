@@ -75,6 +75,16 @@ def _load_by_path(module_name: str, filename: str):
 _SPARSE = None
 
 
+def gptfast_sparse():
+    """The loaded GPT-FAST/kernels/sparse.py module object.
+
+    Public because the equivalence gates in socket_gate.py reach past these wrappers to call
+    kernel implementations directly, and because a caller occasionally needs a launch constant
+    (_STAGE1_BLOCK_N, _BUILD_LIST_BLOCK) rather than a kernel.
+    """
+    return _sparse()
+
+
 def _sparse():
     """GPT-FAST/kernels/sparse.py, loaded once per process."""
     global _SPARSE
@@ -110,10 +120,12 @@ def _sparse():
 
 
 # ---------------------------------------------------------------------------
-# SCORER.  socket::soft_hash_score, the MUTATING triton_op form (it writes `out` rather than
-# allocating).  sparse.py also registers a non-mutating `soft_hash_score_alloc` around the
-# same kernel; the mutating form is the one GPT-FAST's own decode path uses, so it is the one
-# used here.
+# SCORER.  socket::soft_hash_score, the MUTATING triton_op form: it writes `out` rather than
+# allocating, which is the form GPT-FAST's own decode path uses.
+#
+# WIDTH.  The kernel takes T from key_buckets and never checks that `out` and `v_norm` agree
+# with it, so a caller that passes a padded bucket buffer next to an unpadded output writes off
+# the end of `out`.  The asserts below turn that into a Python error at the call.
 #
 # LAYOUT.  key_buckets/v_norm are PER-KV-HEAD ([B,Hkv,L,T] / [B,Hkv,T]) while q_probs and out
 # are PER-QUERY-HEAD ([B,H,L,R] / [B,H,T]).  The kernel recovers a query head's bucket row as
@@ -124,6 +136,15 @@ def _sparse():
 # ---------------------------------------------------------------------------
 def soft_hash_score_rt(q_probs, key_buckets, v_norm, seq_len_t, out):
     """Score [B,H,T] into `out` (fp32). seq_len_t is an int32 scalar tensor on device."""
+    B, Hkv, L, T = key_buckets.shape
+    assert v_norm.shape == (B, Hkv, T), (
+        f"v_norm {tuple(v_norm.shape)} must be [B,Hkv,T] = {(B, Hkv, T)}; the kernel reads T "
+        f"columns of it regardless of what shape it actually has")
+    assert out.shape[0] == B and out.shape[-1] == T, (
+        f"out {tuple(out.shape)} must be [B,H,T] with T = {T} (the bucket-buffer width, "
+        f"padding included), not the true sequence length")
+    assert q_probs.shape[0] == B and q_probs.shape[2] == L, (
+        f"q_probs {tuple(q_probs.shape)} must be [B,H,L,R] with L = {L}")
     return _sparse().soft_hash_score_op(
         q_probs, key_buckets, v_norm, seq_len_t.reshape(()), out
     )
@@ -131,8 +152,9 @@ def soft_hash_score_rt(q_probs, key_buckets, v_norm, seq_len_t, out):
 
 # ---------------------------------------------------------------------------
 # SELECT.  socket::radix_topm -- an EXACT top-M index select (same score multiset as
-# aten::topk; which tokens tie AT the threshold is arbitrary in topk too).  The tuning knobs
-# (SOCKET_RS_*) are read inside sparse.py, so they apply identically to both paths.
+# aten::topk; which tokens tie AT the threshold is arbitrary in topk too).  Its tuning
+# constants are module-level literals in sparse.py, so both stacks select with the same ones
+# and there is no environment knob that could make them diverge.
 # ---------------------------------------------------------------------------
 def radix_topm(scores, M):
     """scores [B,H,T] fp32 (contiguous) -> [B,H,M] int32 indices."""
@@ -155,4 +177,27 @@ def build_list_rt(heavy, seq_len_t, out, sink, window, maxlen, dedup=True):
     return _sparse().build_list_op(
         heavy, seq_len_t.reshape(()), out,
         int(sink), int(window), int(maxlen), bool(dedup),
+    )
+
+
+# ---------------------------------------------------------------------------
+# DECODE ATTENTION.  socket::sparse_decode_stage1 + stage2, wrapped by GPT-FAST's own
+# sparse_attention_fwd -- a flash-decode over the index list produced above.
+#
+# This is the last of the four decode stages to reach the HF path; before it, the eval path
+# ran the repo-root copy in kernels/socket_triton_kernels.py while the throughput numbers came
+# from this one.  The two are NOT interchangeable outputs: this kernel gathers 128 list slots
+# per inner step where the repo-root copy gathers 16, so the online softmax accumulates in a
+# different order, and it pins the running max and the exponentials to fp32 where the other
+# leaves them at the input dtype.  Expect agreement to a few ulps, not bit equality.
+#
+# Neither stage carries the sequence length or the list width as a tl.constexpr -- both are
+# ordinary strides and grid dimensions -- so a cache that grows a column per step costs no
+# recompile here.  It also takes the list width from sparse_list.shape rather than from
+# sparse_len.max().item(), which removes one host synchronisation per layer per decode step.
+# ---------------------------------------------------------------------------
+def sparse_attention_fwd(query, key, value, sparse_list, sparse_len, block_seq=256):
+    """query [B,H,D]; key/value [B,Hkv,T,D]; sparse_list [B,H,W] int32 -> out [B,H,D]."""
+    return _sparse().sparse_attention_fwd(
+        query, key, value, sparse_list, sparse_len, block_seq=int(block_seq)
     )

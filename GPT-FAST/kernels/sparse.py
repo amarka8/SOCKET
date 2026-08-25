@@ -1,4 +1,6 @@
 import math
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -194,6 +196,12 @@ def _fwd_kernel_soft_hash_score(
     qp_base = (b * H + h) * L * R
 
     acc = tl.zeros([BLOCK_T], dtype=tl.float32)
+    # BUCKET RANGE IS A CALLER INVARIANT. Both loads below are masked on `mask_t` (t < T), not
+    # on `keep` (t < seq_len), so a column past seq_len is still dereferenced -- the -inf write
+    # at the end of the kernel discards its value but does not prevent its gather. Every column
+    # of KeyBuckets in [0, T) must therefore hold a bucket in [0, R), or the second load reads
+    # outside QProbs. Both callers satisfy this by zero-filling at allocation: model.py's
+    # KVCache and the HF path's padded prefill buffer.
     for l in tl.static_range(L):
         bkt = tl.load(KeyBuckets + kb_base + l * T + offs_t, mask=mask_t, other=0).to(tl.int32)
         qv = tl.load(QProbs + qp_base + l * R + bkt, mask=mask_t, other=0.0)
@@ -259,6 +267,9 @@ def _fwd_kernel_soft_hash_score_gqa4(
     a1 = tl.zeros([BLOCK_T], dtype=tl.float32)
     a2 = tl.zeros([BLOCK_T], dtype=tl.float32)
     a3 = tl.zeros([BLOCK_T], dtype=tl.float32)
+    # Same caller invariant as the per-query-head kernel: every column of KeyBuckets in [0, T)
+    # must hold a bucket in [0, R), because the four gathers below are masked on t < T rather
+    # than on t < seq_len. Here it matters four times per l instead of once.
     for l in tl.static_range(L):
         # ONE bucket load per l; the four gathers reuse it from registers.
         bkt = tl.load(KeyBuckets + kb_base + l * T + offs_t, mask=mask_t, other=0).to(tl.int32)
@@ -351,9 +362,18 @@ else:
 #   gather(allowed, base); masked_fill; win_start=clamp; in_sink; in_window; or; masked_fill;
 #   cat([base, heavy]); contiguous
 # One kernel emits sparse_list directly, and it needs NO `allowed` tensor: the mask is exactly
-# `t < seq_len`, a scalar compare, so materializing and re-reading a [B,H,maxlen] bool
-# each way per layer per decode step) was pure waste. This is the last consumer of
-# `allowed`, so model.py stops building it entirely.
+# `t < seq_len`, a scalar compare, so materializing a [B,H,maxlen] bool and reading it back
+# once per layer per decode step was pure waste. This is the last consumer of `allowed`, so
+# model.py stops building it entirely.
+#
+# WHICH PARAMETERS ARE constexpr, AND WHY. SINK, WINDOW, BLOCK and DEDUP are constants for a
+# whole run in both stacks, so they stay constexpr and the untaken DEDUP arm folds away. MAXLEN
+# and W are ORDINARY RUNTIME ARGUMENTS: GPT-FAST decodes against a static cache and holds both
+# fixed, but the HuggingFace eval path in pipeline/train_quest/modeling grows its list width
+# with the heavy budget, and a constexpr would force a fresh Triton compile per decode step
+# there. Each is read exactly once -- W bounds the slot range, MAXLEN clamps the window index --
+# so two runtime compares replace two folded immediates in a kernel that touches B*H*W int32
+# slots. There was a third, `M`, which the body never read at all; it is gone.
 #
 # The emitted list is BIT-IDENTICAL by construction -- it is pure integer index arithmetic,
 # reproducing exactly the semantics of the op chain it replaces:
@@ -379,8 +399,8 @@ def _fwd_kernel_build_list(
     Out,              # [B,H,W] int32   (written)
     stride_hb, stride_hh,
     stride_ob, stride_oh,
-    SINK: tl.constexpr, WINDOW: tl.constexpr, M: tl.constexpr,
-    MAXLEN: tl.constexpr, W: tl.constexpr, BLOCK: tl.constexpr,
+    MAXLEN, W,        # RUNTIME, not constexpr -- see the note above
+    SINK: tl.constexpr, WINDOW: tl.constexpr, BLOCK: tl.constexpr,
     DEDUP: tl.constexpr,
 ):
     b = tl.program_id(0)
@@ -429,7 +449,7 @@ def _build_list_impl(
     out: torch.Tensor,         # [B,H,W] int32 (written)
     sink: int, window: int, maxlen: int, dedup: bool,
 ) -> None:
-    B, H, M = heavy_idx.shape
+    B, H = heavy_idx.shape[0], heavy_idx.shape[1]
     W = out.shape[-1]
     BLOCK = _BUILD_LIST_BLOCK
     grid = (B, H, triton.cdiv(W, BLOCK))
@@ -437,7 +457,8 @@ def _build_list_impl(
         heavy_idx, seq_len_t, out,
         heavy_idx.stride(0), heavy_idx.stride(1),
         out.stride(0), out.stride(1),
-        SINK=sink, WINDOW=window, M=M, MAXLEN=maxlen, W=W, BLOCK=BLOCK,
+        int(maxlen), int(W),
+        SINK=sink, WINDOW=window, BLOCK=BLOCK,
         DEDUP=dedup,
         num_warps=4, num_stages=1,
     )
@@ -574,6 +595,7 @@ def _fwd_kernel_sparse_decode_stage1(
     BLOCK_SEQ: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NAN_GUARD: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -645,7 +667,10 @@ def _fwd_kernel_sparse_decode_stage1(
         # exp() argument is then -inf - 0 = -inf -> 0.0, so the chunk contributes nothing and
         # max_logic legitimately stays -inf. When new_max_logic is finite the expression is
         # unchanged, so this is bit-identical on every non-degenerate chunk.
-        _safe_max = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic).to(tl.float32)
+        _safe_max = new_max_logic
+        if NAN_GUARD:
+            _safe_max = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic)
+        _safe_max = _safe_max.to(tl.float32)
 
         exp_logic = tl.exp(att_value - _safe_max).to(tl.float32)
         logic_scale = tl.exp(max_logic - _safe_max).to(tl.float32)
@@ -668,8 +693,12 @@ def _fwd_kernel_sparse_decode_stage1(
         # A block whose slots are ALL padding yields sum_exp == 0; 0/0 = nan and log(0) =
         # -inf. Emit a zero partial with logexpsum = -inf so stage2's merge discards it (its
         # weight is exp(-inf - m) = 0). Unchanged whenever sum_exp > 0.
-        _empty = sum_exp == 0.0
-        _safe_sum = tl.where(_empty, 1.0, sum_exp)
+        if NAN_GUARD:
+            _empty = sum_exp == 0.0
+            _safe_sum = tl.where(_empty, 1.0, sum_exp)
+        else:
+            _empty = sum_exp < 0.0        # never true: reproduces the unguarded store
+            _safe_sum = sum_exp
         tl.store(Mid_O + off_mid_o, acc / _safe_sum)
         tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum,
                  tl.where(_empty, float("-inf"), max_logic + tl.log(_safe_sum)))
@@ -687,6 +716,7 @@ def _fwd_kernel_sparse_decode_stage2(
     stride_obs, stride_oh, stride_od,
     BLOCK_SEQ: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
+    NAN_GUARD: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -714,7 +744,10 @@ def _fwd_kernel_sparse_decode_stage2(
         # Same empty guard as stage1: a partial from an all-padding block carries
         # logexpsum = -inf, and merging it while the running max is still -inf would
         # evaluate exp(-inf - -inf) = nan. Bit-identical whenever new_max_logic is finite.
-        _safe_max2 = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic).to(tl.float32)
+        _safe_max2 = new_max_logic
+        if NAN_GUARD:
+            _safe_max2 = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic)
+        _safe_max2 = _safe_max2.to(tl.float32)
         old_scale = tl.exp(max_logic - _safe_max2).to(tl.float32)
         exp_logic = tl.exp(tlogic - _safe_max2).to(tl.float32)
         acc = (acc * old_scale + exp_logic * tv).to(tl.float32)
@@ -724,7 +757,10 @@ def _fwd_kernel_sparse_decode_stage2(
     off_o = cur_batch * stride_obs + cur_head * stride_oh + offs_d
     # Defensive: sum_exp == 0 only if EVERY slot for this (b,h) was padding, which cannot
     # happen while sink > 0, but 0/0 would silently produce NaN logits if it ever did.
-    tl.store(O + off_o, acc / tl.where(sum_exp == 0.0, 1.0, sum_exp))
+    _den = sum_exp
+    if NAN_GUARD:
+        _den = tl.where(sum_exp == 0.0, 1.0, sum_exp)
+    tl.store(O + off_o, acc / _den)
 
 
 # STAGE-1 LAUNCH CONFIG. Literals, for the inductor-cache-key reason spelled out at the
@@ -744,6 +780,15 @@ def _fwd_kernel_sparse_decode_stage2(
 # and double-count those tokens in the online softmax. A single-partition call
 # (block_seq >= list width, which GPT-FAST/test_socket_compile_equiv.py's T9 fixture makes)
 # has no next partition, so it is harmless and is allowed.
+# THE ONE ENVIRONMENT-DERIVED constexpr IN THIS FILE, and it exists only so the regression
+# test can show the guard is load-bearing: SOCKET_NAN_GUARD=0 compiles the empty-partition
+# guards out and the NaN they suppress comes back. Read once, here, into a plain Python bool.
+#
+# It carries the hazard described above -- a value baked at trace time is not part of
+# inductor's FX cache key -- so it must never be varied inside a benchmark, and never with a
+# shared TORCHINDUCTOR_CACHE_DIR. Nothing but GPT-FAST/tests/test_empty_chunk_nan.py sets it.
+_NAN_GUARD = os.environ.get("SOCKET_NAN_GUARD", "1") != "0"
+
 _STAGE1_BLOCK_N = 128
 # num_warps stays at 4, DELIBERATELY. Of the two knobs, widening BLOCK_N is bitwise-neutral
 # while raising num_warps changes the reduction order and so perturbs stage1's output. Keeping
@@ -794,6 +839,7 @@ def _sparse_decode_stage1_impl(
         BLOCK_SEQ=block_seq,
         BLOCK_DMODEL=D,
         BLOCK_N=BLOCK_N,
+        NAN_GUARD=_NAN_GUARD,
         num_warps=_STAGE1_NUM_WARPS,
         num_stages=2,
     )
@@ -823,6 +869,7 @@ def _sparse_decode_stage2_impl(
         out.stride(0), out.stride(1), out.stride(2),
         BLOCK_SEQ=block_seq,
         BLOCK_DMODEL=D,
+        NAN_GUARD=_NAN_GUARD,
         num_warps=4,
         num_stages=2,
     )
