@@ -18,13 +18,18 @@ produced ALL-NaN logits and a greedy stream collapsing to token 0.
 
 The test drives it directly with a fully padded LEADING partition, which is independent of
 BLOCK_N and exercises all four guards (stage1 softmax, stage1 store, stage2 merge, stage2
-store). To see the pre-fix behaviour, revert the guard commit and re-run: this test then
-fails with non-finite output.
+store).
+
+A test that only asserts the output is finite cannot distinguish a working guard from a bug
+that stopped being reachable, so the suite is run twice. SOCKET_NAN_GUARD=0 compiles the
+guards out, and in that run the padded case must produce non-finite output -- if it does not,
+the fixture has drifted and the guarded run proves nothing.
 
 Standalone runner (pytest cannot import in this cluster's module stack: its anyio dependency
 pulls in ssl, which fails with an OPENSSL_3.3.0 mismatch):
 
-    python GPT-FAST/tests/test_empty_chunk_nan.py
+    python GPT-FAST/tests/test_empty_chunk_nan.py                     # guard on
+    SOCKET_NAN_GUARD=0 python GPT-FAST/tests/test_empty_chunk_nan.py  # guard off
 """
 import os
 import sys
@@ -102,12 +107,34 @@ def test_fully_padded_partition_is_finite_and_correct():
     assert err < 2e-2, f"padded-partition output disagrees with the dense reference: {err}"
 
 
+def test_bug_reproduces_without_the_guard():
+    """With SOCKET_NAN_GUARD=0 the padded case MUST go non-finite.
+
+    This is what makes the guarded assertion meaningful: it shows the fixture still reaches
+    the code path the guard protects, rather than having drifted into a case that is finite
+    for unrelated reasons.
+    """
+    lst = _build(pad_first_block=True)
+    out = _run(lst)
+    n = int((~torch.isfinite(out)).sum())
+    assert n > 0, (
+        "with the guard compiled out the fully padded leading partition produced finite "
+        "output, so this fixture no longer reaches the empty-chunk path and the guarded "
+        "run below proves nothing")
+
+
 def _main():
     if not torch.cuda.is_available():
         print("SKIP (no CUDA)")
         return 0
+    guard_on = os.environ.get("SOCKET_NAN_GUARD", "1") != "0"
+    print(f"[CFG] SOCKET_NAN_GUARD={'1 (guards compiled in)' if guard_on else '0 (guards compiled out)'}")
+    if guard_on:
+        tests = (test_no_padding_is_finite, test_fully_padded_partition_is_finite_and_correct)
+    else:
+        tests = (test_no_padding_is_finite, test_bug_reproduces_without_the_guard)
     rc = 0
-    for fn in (test_no_padding_is_finite, test_fully_padded_partition_is_finite_and_correct):
+    for fn in tests:
         try:
             fn()
             print(f"  PASS  {fn.__name__}")
