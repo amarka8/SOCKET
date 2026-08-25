@@ -131,8 +131,16 @@ def _fwd_kernel_sparse_decode_stage1(
         off_mid_o_logexpsum = (
             cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh + seq_start_block
         )
-        tl.store(Mid_O + off_mid_o, acc / sum_exp)
-        tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum, max_logic + tl.log(sum_exp))
+        # A partition whose every slot is padding or out of range takes no contribution, so
+        # sum_exp is still 0: acc / sum_exp is 0/0 = NaN and log(0) = -inf, and stage2 merges
+        # that partial straight into the output. Store a neutral partial instead -- any value
+        # divided by 1, carrying logsumexp -inf, which stage2 weights by exp(-inf - m) = 0.
+        # Unchanged whenever sum_exp > 0, i.e. on every partition holding a valid slot.
+        _empty = sum_exp == 0.0
+        _safe_sum = tl.where(_empty, 1.0, sum_exp)
+        tl.store(Mid_O + off_mid_o, acc / _safe_sum)
+        tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum,
+                 tl.where(_empty, float("-inf"), max_logic + tl.log(_safe_sum)))
 
 
 @triton.jit
@@ -170,15 +178,23 @@ def _fwd_kernel_sparse_decode_stage2(
         tlogic = tl.load(Mid_O_LogExpSum + offs_logic + block_seq_n)
 
         new_max_logic = tl.maximum(tlogic, max_logic)
-        old_scale = tl.exp(max_logic - new_max_logic)
+        # Same -inf - -inf hazard as stage1, one level up: a partial carrying logsumexp -inf
+        # (an all-padding partition) merged while the running max is also still -inf makes
+        # both exp() calls evaluate exp(-inf - -inf) = NaN. Bit-identical whenever
+        # new_max_logic is finite.
+        _safe_max2 = tl.where(new_max_logic == float("-inf"), 0.0, new_max_logic)
+        old_scale = tl.exp(max_logic - _safe_max2)
         acc *= old_scale
-        exp_logic = tl.exp(tlogic - new_max_logic)
+        exp_logic = tl.exp(tlogic - _safe_max2)
         acc += exp_logic * tv
         sum_exp = sum_exp * old_scale + exp_logic
         max_logic = new_max_logic
 
     off_o = cur_batch * stride_obs + cur_head * stride_oh + offs_d
-    tl.store(O + off_o, acc / sum_exp)
+    # Defensive: sum_exp == 0 here means EVERY slot for this (b,h) was padding, which the
+    # list builder should never produce (sink alone is always valid). Emit zeros rather than
+    # NaN if it ever does, so the failure stays local instead of poisoning the whole layer.
+    tl.store(O + off_o, acc / tl.where(sum_exp == 0.0, 1.0, sum_exp))
 
 
 @torch.no_grad()
