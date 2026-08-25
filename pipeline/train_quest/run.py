@@ -159,6 +159,14 @@ def run(configs, args, logger):
         epoch = pipeline_params["resume"]
         print(f"Loading from previous run epoch_{epoch}!")
 
+    # SOCKET_MODEL_PATH overrides the config's model_name. The committed configs name the
+    # canonical hub repo so they stay portable; a machine that has to load from an assembled
+    # local weight tree points at it here instead of editing a tracked file.
+    _model_override = os.environ.get("SOCKET_MODEL_PATH", "").strip()
+    if _model_override:
+        pipeline_params["model_name"] = _model_override
+        print(f"[SOCKET-MODEL] model_name overridden to {_model_override}", flush=True)
+
     model_name = pipeline_params["model_name"]
     use_socket = pipeline_params.get("method") == "socket"
     is_llama_instruct = model_name in {
@@ -166,7 +174,13 @@ def run(configs, args, logger):
         "meta-llama/Llama-3.2-3B-Instruct",
         "meta-llama/Llama-3.2-1B-Instruct",
         "meta-llama/Llama-3.1-8B-Instruct",
-    }
+    } or (
+        # A local directory holding the same Instruct weights also qualifies. Without this the
+        # masker branch is skipped silently and the run measures DENSE attention while every
+        # log line still says SOCKET.
+        os.path.isdir(model_name)
+        and "instruct" in os.path.basename(model_name.rstrip("/")).lower()
+    )
 
     if use_socket and is_llama_instruct:
         llama_config = AutoConfig.from_pretrained(model_name)
@@ -195,6 +209,11 @@ def run(configs, args, logger):
             llama_config.heavy_const = pipeline_params["heavy_const"]
         if "tau" in pipeline_params:
             llama_config.tau = pipeline_params["tau"]
+        # How far past the prompt the SOCKET bucket buffers are allocated. The masker sizes
+        # them once at prefill so the kernels see a shape that does not change per decode
+        # step; the reserve is what generation is allowed to consume before the buffer has to
+        # grow. n_new_tokens is the generation budget this pipeline config asks for.
+        llama_config.socket_decode_reserve = int(pipeline_params.get("n_new_tokens", 1024))
 
         model = LlamaForCausalLM.from_pretrained(
             model_name, config=llama_config, torch_dtype=torch.bfloat16
@@ -207,7 +226,8 @@ def run(configs, args, logger):
             f"sink={getattr(llama_config,'sink_size',None)} "
             f"window={getattr(llama_config,'window_size',None)} "
             f"heavy_const={getattr(llama_config,'heavy_const',None)} "
-            f"tau={getattr(llama_config,'tau',None)}",
+            f"tau={getattr(llama_config,'tau',None)} "
+            f"decode_reserve={getattr(llama_config,'socket_decode_reserve',None)}",
             flush=True,
         )
         model.set_masker_mode(configs['pipeline_params']["train_mode"])
@@ -333,6 +353,15 @@ def run(configs, args, logger):
             configs,
             tokenizer
         )
+
+        # SOCKET_LB_LIMIT=N evaluates only the first N samples. The sampler below is
+        # shuffle=False, so every arm of a kernel comparison sees the SAME N samples, which is
+        # what makes the arms comparable at a sample count small enough to sweep.
+        _lb_limit = os.environ.get("SOCKET_LB_LIMIT")
+        if _lb_limit:
+            _n = min(int(_lb_limit), len(dataset_gen_val))
+            dataset_gen_val = torch.utils.data.Subset(dataset_gen_val, list(range(_n)))
+            print(f"[LB-LIMIT] evaluating first {_n} samples", flush=True)
 
         valid_gen_dataloader = torch.utils.data.DataLoader(
             dataset_gen_val,
