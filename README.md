@@ -51,18 +51,25 @@ This repository has **two independent parts**:
 The two paths use **separate Python environments** (different torch/CUDA wheels). Both are
 Python 3.13 venvs; CUDA toolkit `12.9.1` is loaded as a module.
 
-### Accuracy path (e.g. `swa_env`)
+### Accuracy path (e.g. `socket_env`)
 
-- Python 3.13, `torch 2.8.0+cu128`, `transformers==4.57.6`, `triton 3.4.0`, `datasets`.
+- Python 3.13, `torch 2.8.0+cu128`, `transformers==4.57.6`, `triton 3.4.0`, `datasets`,
+  `deepspeed`.
 - Install from `requirements.txt` (it pins `transformers==4.57.6`; `torch`/CUDA wheels are
   left to you, hence the commented `# torch` / `# nvidia-*` lines).
 
 ```bash
-module load GCCcore/13.3.0 CUDA/12.9.1
-python -m venv swa_env && source swa_env/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cu128   # or your CUDA wheel
+module load GCCcore/14.3.0 Python/3.13.5 CUDA/12.9.1
+python -m venv socket_env && source socket_env/bin/activate
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128   # or your CUDA wheel
 pip install -r requirements.txt
 ```
+
+> The `transformers` pin is a hard requirement, not a preference:
+> `pipeline/train_quest/modeling/modeling_llama.py` is a fork of that release's Llama
+> implementation and does not import against `transformers` 5.x. The job scripts under
+> `scripts/socket_accuracy/` check the major version and skip the model-level gates rather
+> than failing obscurely when it is wrong.
 
 ### Throughput path (`GPT-FAST/`, e.g. `prism_env`)
 
@@ -192,6 +199,78 @@ To change:
 Outputs land under `--output_folder_dir`: `raw_results.json` (scores) and
 `output_config.json` (full fused config incl. per-task results), plus `input_config/` and
 `exp.log`.
+
+---
+
+### One kernel composition for accuracy *and* throughput
+
+The throughput numbers in `GPT-FAST/speed_results.md` were produced by four kernels — a Triton
+soft-hash scorer with GQA-group bucket sharing, an exact radix top-M select, a one-kernel
+sparse-list assembly, and a stage1/stage2 flash decode — all living in `GPT-FAST/kernels/`.
+The accuracy path used to carry its own older implementation of all four, so a speed number and
+an accuracy number never described the same system. It now calls the GPT-FAST kernels directly,
+through `pipeline/train_quest/modeling/socket_port.py`, and each stage is individually
+switchable so the older implementation stays available as a reference:
+
+| Env var | Default | Alternative |
+|---|---|---|
+| `SOCKET_SCORER` | `triton` — GPT-FAST scorer, per-KV-head buckets | `cuda` — the `load_inline` scorer, per-query-head buckets |
+| `SOCKET_SELECT` | `radix` — exact 3-digit radix threshold select | `topk` — `torch.topk` |
+| `SOCKET_LIST` | `triton` — one-kernel list assembly | `torch` — the arange/cat/gather op chain |
+| `SOCKET_ATTN` | `gptfast` — GPT-FAST stage1/stage2 flash decode | `local` — `kernels/socket_triton_kernels.py` |
+| `SOCKET_DEDUP` | `0` — a heavy token in sink/window is attended twice | `1` — masked to `-1`, matching GPT-FAST |
+| `SOCKET_TARGET_SPARSITY` | unset — `heavy_const` is a fraction of `T` | `R` — total kept is exactly `round(T/R)` |
+| `SOCKET_LB_LIMIT` | unset — evaluate every sample | `N` — the first N only, `shuffle=False` |
+| `SOCKET_MODEL_PATH` | unset — use the config's `model_name` | a local weight directory |
+| `SOCKET_GATE` | `0` | `1` — run the in-forward equivalence gates (`socket_gate.py`) |
+
+The first three arms are exact swaps; `SOCKET_ATTN` is not. The GPT-FAST decode kernel gathers
+128 list slots per inner step where the local copy gathers 16, and pins the online softmax to
+fp32, so the two agree to a few ulps rather than bitwise.
+
+**Buffer capacity.** GPT-FAST decodes against a static KV cache, so the score-array width is a
+run constant and the kernels declare it `tl.constexpr`. The HF cache grows a column per step, so
+the masker allocates the bucket and `||v||` buffers at a padded capacity — the next half-octave
+above the prompt plus the generation reserve — and lets the on-device `seq_len` scalar carry the
+truth. Padding is inert: the scorer writes `-inf` past `seq_len`, the select sorts `-inf` last,
+and the list builder drops any index at or beyond it. The buffers are **zero-filled**, which is
+load-bearing rather than tidy: the scorer masks its gathers on the buffer width, so a padded
+column holding an out-of-range bucket code would index outside `q_probs`.
+
+### The two benchmarked hash geometries
+
+`speed_results.md` reports `L=60`; the later decode sweeps measured `(P=10, L=10)` and
+`(P=8, L=50)`, with `P=10, L=10` the faster of the two at every context. Matching accuracy
+configs live alongside the RULER one:
+
+| Config | P (`bucket_K`) | L (`bucket_L`) |
+|---|---|---|
+| `config/pipeline_config/SOCKET/Llama-3.1-8B-Instruct/lb-P10L10.json` | 10 | 10 |
+| `config/pipeline_config/SOCKET/Llama-3.1-8B-Instruct/lb-P8L50.json` | 8 | 50 |
+| `config/pipeline_config/SOCKET/Llama-3.1-8B-Instruct/lb-P10L60.json` | 10 | 60 |
+
+All three hold `tau=0.3`, `sink_size=window_size=128` and `heavy_const=0.05` fixed, so a score
+difference between them is attributable to the hash geometry alone. Sparsity is set at run time
+with `SOCKET_TARGET_SPARSITY`, because `heavy_const` is a fraction and cannot express a total
+kept count.
+
+### Running the accuracy sweep
+
+`scripts/socket_accuracy/` runs the whole matrix — one SLURM job per dataset, every arm inside
+that job so they share a node and the same samples:
+
+```bash
+cd /scratch/sj157/SOCKET_orig
+sbatch scripts/socket_accuracy/gates.sbatch          # kernel equivalence, minutes
+DSLIST="hotpotqa samsum qasper multifieldqa_en" \
+  sbatch scripts/socket_accuracy/run_lb_kernels.sbatch
+python scripts/socket_accuracy/collect.py            # three tables
+```
+
+`env.sh` holds the shared job environment; every machine-specific path in it is an override with
+a default (`SOCKET_ENV_DIR`, `SOCKET_HF_HOME`, `SOCKET_MODEL_PATH`, `SOCKET_REPO`). The gate job
+skips the two model-level tests when `transformers` is not importable, so a torch-only
+environment still validates every kernel claim.
 
 ---
 
