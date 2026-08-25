@@ -21,6 +21,13 @@ from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
 # SOCKET sparse path). Copied verbatim from the reference fork so the dense
 # baseline can be timed under BOTH FA2 and FA3 in the same env.
 # ---------------------------------------------------------------------------
+# The four-kernel q_probs chain can be folded into one Triton kernel (kernels/fused_meta.py).
+# OFF by default: the published SOCKET throughput was measured without it and it is not bitwise
+# equal to the ATen chain, so enabling it is a separate change with its own measurement.
+_FUSED_SOFTHASH = os.environ.get("SOCKET_FUSED_SOFTHASH", "0") == "1"
+if _FUSED_SOFTHASH:
+    from kernels.fused_meta import fused_soft_hash
+
 _flash_attn_func = None
 _flash_attn_with_kvcache = None       # decode kernel (static cache + cache_seqlens); None if absent
 _FLASH_IS_FA3 = False
@@ -854,7 +861,14 @@ class Attention(nn.Module):
         window = max(0, min(window, maxlen))
         M = max(0, min(M, maxlen))
 
-        q_probs = self.soft_hash(q_bhd)  # [B,H,L,R]
+        if _FUSED_SOFTHASH:
+            # temp matches soft_hash's math.sqrt(D) exactly; the fused kernel multiplies by
+            # its reciprocal rather than dividing, which is where its sub-ulp difference from
+            # the ATen chain comes from.
+            q_probs = fused_soft_hash(q_bhd, self.planes, self.protos_T,
+                                      math.sqrt(self.head_dim), self.tau, q_bhd.dtype)
+        else:
+            q_probs = self.soft_hash(q_bhd)  # [B,H,L,R]
 
         with CUDATimer(cuda_timing) as t_index:
             sparse_list, sparse_len = build_sparse_list_decode(
