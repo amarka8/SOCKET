@@ -15,20 +15,16 @@ NOT BITWISE.  Everything here is arranged to reproduce the eager chain's roundin
 intermediate is round-tripped through bf16 at the point the ATen chain would materialize a
 bf16 tensor -- but a fused reduction is not obliged to associate the same way a GEMV does, so
 expect agreement to about one bf16 ulp rather than exactly.  For calibration, Inductor's own
-compiled version of the same chain is not bitwise equal to eager either, and differs from it
-on more elements than this kernel does.  ROUND_TRIP=1 (the default) matches EAGER; Inductor
+compiled version of the same chain is not bitwise equal to eager either.  ROUND_TRIP=1 (the default) matches EAGER; Inductor
 keeps the (logit / tau) intermediate in fp32 across the fused divide and softmax, which is
 ROUND_TRIP=0.
 
-OFF BY DEFAULT.  SOCKET_FUSED_SOFTHASH=1 turns it on.  The published SOCKET throughput was
-measured without it, so leaving it off keeps the shipped decode path identical to the one
-those numbers describe; turning it on is a separate, re-measurable change.
+ON BY DEFAULT.  SOCKET_FUSED_SOFTHASH=0 restores the ATen chain for A/B comparison.
 
 WHAT IS DELIBERATELY NOT HERE.  An earlier version of this file also fused the per-step KV
 metadata (the new token's bucket code and value norm).  That kernel put one program on each
 (batch, kv-head) -- eight CTAs on a 132-SM GPU -- and ran L*K sequentially dependent
-block-wide reductions inside it, which made it several times slower than the ATen work it
-replaced.  It is not ported.
+block-wide reductions inside it.  It is not ported.
 """
 import os
 

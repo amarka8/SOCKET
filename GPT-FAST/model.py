@@ -21,10 +21,10 @@ from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
 # SOCKET sparse path). Copied verbatim from the reference fork so the dense
 # baseline can be timed under BOTH FA2 and FA3 in the same env.
 # ---------------------------------------------------------------------------
-# The four-kernel q_probs chain can be folded into one Triton kernel (kernels/fused_meta.py).
-# OFF by default: the published SOCKET throughput was measured without it and it is not bitwise
-# equal to the ATen chain, so enabling it is a separate change with its own measurement.
-_FUSED_SOFTHASH = os.environ.get("SOCKET_FUSED_SOFTHASH", "0") == "1"
+# The four-kernel q_probs chain is folded into one Triton kernel (kernels/fused_meta.py).
+# ON by default; the fused reduction is not bitwise equal to the ATen chain (see the design
+# note in fused_meta.py), so SOCKET_FUSED_SOFTHASH=0 restores the ATen chain for A/B runs.
+_FUSED_SOFTHASH = os.environ.get("SOCKET_FUSED_SOFTHASH", "1") == "1"
 if _FUSED_SOFTHASH:
     from kernels.fused_meta import fused_soft_hash
 
@@ -406,7 +406,7 @@ class KVCache(nn.Module):
       "bthd" (dense decode): k_cache/v_cache are (B, T, Hkv, D) -- exactly what
              flash_attn_with_kvcache consumes, so dense decode hands FA the cache buffer with
              no per-step relayout. Previously dense decode ran k.transpose(1,2).contiguous()
-             on the WHOLE cache every layer every step (2 x 587 MB/layer at 140K).
+             on the WHOLE cache every layer every step.
 
     Only k_cache/v_cache are affected; k_hard / v_norm / attn_out are SOCKET-only and
     unchanged.
@@ -436,8 +436,8 @@ class KVCache(nn.Module):
         self.R = R
 
         # RANK-1: store k_hard NATIVELY transposed as [B, Hkv, L, T] (the scorer's read layout)
-        # so the per-decode-token full-buffer permute().contiguous() relayout (~210MB round-trip
-        # @128K, the #1 T-scaling DRAM op) is eliminated — KVCache.update writes only the new
+        # so the per-decode-token full-buffer permute().contiguous() relayout is eliminated —
+        # KVCache.update writes only the new
         # column along the last (T) axis. Byte-equal to the old [B,Hkv,T,L]+relayout (gate: T7).
         self.register_buffer("k_hard", torch.zeros((B, H, L, T), dtype=torch.int16))
         self.register_buffer("v_norm", torch.zeros((B, H, T), dtype=torch.float16))
@@ -558,7 +558,7 @@ class Transformer(nn.Module):
         # as the attn_mask argument of _dense_attention's SDPA fallback -- every
         # FlashAttention path (prefill flash_attn_func, the flash_dense_decode op) derives
         # causality from causal=True and never reads it, and SOCKET decode masks with
-        # `t < seq_len`. Allocating it unconditionally capped usable context at ~200-210K for
+        # `t < seq_len`. Allocating it unconditionally would spend context-scaling memory for
         # a buffer no kernel dereferences. Allocate it only when there is no flash backend;
         # otherwise leave it None and let the SDPA fallback rebuild the [S,T] slice it needs
         # from input_pos, so a flash exception still gets a CORRECT causal mask instead of
@@ -839,12 +839,12 @@ class Attention(nn.Module):
             #
             # RANK-1: k_hard is now STORED natively as [B,Hkv,L,maxlen] (KVCache.update writes one
             # column/step), so the per-token full-buffer permute(0,1,3,2).contiguous() relayout
-            # (~210MB round-trip @128K, the #1 T-scaling DRAM op) is DELETED — read it directly.
+            # is DELETED — read it directly.
             k_hard_bhlt = self.kv_cache.k_hard  # [B,Hkv,L,maxlen] (native; no relayout)
             v_norm_bht = self.kv_cache.v_norm   # [B,Hkv,maxlen]
             if self._force_repeat and rep != 1:
                 # ABLATION (default OFF): reproduce the pre-opt 4x repeat (kernel sees Hkv==H,
-                # rep=1). Bit-identical selection/output (T6), only slower.
+                # rep=1). Bit-identical selection/output (T6).
                 k_hard_bhlt = k_hard_bhlt.repeat_interleave(rep, dim=1)  # [B,H,L,maxlen]
                 v_norm_bht = v_norm_bht.repeat_interleave(rep, dim=1)    # [B,H,maxlen]
 
@@ -965,7 +965,7 @@ class Attention(nn.Module):
             q_bshd = q.transpose(1, 2).contiguous()        # [B,1,Hq,D]
             if k_bthd_cache is not None:
                 # ZERO-COPY: the cache is already [B,maxlen,Hkv,D]. This is the whole point of
-                # layout="bthd" -- no 2 x 587 MB relayout per layer per step at 140K.
+                # layout="bthd" -- no per-step relayout.
                 k_bthd = k_bthd_cache
                 v_bthd = v_bthd_cache
             else:
