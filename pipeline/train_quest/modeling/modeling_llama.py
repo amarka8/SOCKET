@@ -213,8 +213,8 @@ def build_sparse_list_decode(
     seq_len_t: torch.Tensor = None,  # int32 scalar on device; defaults to T
     T_true: int = None,              # live sequence length; defaults to the buffer width T
 ):
-    """Returns (sparse_list [B,H,W] int32, sparse_len [B,H] int32, scores [B,H,T] fp16|None
-    (fp32 on the legacy cuda scorer arm)).
+    """Returns (sparse_list [B,H,W] int32, sparse_len [B,H] int32, scores [B,H,T]|None,
+    in the shared entry point buffer dtype (fp32 on the legacy cuda scorer arm)).
 
     TWO LENGTHS.  `T` is the WIDTH of the bucket / ||v|| buffers, which the caller pads to a
     capacity so the kernels see a shape that changes only when the capacity does.  `T_true` is
@@ -259,9 +259,10 @@ def build_sparse_list_decode(
             key_buckets = k_hard_bhlt
             if key_buckets.dtype != torch.int16:
                 key_buckets = key_buckets.to(torch.int16)
-            # fp16 scores: fp32-accumulated in-kernel, rounded once on store. The CUDA arm
-            # below keeps its historical fp32 output; comparisons across arms round it.
-            scores = torch.empty((B, H, T), device=device, dtype=torch.float16)
+            # fp32-accumulated in-kernel, stored in the shared entry point's buffer dtype.
+            # The CUDA arm below keeps its historical fp32 output; comparisons across arms
+            # cast to the stored dtype.
+            scores = torch.empty((B, H, T), device=device, dtype=_port().scores_dtype())
             _port().soft_hash_score_rt(
                 q_probs.contiguous(), key_buckets.contiguous(),
                 v_norm_bht.contiguous(), seq_len_t, scores,

@@ -152,7 +152,7 @@ def gate_scorer(tag, q_probs, kb_kv, vn_kv, kb_q, vn_q, allowed_bht, seq_len_t, 
     dev = q_probs.device
 
     qp = q_probs.contiguous()
-    scores_tri = torch.empty((B, H, T), device=dev, dtype=torch.float16)
+    scores_tri = torch.empty((B, H, T), device=dev, dtype=port.scores_dtype())
     port.soft_hash_score_rt(qp, kb_kv.contiguous(), vn_kv.contiguous(), seq_len_t, scores_tri)
 
     # --- reference 1: the eval path's own load_inline CUDA scorer, called exactly as
@@ -166,14 +166,15 @@ def gate_scorer(tag, q_probs, kb_kv, vn_kv, kb_q, vn_q, allowed_bht, seq_len_t, 
         allowed_bht.unsqueeze(2).contiguous(),
         vn_q.float().unsqueeze(2).contiguous(),
     ).squeeze(2)
-    # The production scorer stores fp16; the CUDA reference computes fp32 and is rounded once
-    # (the same round-to-nearest the kernel applies) before the bit comparison.
-    eq_c, d_c = _bitwise_equal(scores_tri[..., :T_true], scores_cuda[..., :T_true].half())
+    # The CUDA reference computes fp32; cast to the stored dtype (a no-op when it is fp32,
+    # the kernel's own single rounding when it is fp16) before the bit comparison.
+    eq_c, d_c = _bitwise_equal(scores_tri[..., :T_true],
+                               scores_cuda[..., :T_true].to(scores_tri.dtype))
 
     # --- reference 2: the same kernel on an EXACT-width copy of the same data.
     kb_x = kb_kv[..., :T_true].contiguous()
     vn_x = vn_kv[..., :T_true].contiguous()
-    scores_exact = torch.empty((B, H, T_true), device=dev, dtype=torch.float16)
+    scores_exact = torch.empty((B, H, T_true), device=dev, dtype=port.scores_dtype())
     port.soft_hash_score_rt(qp, kb_x, vn_x, seq_len_t, scores_exact)
     eq_g, d_g = _bitwise_equal(scores_tri[..., :T_true], scores_exact)
 

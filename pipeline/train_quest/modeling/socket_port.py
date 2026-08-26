@@ -133,8 +133,13 @@ def _sparse():
 # GQA group size works; passing per-query-head buckets (Hkv == H, rep == 1) is also valid and
 # simply shares nothing.
 # ---------------------------------------------------------------------------
+def scores_dtype():
+    """The score-buffer dtype the shared scorer entry point expects."""
+    return _sparse()._SCORES_DTYPE
+
+
 def soft_hash_score_rt(q_probs, key_buckets, v_norm, seq_len_t, out):
-    """Score [B,H,T] into `out` (fp16). seq_len_t is an int32 scalar tensor on device.
+    """Score [B,H,T] into `out` (scores_dtype()). seq_len_t is an int32 scalar on device.
 
     Dispatches through sparse.py's soft_hash_score_auto, the one scorer entry point both
     stacks share, so the transport choice (packed CUDA vs Triton) is identical in the

@@ -43,6 +43,10 @@ from soft_hash_collision_loader import load_soft_hash_collision  # noqa: E402
 dev = "cuda"
 torch.manual_seed(0)
 
+# the score-buffer dtype the shared scorer entry point expects (fp32 unless SOCKET_SCORES_FP16=1)
+SD = socket_port._sparse()._SCORES_DTYPE
+SD_BITS = torch.int16 if SD == torch.float16 else torch.int32
+
 B, H, HKV, L, R = 1, 8, 2, 10, 256
 T = 4096
 SEQ_LEN = 3500          # < T, so the tail is unfilled cache and must score -inf / drop to -1
@@ -90,7 +94,7 @@ def cuda_scores(q_probs, kb_q, vn_q, allowed):
 
 def t1_scorer(f):
     kb_kv, vn_kv, kb_q, vn_q, q_probs, allowed, seq_len_t = f
-    tri = torch.empty((B, H, T), device=dev, dtype=torch.float16)
+    tri = torch.empty((B, H, T), device=dev, dtype=SD)
     socket_port.soft_hash_score_rt(q_probs.contiguous(), kb_kv.contiguous(),
                                    vn_kv.contiguous(), seq_len_t, tri)
     cud = cuda_scores(q_probs, kb_q, vn_q, allowed)
@@ -98,10 +102,10 @@ def t1_scorer(f):
     # Compare only t < SEQ_LEN. The two arms deliberately differ OUTSIDE it: the Triton kernel
     # writes -inf (so the select drops those columns), while the CUDA kernel leaves the
     # `allowed`-masked columns at the zeros its wrapper allocated. Both are "never selected",
-    # but they are not the same bits. The production scorer stores fp16, so the fp32 reference
-    # is rounded once (the same round-to-nearest the kernel applies) before comparing.
-    a, b = tri[..., :SEQ_LEN], cud[..., :SEQ_LEN].half()
-    check("T1 scorer bitwise-equal to the CUDA scorer (rounded to fp16) on t < seq_len",
+    # but they are not the same bits. The fp32 reference is cast to the stored dtype (a
+    # no-op when fp32, the kernel's own single rounding when fp16) before comparing.
+    a, b = tri[..., :SEQ_LEN], cud[..., :SEQ_LEN].to(SD)
+    check("T1 scorer bitwise-equal to the CUDA scorer (in the stored dtype) on t < seq_len",
           torch.equal(a, b),
           f"max|diff| {(a.float() - b.float()).abs().max().item():.3e}")
     check("T1 scorer writes -inf for t >= seq_len (so select cannot pick unfilled columns)",
@@ -110,7 +114,7 @@ def t1_scorer(f):
     # expansion (Hkv == H, rep == 1, nothing shared) must give the same scores as feeding it
     # the Hkv unique rows. Two heads in one group share a bucket row but have DIFFERENT
     # q_probs, so their SCORES are not equal -- that is not the claim being made here.
-    tri_q = torch.empty((B, H, T), device=dev, dtype=torch.float16)
+    tri_q = torch.empty((B, H, T), device=dev, dtype=SD)
     socket_port.soft_hash_score_rt(q_probs.contiguous(), kb_q.contiguous(),
                                    vn_q.contiguous(), seq_len_t, tri_q)
     # Diff reported over t < seq_len only: past it both are -inf and (-inf)-(-inf) is nan,
@@ -125,7 +129,8 @@ def t1_scorer(f):
     R2 = 1024
     kb2 = torch.randint(0, R2, (B, HKV, L, T), device=dev, dtype=torch.int16)
     q2 = torch.softmax(torch.randn(B, H, L, R2, device=dev, dtype=torch.float32), -1).half()
-    auto_out = torch.empty((B, H, T), device=dev, dtype=torch.float16)
+    # (fp16 q_probs so the packed transport is eligible regardless of the buffer dtype)
+    auto_out = torch.empty((B, H, T), device=dev, dtype=SD)
     socket_port.soft_hash_score_rt(q2.contiguous(), kb2.contiguous(),
                                    vn_kv.contiguous(), seq_len_t, auto_out)
     tri_out = torch.empty_like(auto_out)
@@ -289,18 +294,18 @@ def t6_padded_capacity(f):
 
     exact_kb = kb_kv[..., :T_true].contiguous()
     exact_vn = vn_kv[..., :T_true].contiguous()
-    s_exact = torch.empty((B, H, T_true), device=dev, dtype=torch.float16)
+    s_exact = torch.empty((B, H, T_true), device=dev, dtype=SD)
     socket_port.soft_hash_score_rt(q_probs.contiguous(), exact_kb, exact_vn, seq_len_t, s_exact)
 
     pad_kb = torch.zeros((B, HKV, L, T_cap), device=dev, dtype=torch.int16)
     pad_kb[..., :T_true] = exact_kb
     pad_vn = torch.zeros((B, HKV, T_cap), device=dev, dtype=torch.float16)
     pad_vn[..., :T_true] = exact_vn
-    s_pad = torch.empty((B, H, T_cap), device=dev, dtype=torch.float16)
+    s_pad = torch.empty((B, H, T_cap), device=dev, dtype=SD)
     socket_port.soft_hash_score_rt(q_probs.contiguous(), pad_kb, pad_vn, seq_len_t, s_pad)
 
     check("T6 padded scores are BITWISE equal to exact-width scores over the live columns",
-          torch.equal(s_pad[..., :T_true].view(torch.int16), s_exact.view(torch.int16)))
+          torch.equal(s_pad[..., :T_true].view(SD_BITS), s_exact.view(SD_BITS)))
     check("T6 every padded score column is -inf",
           bool((s_pad[..., T_true:] == -float("inf")).all()))
     check("T6 the padded columns hold in-range buckets",

@@ -2,8 +2,9 @@
 // HEAD-PACKED soft-hash scorer (socket::soft_hash_score_packed).
 //
 // Same score as socket::soft_hash_score -- for query head h = kv*rep + j:
-//     out[b,h,t] = fp16( (sum_l fp32(q_probs[b,h,l, buckets[b,kv,l,t]])) * fp32(||v_t||) )
-// accumulated in fp32 in ascending l, -inf past seq_len -- but q_probs arrives PACKED as
+//     out[b,h,t] = out_dtype( (sum_l fp32(q_probs[b,h,l, buckets[b,kv,l,t]])) * fp32(||v_t||) )
+// accumulated in fp32 in ascending l, stored in the buffer's dtype (one round-to-nearest
+// conversion when it is fp16), -inf past seq_len -- but q_probs arrives PACKED as
 // [B,Hkv,L,R,4] with the GQA group's four query heads interleaved in the last dimension, so
 // one aligned 8-byte load serves the whole group where the unpacked kernel issues four
 // independent 2-byte gathers into four separate rows. At large R the unpacked gathers touch
@@ -11,8 +12,8 @@
 // removes both effects. The caller selects this kernel only for R large enough to benefit.
 //
 // The transport is the only change: operand bits, fp32 add order, the final multiply, the
-// fp16 rounding of the result and the -inf tail are identical to the Triton scorer, so the
-// two kernels are bit-equal.
+// store rounding and the -inf tail are identical to the Triton scorer, so the two kernels
+// are bit-equal.
 //
 // Caller invariant (same as the Triton scorer): every bucket column in [0,T) holds a value
 // in [0,R), including zero-filled padding columns.
@@ -34,13 +35,20 @@ template <> __device__ __forceinline__ float to_f32<__half>(__half v) {
     return __half2float(v);
 }
 
-template <typename TQ, typename TV>
+template <typename TO>
+__device__ __forceinline__ TO from_f32(float v);
+template <> __device__ __forceinline__ float from_f32<float>(float v) { return v; }
+template <> __device__ __forceinline__ __half from_f32<__half>(float v) {
+    return __float2half_rn(v);
+}
+
+template <typename TQ, typename TV, typename TO>
 __global__ void rowpack_scorer_kernel(
     const TQ* __restrict__ qp,              // [B, HKV, L, R, 4] packed
     const int16_t* __restrict__ kb,         // [B, HKV, L, T] int16
     const TV* __restrict__ vn,              // [B, HKV, T]
     const int* __restrict__ seqlen,         // device scalar
-    __half* __restrict__ out,               // [B, HKV*4, T] fp16
+    TO* __restrict__ out,                   // [B, HKV*4, T] fp32 or fp16
     int L, int R, int T, int HKV)
 {
     const int kv = blockIdx.y;
@@ -63,12 +71,12 @@ __global__ void rowpack_scorer_kernel(
     }
     const float v = to_f32<TV>(vn[((size_t)b * HKV + kv) * T + t]);
     const bool keep = t < *seqlen;
-    const __half ninf = __ushort_as_half(0xFC00u);   // fp16 -inf
-    __half* ob = out + (((size_t)b * HKV + kv) * 4) * T + t;
-    ob[0]             = keep ? __float2half_rn(a0 * v) : ninf;
-    ob[(size_t)T]     = keep ? __float2half_rn(a1 * v) : ninf;
-    ob[2 * (size_t)T] = keep ? __float2half_rn(a2 * v) : ninf;
-    ob[3 * (size_t)T] = keep ? __float2half_rn(a3 * v) : ninf;
+    const TO ninf = from_f32<TO>(-__int_as_float(0x7f800000));
+    TO* ob = out + (((size_t)b * HKV + kv) * 4) * T + t;
+    ob[0]             = keep ? from_f32<TO>(a0 * v) : ninf;
+    ob[(size_t)T]     = keep ? from_f32<TO>(a1 * v) : ninf;
+    ob[2 * (size_t)T] = keep ? from_f32<TO>(a2 * v) : ninf;
+    ob[3 * (size_t)T] = keep ? from_f32<TO>(a3 * v) : ninf;
 }
 
 void soft_hash_score_packed(torch::Tensor qp_pack, torch::Tensor kb, torch::Tensor vn,
@@ -78,7 +86,8 @@ void soft_hash_score_packed(torch::Tensor qp_pack, torch::Tensor kb, torch::Tens
                 && out.is_contiguous(), "contiguous required");
     TORCH_CHECK(qp_pack.dim() == 5 && qp_pack.size(4) == 4, "qp_pack must be [B,HKV,L,R,4]");
     TORCH_CHECK(kb.scalar_type() == torch::kInt16, "buckets must be int16");
-    TORCH_CHECK(out.scalar_type() == torch::kHalf, "out must be fp16");
+    TORCH_CHECK(out.scalar_type() == torch::kHalf || out.scalar_type() == torch::kFloat,
+                "out must be fp16 or fp32");
     const int B = kb.size(0), HKV = kb.size(1), L = kb.size(2), T = kb.size(3);
     const int R = qp_pack.size(3);
     TORCH_CHECK(qp_pack.size(0) == B && qp_pack.size(1) == HKV && qp_pack.size(2) == L);
@@ -92,15 +101,23 @@ void soft_hash_score_packed(torch::Tensor qp_pack, torch::Tensor kb, torch::Tens
     const bool v_fp = vn.scalar_type() == torch::kHalf;
     TORCH_CHECK(q_bf || q_fp, "packed scorer supports bf16/fp16 q_probs only");
     TORCH_CHECK(v_bf || v_fp, "packed scorer supports bf16/fp16 v_norm only");
-#define RP_LAUNCH(TQ, TV)                                                        \
-    rowpack_scorer_kernel<TQ, TV><<<grid, block, 0, st>>>(                        \
+#define RP_LAUNCH(TQ, TV, TO)                                                    \
+    rowpack_scorer_kernel<TQ, TV, TO><<<grid, block, 0, st>>>(                    \
         reinterpret_cast<const TQ*>(qp_pack.data_ptr()), kb.data_ptr<int16_t>(),  \
         reinterpret_cast<const TV*>(vn.data_ptr()), seqlen.data_ptr<int>(),       \
-        reinterpret_cast<__half*>(out.data_ptr()), L, R, T, HKV)
-    if (q_bf && v_bf)      RP_LAUNCH(__nv_bfloat16, __nv_bfloat16);
-    else if (q_bf && v_fp) RP_LAUNCH(__nv_bfloat16, __half);
-    else if (q_fp && v_bf) RP_LAUNCH(__half, __nv_bfloat16);
-    else                   RP_LAUNCH(__half, __half);
+        reinterpret_cast<TO*>(out.data_ptr()), L, R, T, HKV)
+    const bool o_fp16 = out.scalar_type() == torch::kHalf;
+    if (o_fp16) {
+        if (q_bf && v_bf)      RP_LAUNCH(__nv_bfloat16, __nv_bfloat16, __half);
+        else if (q_bf && v_fp) RP_LAUNCH(__nv_bfloat16, __half, __half);
+        else if (q_fp && v_bf) RP_LAUNCH(__half, __nv_bfloat16, __half);
+        else                   RP_LAUNCH(__half, __half, __half);
+    } else {
+        if (q_bf && v_bf)      RP_LAUNCH(__nv_bfloat16, __nv_bfloat16, float);
+        else if (q_bf && v_fp) RP_LAUNCH(__nv_bfloat16, __half, float);
+        else if (q_fp && v_bf) RP_LAUNCH(__half, __nv_bfloat16, float);
+        else                   RP_LAUNCH(__half, __half, float);
+    }
 #undef RP_LAUNCH
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

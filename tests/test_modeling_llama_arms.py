@@ -145,10 +145,10 @@ def main():
           f"legacy={old['layout']} default={new['layout']}")
 
     so, sn = old["scores"], new["scores"]
-    # The default arm stores fp16 scores; the legacy CUDA arm keeps fp32. Rounding the fp32
-    # reference once (the same round-to-nearest the kernel applies) restores bit equality.
+    # The legacy CUDA arm keeps fp32 scores; cast to the default arm's stored dtype (a
+    # no-op when fp32, the kernel's own single rounding when fp16) restores bit equality.
     check("E3 scores bitwise-equal on t < seq_len (the layout contract holds on real shapes)",
-          torch.equal(so[..., :SEQ_LEN].half(), sn[..., :SEQ_LEN].half()),
+          torch.equal(so[..., :SEQ_LEN].to(sn.dtype), sn[..., :SEQ_LEN]),
           f"max|diff| {(so[..., :SEQ_LEN].float() - sn[..., :SEQ_LEN].float()).abs().max().item():.3e}")
 
     lo, ln = old["list"], new["list"]
@@ -156,21 +156,22 @@ def main():
     check("E5 same sparse_len", torch.equal(old["len"], new["len"]))
 
     # Compare the selected SCORE MULTISETS, not the index sets: the legacy arm selects by
-    # fp32 topk while the default arm selects exactly over the fp16 scores, and rounding is
-    # monotone, so the legacy selection is one valid fp16 top-M among possibly many tie
-    # choices. Slot order is also unspecified (topk sorts, radix emits in grid order).
+    # fp32 topk while the default arm selects exactly over the stored scores, and rounding
+    # is monotone, so the legacy selection is one valid top-M in the stored dtype among
+    # possibly many tie choices. Slot order is also unspecified (topk sorts, radix in grid
+    # order).
     same = True
     for b in range(lo.shape[0]):
         for h in range(lo.shape[1]):
             ia = lo[b, h][lo[b, h] >= 0].long()
             ic = ln[b, h][ln[b, h] >= 0].long()
-            va = so[b, h].half()[ia].sort().values
-            vc = sn[b, h].half()[ic].sort().values
+            va = so[b, h].to(sn.dtype)[ia].sort().values
+            vc = sn[b, h][ic].sort().values
             if ia.numel() != ic.numel() or not torch.equal(va, vc):
                 same = False
                 print(f"       (b={b},h={h}) counts {ia.numel()} vs {ic.numel()}, "
                       f"multiset equal={torch.equal(va, vc) if ia.numel() == ic.numel() else 'n/a'}")
-    check("E6 the two arms select the same fp16 score multiset", same)
+    check("E6 the two arms select the same stored-dtype score multiset", same)
 
     check("E7 nothing past seq_len was selected", bool((ln[ln >= 0] < SEQ_LEN).all()))
 

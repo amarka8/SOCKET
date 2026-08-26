@@ -37,7 +37,8 @@ def _get_soft_hash_ext():
 # array, materialises no intermediate buffer, and resolves the exact top-M threshold in
 # seven kernels over four streaming passes.
 #
-# EXACTNESS. Scores are fp16; each is promoted exactly to fp32 on load and compared through
+# EXACTNESS. Scores are fp32 or fp16; an fp16 score is promoted exactly to fp32 on load, and
+# every value is compared through
 # key(f) = (bits(f) & 0x80000000) ? ~bits(f) : (bits(f) | 0x80000000), strictly monotone over
 # ALL floats, so the -inf written into unfilled cache columns sorts last exactly as it does
 # under topk. d = 0xFFFFFFFF - key is split MSB-first into 11/11/10 bits; digit 3 has UNIT
@@ -145,6 +146,12 @@ soft_hash_score_packed_op = _soft_hash_score_packed
 # defeats the caches, so it is enabled by R (a static shape-derived int, stable per run).
 _SCORER_PACKED_MIN_R = 1024
 
+# Score-buffer dtype. Every scorer arm accumulates in fp32 and stores in the buffer's dtype
+# (one round-to-nearest conversion when it is fp16); the radix select is exact over either.
+# This is an allocation-dtype choice, never a tl.constexpr, so the env read is cache-safe.
+_SCORES_DTYPE = (torch.float16
+                 if os.environ.get("SOCKET_SCORES_FP16", "0") == "1" else torch.float32)
+
 
 def soft_hash_score_auto(q_probs, key_buckets, v_norm_bht, seq_len_t, scores):
     """Run the soft-hash scorer, choosing the transport by geometry.
@@ -154,9 +161,9 @@ def soft_hash_score_auto(q_probs, key_buckets, v_norm_bht, seq_len_t, scores):
     otherwise. This is the ONE scorer entry point both the GPT-FAST decode path and the
     HF eval path call, so the two pipelines always run the same kernels.
     """
-    assert scores.dtype == torch.float16, (
-        f"scores must be fp16 (got {scores.dtype}); every scorer arm rounds its fp32 "
-        f"accumulator once on store, and a wider buffer would hide that rounding")
+    assert scores.dtype == _SCORES_DTYPE, (
+        f"scores must be {_SCORES_DTYPE} (got {scores.dtype}); the buffer dtype selects the "
+        f"store rounding, so a mismatched buffer would change the selection contract")
     B, H, L, R = q_probs.shape
     Hkv = key_buckets.shape[1]
     rep = H // Hkv
@@ -247,7 +254,7 @@ def _fwd_kernel_soft_hash_score(
     KeyBuckets,      # [B,Hkv,L,T]      int16
     VNorm,           # [B,Hkv,T]        (bf16 / fp16 / fp32)
     SeqLenPtr,       # int32 scalar on device
-    Out,             # [B,H,T]          fp16 (written)
+    Out,             # [B,H,T]          fp32|fp16 (written)
     H: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, R: tl.constexpr,
     T: tl.constexpr, BLOCK_T: tl.constexpr,
 ):
@@ -284,7 +291,8 @@ def _fwd_kernel_soft_hash_score(
     # Unfilled cache columns (t >= seq_len) get -inf: `allowed` IS `t < seq_len` (model.py
     # builds it as arange(maxlen) <= pos.max(), with seq_len_t = pos.max()+1).
     out = tl.where(keep, out, -float("inf"))
-    tl.store(Out + (b * H + h) * T + offs_t, out.to(tl.float16), mask=mask_t)
+    # the store casts to Out's element type, so the buffer dtype selects the rounding
+    tl.store(Out + (b * H + h) * T + offs_t, out, mask=mask_t)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +324,7 @@ def _fwd_kernel_soft_hash_score_gqa4(
     KeyBuckets,      # [B,Hkv,L,T]      int16
     VNorm,           # [B,Hkv,T]        (bf16 / fp16 / fp32)
     SeqLenPtr,       # int32 scalar on device
-    Out,             # [B,H,T]          fp16 (written)
+    Out,             # [B,H,T]          fp32|fp16 (written)
     H: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, R: tl.constexpr,
     T: tl.constexpr, BLOCK_T: tl.constexpr,
 ):
@@ -351,10 +359,11 @@ def _fwd_kernel_soft_hash_score_gqa4(
 
     v = tl.load(VNorm + (b * HKV + kv) * T + offs_t, mask=mask_t, other=0.0).to(tl.float32)
     ob = Out + (b * H + kv * 4) * T + offs_t
-    tl.store(ob, tl.where(keep, a0 * v, -float("inf")).to(tl.float16), mask=mask_t)
-    tl.store(ob + T, tl.where(keep, a1 * v, -float("inf")).to(tl.float16), mask=mask_t)
-    tl.store(ob + 2 * T, tl.where(keep, a2 * v, -float("inf")).to(tl.float16), mask=mask_t)
-    tl.store(ob + 3 * T, tl.where(keep, a3 * v, -float("inf")).to(tl.float16), mask=mask_t)
+    # the stores cast to Out's element type, so the buffer dtype selects the rounding
+    tl.store(ob, tl.where(keep, a0 * v, -float("inf")), mask=mask_t)
+    tl.store(ob + T, tl.where(keep, a1 * v, -float("inf")), mask=mask_t)
+    tl.store(ob + 2 * T, tl.where(keep, a2 * v, -float("inf")), mask=mask_t)
+    tl.store(ob + 3 * T, tl.where(keep, a3 * v, -float("inf")), mask=mask_t)
 
 
 # LAUNCH CONFIG: HARDCODED LITERALS, deliberately not env-readable. These become tl.constexpr
@@ -392,7 +401,7 @@ def _soft_hash_score_impl(
     key_buckets: torch.Tensor,  # [B,Hkv,L,T] int16
     v_norm: torch.Tensor,       # [B,Hkv,T]
     seq_len_t: torch.Tensor,    # int32 scalar on device
-    out: torch.Tensor,          # [B,H,T] fp16 (written)
+    out: torch.Tensor,          # [B,H,T] fp32|fp16 (written)
 ) -> None:
     B, H, L, R = q_probs.shape
     HKV, T = key_buckets.shape[1], key_buckets.shape[3]
@@ -604,9 +613,9 @@ def build_sparse_list_decode(
         if key_buckets.dtype != torch.int16:
             key_buckets = key_buckets.to(torch.int16)
 
-        # Scores are fp16: fp32-accumulated by every scorer arm and rounded once on store.
-        # The select is exact over these fp16 values (see the radix comment above).
-        scores = torch.empty((B, H, maxlen), device=device, dtype=torch.float16)
+        # Scores are fp32-accumulated by every scorer arm and stored in _SCORES_DTYPE
+        # (one rounding when fp16). The select is exact over the stored values.
+        scores = torch.empty((B, H, maxlen), device=device, dtype=_SCORES_DTYPE)
         soft_hash_score_auto(q_probs, key_buckets, v_norm_bht, seq_len_t, scores)
 
         # Exact radix threshold select over the fp16 scores; see the module-level comment
