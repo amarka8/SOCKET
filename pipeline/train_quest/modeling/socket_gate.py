@@ -2,7 +2,7 @@
 
 Everything here runs on tensors the model actually produced at decode step k of a real
 LongBench prompt -- never on torch.randn stand-ins.  Synthetic tensors have already produced
-a wrong conclusion in this project (a scorer microbenchmark), and for the SELECT gate they
+a wrong conclusion (a scorer microbenchmark), and for the SELECT gate they
 would be actively misleading: whether the top-M boundary score is TIED depends entirely on the
 real score distribution.
 
@@ -23,7 +23,7 @@ Gates, in the order the task asks for them:
   G3 LIVENESS protos_T in {-1,+1}; planes std ~1; q_probs deviation from uniform 1/R; and the
               decisive one -- the top-256 overlap between two query heads that SHARE a KV head
               (identical buckets, identical ||v||, so any divergence is the QUERY talking).
-              Measured ~30% on this path before the port.  Toward 100% means dead.
+              Overlap trending toward 100% means the query has stopped mattering.
 
   G4 FINITE   No NaN / no +-inf in the attention output, and no -1 index escaping into an
               out-of-bounds gather (the two bugs guarded in 9dc668b).
@@ -102,14 +102,19 @@ def state():
     return _STATE
 
 
-def _bitwise_equal(a: torch.Tensor, b: torch.Tensor):
-    """Exact bit comparison of two fp32 tensors, -inf included.
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    return t.contiguous().view(torch.int16 if t.dtype == torch.float16 else torch.int32)
 
-    `a == b` is False for NaN and True for -inf == -inf, so comparing the raw int32 views
+
+def _bitwise_equal(a: torch.Tensor, b: torch.Tensor):
+    """Exact bit comparison of two float tensors of the same dtype, -inf included.
+
+    `a == b` is False for NaN and True for -inf == -inf, so comparing the raw integer views
     is the only way to say "bitwise".  Returns (all_equal, max_abs_diff_over_finite).
     """
-    ai = a.contiguous().view(torch.int32)
-    bi = b.contiguous().view(torch.int32)
+    assert a.dtype == b.dtype, (a.dtype, b.dtype)
+    ai = _bits(a)
+    bi = _bits(b)
     eq = bool(torch.equal(ai, bi))
     finite = torch.isfinite(a) & torch.isfinite(b)
     if finite.any():
@@ -130,8 +135,7 @@ def gate_scorer(tag, q_probs, kb_kv, vn_kv, kb_q, vn_q, allowed_bht, seq_len_t, 
     Two things have to hold, and they are separate claims:
 
       1. The Triton scorer agrees with the CUDA one over the live columns.  This is the
-         cross-implementation check; the CUDA scorer is the reference that produced the
-         published accuracy numbers.
+         cross-implementation check against the older reference scorer.
       2. Running it on a padded buffer changes nothing over the live columns.  That is the
          claim the padding rests on: the -inf write past seq_len is what makes the extra
          columns inert, and if it ever stopped doing so the top-M select would start choosing
@@ -148,7 +152,7 @@ def gate_scorer(tag, q_probs, kb_kv, vn_kv, kb_q, vn_q, allowed_bht, seq_len_t, 
     dev = q_probs.device
 
     qp = q_probs.contiguous()
-    scores_tri = torch.empty((B, H, T), device=dev, dtype=torch.float32)
+    scores_tri = torch.empty((B, H, T), device=dev, dtype=torch.float16)
     port.soft_hash_score_rt(qp, kb_kv.contiguous(), vn_kv.contiguous(), seq_len_t, scores_tri)
 
     # --- reference 1: the eval path's own load_inline CUDA scorer, called exactly as
@@ -162,12 +166,14 @@ def gate_scorer(tag, q_probs, kb_kv, vn_kv, kb_q, vn_q, allowed_bht, seq_len_t, 
         allowed_bht.unsqueeze(2).contiguous(),
         vn_q.float().unsqueeze(2).contiguous(),
     ).squeeze(2)
-    eq_c, d_c = _bitwise_equal(scores_tri[..., :T_true], scores_cuda[..., :T_true])
+    # The production scorer stores fp16; the CUDA reference computes fp32 and is rounded once
+    # (the same round-to-nearest the kernel applies) before the bit comparison.
+    eq_c, d_c = _bitwise_equal(scores_tri[..., :T_true], scores_cuda[..., :T_true].half())
 
     # --- reference 2: the same kernel on an EXACT-width copy of the same data.
     kb_x = kb_kv[..., :T_true].contiguous()
     vn_x = vn_kv[..., :T_true].contiguous()
-    scores_exact = torch.empty((B, H, T_true), device=dev, dtype=torch.float32)
+    scores_exact = torch.empty((B, H, T_true), device=dev, dtype=torch.float16)
     port.soft_hash_score_rt(qp, kb_x, vn_x, seq_len_t, scores_exact)
     eq_g, d_g = _bitwise_equal(scores_tri[..., :T_true], scores_exact)
 
@@ -202,8 +208,8 @@ def gate_select(tag, scores, M, port):
     s_radix = torch.gather(scores, -1, idx_radix)
     # Multiset equality: sort both selected score rows descending and compare BITWISE.
     ms_ok = torch.equal(
-        torch.sort(s_topk, dim=-1, descending=True).values.contiguous().view(torch.int32),
-        torch.sort(s_radix, dim=-1, descending=True).values.contiguous().view(torch.int32),
+        _bits(torch.sort(s_topk, dim=-1, descending=True).values),
+        _bits(torch.sort(s_radix, dim=-1, descending=True).values),
     )
     idx_same = torch.equal(torch.sort(idx_topk, dim=-1).values,
                            torch.sort(idx_radix, dim=-1).values)
@@ -231,8 +237,8 @@ def gate_head_overlap(tag, scores, rep, k=256):
     """G3. Two query heads sharing a KV head see IDENTICAL buckets and identical ||v||.
 
     Their scores differ only through q_probs, so the overlap of their top-k selections is a
-    direct read of how much the QUERY influences selection.  ~30% here before the port; a
-    jump toward 100% means the soft-hash has gone inert and no accuracy number means anything.
+    direct read of how much the QUERY influences selection.  A jump toward 100% means the
+    soft-hash has gone inert and no accuracy number means anything.
     """
     st = state()
     B, H, T = scores.shape

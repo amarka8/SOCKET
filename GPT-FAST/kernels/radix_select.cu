@@ -9,7 +9,7 @@
 //     {t : score_t > theta}  U  {exactly (M - #above) arbitrary t with score_t == theta}
 // where theta is the EXACT M-th largest score.  So the selected SCORE MULTISET equals
 // torch.topk's.  (Index sets cannot be required to match: topk's own tie-break is
-// arbitrary and the " hello"xN prompt has 1174-1572 tokens tied at the threshold.)
+// arbitrary, and repetitive prompts tie many tokens at the threshold.)
 //
 // ORDER KEY.  Floats are compared through the standard monotone uint32 transform
 //     key(f) = (bits(f) & 0x80000000) ? ~bits(f) : (bits(f) | 0x80000000)
@@ -44,10 +44,8 @@
 // selected and the later passes are skipped by a device-side flag (uniform branch -> the
 // blocks retire immediately).
 //
-// Histogram accumulation and output append are WARP-AGGREGATED (__match_any_sync /
-// __activemask): the " hello"xN prompt has only 36-56 distinct scores over 143362 tokens
-// (and NaN-poisoned layers exactly one), so un-aggregated same-address atomics would
-// serialise 4.6M times per layer.
+// The output append is WARP-AGGREGATED (__match_any_sync / __activemask): on inputs with
+// few distinct scores, un-aggregated same-address atomics would serialise per element.
 //
 // Every launch uses at::cuda::getCurrentCUDAStream() and is error-checked -- mandatory, not
 // stylistic: a launch on the legacy default stream is not captured as a CUDA-graph node and
@@ -56,6 +54,7 @@
 // ---------------------------------------------------------------------------
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -91,8 +90,7 @@
 //   resolved at digit2: A = (b1<<21)+(b2<<10),            W = 1<<10
 //   resolved at digit3: A = (b1<<21)+(b2<<10)+b3,         W = 1
 // Expressing all three cases in the same (A, W) form is what lets ONE final pass do all the
-// emitting: the digit-2 and digit-3 histogram passes then carry no output path at all, which
-// is worth 12 us/layer (their warp_append round-trips were on the critical path).
+// emitting: the digit-2 and digit-3 histogram passes then carry no output path at all.
 #define C_A 12
 #define C_W 13
 
@@ -102,19 +100,22 @@ __device__ __forceinline__ unsigned f2key(float f) {
 }
 __device__ __forceinline__ unsigned f2d(float f) { return 0xFFFFFFFFu - f2key(f); }
 
+// Scores may be fp16 or fp32; either way the ordering key is taken on the exact fp32
+// promotion, which is monotone in the stored value.
+template <typename ST> __device__ __forceinline__ float sc_f32(ST v);
+template <> __device__ __forceinline__ float sc_f32<float>(float v) { return v; }
+template <> __device__ __forceinline__ float sc_f32<__half>(__half v) { return __half2float(v); }
+
 // HMODE selects the histogram accumulation strategy. 1 = PRODUCTION.
 //   0 warp-aggregated (__match_any_sync) shared atomicAdd
 //   1 plain per-lane shared atomicAdd                       <-- production
 //   2 aggregation arithmetic with a plain shared STORE (diagnostic; wrong histogram)
 //   3 no histogram at all (diagnostic; isolates the streaming read)
 //
-// This is the opposite of the textbook advice. When the scores concentrate in few distinct
-// bins -- maximal same-address conflict -- plain per-lane atomicAdd still beats warp
-// aggregation, because __match_any_sync (MATCH.ANY.U32) is the expensive instruction rather
-// than the atomic: replacing only the atomic with a store (HMODE 2) is no cheaper. Shared-
-// atomic conflict replays are inexpensive on Hopper. Replicating the shared histogram to cut
-// cross-warp contention is a small loss at every replication factor, which confirms the
-// atomics were never the bottleneck.
+// Even when the scores concentrate in few distinct bins -- maximal same-address conflict --
+// plain per-lane atomicAdd is used: __match_any_sync (MATCH.ANY.U32) is the expensive
+// instruction rather than the atomic, and shared-atomic conflict replays are inexpensive
+// on Hopper.
 template <int HMODE>
 __device__ __forceinline__ void hist_add(unsigned* s_cnt, int bin) {
     if (HMODE == 3) return;
@@ -142,10 +143,11 @@ __device__ __forceinline__ unsigned warp_append(unsigned* ctr) {
 
 // CALIBRATION ONLY: the streaming read + key transform with no histogram, so the
 // microbenchmark can separate "how fast can this grid read the array" from the atomics.
-__global__ void rs_readonly(const float* __restrict__ scores, int T, int NB,
+template <typename ST>
+__global__ void rs_readonly(const ST* __restrict__ scores, int T, int NB,
                             unsigned* __restrict__ h1) {
     const int bh = blockIdx.x, blk = blockIdx.y, BH = gridDim.x;
-    const float* sc = scores + (long)bh * (long)T;
+    const ST* sc = scores + (long)bh * (long)T;
     const int per = (T + NB - 1) / NB;
     const int t0 = blk * per, t1 = min(T, t0 + per);
     const int stride = blockDim.x;
@@ -154,11 +156,11 @@ __global__ void rs_readonly(const float* __restrict__ scores, int T, int NB,
     for (; t + (UNROLL - 1) * stride < t1; t += UNROLL * stride) {
         float v[UNROLL];
 #pragma unroll
-        for (int u = 0; u < UNROLL; ++u) v[u] = sc[t + u * stride];
+        for (int u = 0; u < UNROLL; ++u) v[u] = sc_f32<ST>(sc[t + u * stride]);
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) acc += f2d(v[u]) >> SH1;
     }
-    for (; t < t1; t += stride) acc += f2d(sc[t]) >> SH1;
+    for (; t < t1; t += stride) acc += f2d(sc_f32<ST>(sc[t])) >> SH1;
     if (acc == 0xDEADBEEFu) h1[((long)blk * BH + bh) * NBINS] = acc;   // never taken
 }
 
@@ -167,15 +169,15 @@ __global__ void rs_readonly(const float* __restrict__ scores, int T, int NB,
 // grid (B*H, NB) -- blockIdx.x is (b,h) so consecutive blocks share a kv head, which keeps
 // the int16 bucket stream (fused form) L2-resident.
 // ---------------------------------------------------------------------------
-template <int HMODE>
-__global__ __launch_bounds__(1024) void rs_hist1(const float* __restrict__ scores, int T, int NB,
+template <int HMODE, typename ST>
+__global__ __launch_bounds__(1024) void rs_hist1(const ST* __restrict__ scores, int T, int NB,
                          unsigned* __restrict__ h1) {
     __shared__ unsigned s_cnt[NBINS];
     const int bh = blockIdx.x, blk = blockIdx.y, BH = gridDim.x;
     for (int i = threadIdx.x; i < NBINS; i += blockDim.x) s_cnt[i] = 0u;
     __syncthreads();
 
-    const float* sc = scores + (long)bh * (long)T;
+    const ST* sc = scores + (long)bh * (long)T;
     const int per = (T + NB - 1) / NB;
     const int t0 = blk * per, t1 = min(T, t0 + per);
     const int stride = blockDim.x;
@@ -183,11 +185,11 @@ __global__ __launch_bounds__(1024) void rs_hist1(const float* __restrict__ score
     for (; t + (UNROLL - 1) * stride < t1; t += UNROLL * stride) {
         float v[UNROLL];
 #pragma unroll
-        for (int u = 0; u < UNROLL; ++u) v[u] = sc[t + u * stride];
+        for (int u = 0; u < UNROLL; ++u) v[u] = sc_f32<ST>(sc[t + u * stride]);
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) hist_add<HMODE>(s_cnt, (int)(f2d(v[u]) >> SH1));
     }
-    for (; t < t1; t += stride) hist_add<HMODE>(s_cnt, (int)(f2d(sc[t]) >> SH1));
+    for (; t < t1; t += stride) hist_add<HMODE>(s_cnt, (int)(f2d(sc_f32<ST>(sc[t])) >> SH1));
     __syncthreads();
     unsigned* o = h1 + ((long)blk * BH + bh) * NBINS;
     for (int i = threadIdx.x; i < NBINS; i += blockDim.x) o[i] = s_cnt[i];
@@ -349,12 +351,11 @@ __global__ void rs_scan3(const unsigned* __restrict__ h3, int NB, int BH,
 
 // ---------------------------------------------------------------------------
 // EMIT/HISTOGRAM passes. `tie_open` is refreshed ONCE PER UNROLLED GROUP, not per element:
-// it is a volatile (L2) load of the shared tie counter, and on inputs where every token is
-// a tie (the NaN-poisoned 140K layers put all 143362 tokens in one bin) a per-element
-// refresh cost ~12 us/pass in pure L2 traffic.
+// it is a volatile (L2) load of the shared tie counter, and on inputs where most tokens tie
+// a per-element refresh is pure L2 traffic.
 // ---------------------------------------------------------------------------
-template <int HMODE>
-__global__ __launch_bounds__(1024) void rs_pass2(const float* __restrict__ scores, int T, int NB, int Mout,
+template <int HMODE, typename ST>
+__global__ __launch_bounds__(1024) void rs_pass2(const ST* __restrict__ scores, int T, int NB, int Mout,
                          unsigned* __restrict__ ctrl, int* __restrict__ out,
                          unsigned* __restrict__ h2) {
     __shared__ unsigned s_cnt[NBINS];
@@ -366,7 +367,7 @@ __global__ __launch_bounds__(1024) void rs_pass2(const float* __restrict__ score
     for (int i = threadIdx.x; i < NBINS; i += blockDim.x) s_cnt[i] = 0u;
     __syncthreads();
 
-    const float* sc = scores + (long)bh * (long)T;
+    const ST* sc = scores + (long)bh * (long)T;
     const int per = (T + NB - 1) / NB;
     const int t0 = blk * per, t1 = min(T, t0 + per);
     const int stride = blockDim.x;
@@ -378,19 +379,19 @@ __global__ __launch_bounds__(1024) void rs_pass2(const float* __restrict__ score
     for (; t + (UNROLL - 1) * stride < t1; t += UNROLL * stride) {
         unsigned d[UNROLL];
 #pragma unroll
-        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc[t + u * stride]);
+        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc_f32<ST>(sc[t + u * stride]));
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) P2_ONE(d[u]);
     }
-    for (; t < t1; t += stride) P2_ONE(f2d(sc[t]));
+    for (; t < t1; t += stride) P2_ONE(f2d(sc_f32<ST>(sc[t])));
 #undef P2_ONE
     __syncthreads();
     unsigned* o = h2 + ((long)blk * BH + bh) * NBINS;
     for (int i = threadIdx.x; i < NBINS; i += blockDim.x) o[i] = s_cnt[i];
 }
 
-template <int HMODE>
-__global__ __launch_bounds__(1024) void rs_pass3(const float* __restrict__ scores, int T, int NB, int Mout,
+template <int HMODE, typename ST>
+__global__ __launch_bounds__(1024) void rs_pass3(const ST* __restrict__ scores, int T, int NB, int Mout,
                          unsigned* __restrict__ ctrl, int* __restrict__ out,
                          unsigned* __restrict__ h3) {
     __shared__ unsigned s_cnt[NBINS];
@@ -403,7 +404,7 @@ __global__ __launch_bounds__(1024) void rs_pass3(const float* __restrict__ score
     for (int i = threadIdx.x; i < NBINS; i += blockDim.x) s_cnt[i] = 0u;
     __syncthreads();
 
-    const float* sc = scores + (long)bh * (long)T;
+    const ST* sc = scores + (long)bh * (long)T;
     const int per = (T + NB - 1) / NB;
     const int t0 = blk * per, t1 = min(T, t0 + per);
     const int stride = blockDim.x;
@@ -416,11 +417,11 @@ __global__ __launch_bounds__(1024) void rs_pass3(const float* __restrict__ score
     for (; t + (UNROLL - 1) * stride < t1; t += UNROLL * stride) {
         unsigned d[UNROLL];
 #pragma unroll
-        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc[t + u * stride]);
+        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc_f32<ST>(sc[t + u * stride]));
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) P3_ONE(d[u]);
     }
-    for (; t < t1; t += stride) P3_ONE(f2d(sc[t]));
+    for (; t < t1; t += stride) P3_ONE(f2d(sc_f32<ST>(sc[t])));
 #undef P3_ONE
     __syncthreads();
     unsigned* o = h3 + ((long)blk * BH + bh) * NBINS;
@@ -441,8 +442,9 @@ __global__ __launch_bounds__(1024) void rs_pass3(const float* __restrict__ score
 //   iteration). Ties are the first TIENEED in that same fixed order. Reproducible run to run
 //   and identical eager vs CUDA-graph replay. Costs one extra streaming pass over `scores`.
 // ===========================================================================
+template <typename ST>
 __global__ __launch_bounds__(1024) void rs_pass4(
-        const float* __restrict__ scores, int T, int NB, int Mout, int SBUF,
+        const ST* __restrict__ scores, int T, int NB, int Mout, int SBUF,
         unsigned* __restrict__ ctrl, int* __restrict__ out) {
     extern __shared__ int s_buf[];
     __shared__ unsigned s_n;
@@ -453,7 +455,7 @@ __global__ __launch_bounds__(1024) void rs_pass4(
     if (threadIdx.x == 0) s_n = 0u;
     __syncthreads();
 
-    const float* sc = scores + (long)bh * (long)T;
+    const ST* sc = scores + (long)bh * (long)T;
     const int per = (T + NB - 1) / NB;
     const int t0 = blk * per, t1 = min(T, t0 + per);
     const int stride = blockDim.x;
@@ -480,18 +482,18 @@ __global__ __launch_bounds__(1024) void rs_pass4(
     for (; t + (UNROLL - 1) * stride < t1; t += UNROLL * stride) {
         // Probe the tie counter FIRST so its L2 latency overlaps the score loads, and consume
         // it only AFTER this group's appends: making `topen` depend on a volatile load in the
-        // same iteration put a ~400-cycle round trip on the loop's critical path (+9 us/pass).
+        // same iteration puts an L2 round trip on the loop's critical path.
         // One group of staleness costs at most one extra group of bounded appends; the
         // `k < tieneed` guard is what makes the count exact.
         if (topen) tc = *tiectr;
         unsigned d[UNROLL];
 #pragma unroll
-        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc[t + u * stride]);
+        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc_f32<ST>(sc[t + u * stride]));
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) P4_ONE(t + u * stride, d[u], topen);
         if (topen) topen = (tc < tieneed);
     }
-    for (; t < t1; t += stride) P4_ONE(t, f2d(sc[t]), topen && (*tiectr < tieneed));
+    for (; t < t1; t += stride) P4_ONE(t, f2d(sc_f32<ST>(sc[t])), topen && (*tiectr < tieneed));
 #undef P4_ONE
 
     __syncthreads();
@@ -505,7 +507,8 @@ __global__ __launch_bounds__(1024) void rs_pass4(
 }
 
 // ---- deterministic emit, phase A: per-thread and per-block counts -----------------------
-__global__ __launch_bounds__(1024) void rs_count4(const float* __restrict__ scores, int T,
+template <typename ST>
+__global__ __launch_bounds__(1024) void rs_count4(const ST* __restrict__ scores, int T,
                                                   int NB, unsigned* __restrict__ ctrl,
                                                   unsigned* __restrict__ tcnt,
                                                   unsigned* __restrict__ bcnt) {
@@ -513,7 +516,7 @@ __global__ __launch_bounds__(1024) void rs_count4(const float* __restrict__ scor
     const int bh = blockIdx.x, blk = blockIdx.y, BH = gridDim.x, nthr = blockDim.x;
     unsigned* C = ctrl + (long)bh * CTRL_N;
     const unsigned A = C[C_A], W = C[C_W];
-    const float* sc = scores + (long)bh * (long)T;
+    const ST* sc = scores + (long)bh * (long)T;
     const int per = (T + NB - 1) / NB;
     const int t0 = blk * per, t1 = min(T, t0 + per);
     unsigned na = 0u, nt = 0u;
@@ -521,12 +524,12 @@ __global__ __launch_bounds__(1024) void rs_count4(const float* __restrict__ scor
     for (; t + (UNROLL - 1) * nthr < t1; t += UNROLL * nthr) {
         unsigned d[UNROLL];
 #pragma unroll
-        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc[t + u * nthr]);
+        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc_f32<ST>(sc[t + u * nthr]));
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) { if (d[u] < A) ++na; else if (d[u] - A < W) ++nt; }
     }
     for (; t < t1; t += nthr) {
-        unsigned d = f2d(sc[t]);
+        unsigned d = f2d(sc_f32<ST>(sc[t]));
         if (d < A) ++na; else if (d - A < W) ++nt;
     }
     unsigned* tb = tcnt + ((long)blk * BH + bh) * 2 * TCNT_STRIDE;
@@ -564,7 +567,8 @@ __global__ void rs_prefix4(int NB, int BH, unsigned* __restrict__ bcnt) {
 }
 
 // ---- deterministic emit, phase C -------------------------------------------------------
-__global__ __launch_bounds__(1024) void rs_emit4(const float* __restrict__ scores, int T,
+template <typename ST>
+__global__ __launch_bounds__(1024) void rs_emit4(const ST* __restrict__ scores, int T,
                                                  int NB, int Mout, unsigned* __restrict__ ctrl,
                                                  const unsigned* __restrict__ tcnt,
                                                  const unsigned* __restrict__ bcnt,
@@ -591,7 +595,7 @@ __global__ __launch_bounds__(1024) void rs_emit4(const float* __restrict__ score
     unsigned ka = bcnt[((long)blk * BH + bh) * 2 + 0] + (ia - va) + s_wa[w];
     unsigned kt = bcnt[((long)blk * BH + bh) * 2 + 1] + (it - vt) + s_wt[w];
 
-    const float* sc = scores + (long)bh * (long)T;
+    const ST* sc = scores + (long)bh * (long)T;
     const int per = (T + NB - 1) / NB;
     const int t0 = blk * per, t1 = min(T, t0 + per);
     int* obase = out + (long)bh * Mout;
@@ -607,11 +611,11 @@ __global__ __launch_bounds__(1024) void rs_emit4(const float* __restrict__ score
     for (; t + (UNROLL - 1) * nthr < t1; t += UNROLL * nthr) {
         unsigned d[UNROLL];
 #pragma unroll
-        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc[t + u * nthr]);
+        for (int u = 0; u < UNROLL; ++u) d[u] = f2d(sc_f32<ST>(sc[t + u * nthr]));
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) E4_ONE(t + u * nthr, d[u]);
     }
-    for (; t < t1; t += nthr) E4_ONE(t, f2d(sc[t]));
+    for (; t < t1; t += nthr) E4_ONE(t, f2d(sc_f32<ST>(sc[t])));
 #undef E4_ONE
 }
 
@@ -637,21 +641,22 @@ static WS split_ws(const torch::Tensor& ws, int64_t NB, int64_t BH) {
 }
 
 // stages bitmask: 1=hist1 2=scan1 4=pass2 8=scan2 16=pass3 32=scan3 64=pass4 128=readonly
-static void run_select(const float* scores, int T, int BH, int M, int Mout, int NB,
+template <typename ST>
+static void run_select(const ST* scores, int T, int BH, int M, int Mout, int NB,
                        int THR, int STHR, WS w, int* out, cudaStream_t st, int stages,
                        int hmode, int det) {
     dim3 g((unsigned)BH, (unsigned)NB, 1), blk((unsigned)THR, 1, 1);
     dim3 gs((unsigned)BH, 1, 1), blks((unsigned)STHR, 1, 1);
 #define HDISPATCH(K, ...)                                            \
     do {                                                             \
-        if (hmode == 0)      K<0><<<g, blk, 0, st>>>(__VA_ARGS__);     \
-        else if (hmode == 1) K<1><<<g, blk, 0, st>>>(__VA_ARGS__);     \
-        else if (hmode == 2) K<2><<<g, blk, 0, st>>>(__VA_ARGS__);     \
-        else                 K<3><<<g, blk, 0, st>>>(__VA_ARGS__);     \
+        if (hmode == 0)      K<0, ST><<<g, blk, 0, st>>>(__VA_ARGS__); \
+        else if (hmode == 1) K<1, ST><<<g, blk, 0, st>>>(__VA_ARGS__); \
+        else if (hmode == 2) K<2, ST><<<g, blk, 0, st>>>(__VA_ARGS__); \
+        else                 K<3, ST><<<g, blk, 0, st>>>(__VA_ARGS__); \
         C10_CUDA_KERNEL_LAUNCH_CHECK();                               \
     } while (0)
     if (stages & 128) {
-        rs_readonly<<<g, blk, 0, st>>>(scores, T, NB, w.h1);
+        rs_readonly<ST><<<g, blk, 0, st>>>(scores, T, NB, w.h1);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     if (stages & 1) HDISPATCH(rs_hist1, scores, T, NB, w.h1);
@@ -671,11 +676,11 @@ static void run_select(const float* scores, int T, int BH, int M, int Mout, int 
     }
     if (stages & 64) {
         if (det) {
-            rs_count4<<<g, blk, 0, st>>>(scores, T, NB, w.ctrl, w.tcnt, w.bcnt);
+            rs_count4<ST><<<g, blk, 0, st>>>(scores, T, NB, w.ctrl, w.tcnt, w.bcnt);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
             rs_prefix4<<<gs, dim3(32, 1, 1), 0, st>>>(NB, BH, w.bcnt);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
-            rs_emit4<<<g, blk, 0, st>>>(scores, T, NB, Mout, w.ctrl, w.tcnt, w.bcnt, out);
+            rs_emit4<ST><<<g, blk, 0, st>>>(scores, T, NB, Mout, w.ctrl, w.tcnt, w.bcnt, out);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         } else {
             // shared staging buffer for the "above" group: one block can never see more than
@@ -685,9 +690,9 @@ static void run_select(const float* scores, int T, int BH, int M, int Mout, int 
             if (SBUF < 1) SBUF = 1;
             unsigned shb4 = (unsigned)SBUF * 4u;
             if (shb4 > 48u * 1024u)
-                cudaFuncSetAttribute(rs_pass4, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     101376);
-            rs_pass4<<<g, blk, shb4, st>>>(scores, T, NB, Mout, SBUF, w.ctrl, out);
+                cudaFuncSetAttribute(rs_pass4<ST>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, 101376);
+            rs_pass4<ST><<<g, blk, shb4, st>>>(scores, T, NB, Mout, SBUF, w.ctrl, out);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     }
@@ -711,15 +716,25 @@ void radix_select(torch::Tensor scores, torch::Tensor out, torch::Tensor ws,
                   int64_t M, int64_t NB, int64_t THR, int64_t STHR, int64_t stages,
                   int64_t hmode, int64_t det) {
     TORCH_CHECK(scores.is_cuda() && scores.is_contiguous(), "scores cuda+contiguous");
-    TORCH_CHECK(scores.scalar_type() == torch::kFloat, "scores must be fp32");
+    TORCH_CHECK(scores.scalar_type() == torch::kFloat ||
+                scores.scalar_type() == torch::kHalf, "scores must be fp32 or fp16");
     TORCH_CHECK(scores.dim() == 3 && out.dim() == 3, "scores [B,H,T], out [B,H,M]");
     int BH = (int)(scores.size(0) * scores.size(1));
     common_checks(out, ws, NB, BH, STHR, THR);
     TORCH_CHECK(M <= out.size(2), "M must be <= out.size(2)");
     WS w = split_ws(ws, NB, BH);
-    run_select(scores.data_ptr<float>(), (int)scores.size(2), BH, (int)M, (int)out.size(2),
-               (int)NB, (int)THR, (int)STHR, w, out.data_ptr<int32_t>(),
-               at::cuda::getCurrentCUDAStream(), (int)stages, (int)hmode, (int)det);
+    if (scores.scalar_type() == torch::kHalf) {
+        run_select<__half>(reinterpret_cast<const __half*>(scores.data_ptr()),
+                           (int)scores.size(2), BH, (int)M, (int)out.size(2),
+                           (int)NB, (int)THR, (int)STHR, w, out.data_ptr<int32_t>(),
+                           at::cuda::getCurrentCUDAStream(), (int)stages, (int)hmode,
+                           (int)det);
+    } else {
+        run_select<float>(scores.data_ptr<float>(), (int)scores.size(2), BH, (int)M,
+                          (int)out.size(2), (int)NB, (int)THR, (int)STHR, w,
+                          out.data_ptr<int32_t>(), at::cuda::getCurrentCUDAStream(),
+                          (int)stages, (int)hmode, (int)det);
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

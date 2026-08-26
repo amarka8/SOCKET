@@ -66,7 +66,7 @@ def _get_soft_hash_ext():
 # Each knob is read ONCE, HERE, into a plain Python constant.  Nothing downstream reads the
 # environment, and in particular no tl.constexpr is ever fed from an env read inside a traced
 # region -- such a value is baked at trace time and is NOT part of inductor's FX cache key,
-# which has already produced a wrong measurement in this project.  (This path never calls
+# which can silently invalidate an A/B.  (This path never calls
 # torch.compile, but the discipline costs nothing and keeps the two stacks consistent.)
 #
 #   SOCKET_SCORER = triton | cuda
@@ -84,8 +84,7 @@ def _get_soft_hash_ext():
 #       torch  the arange/cat/gather op chain already in this file
 #
 #   SOCKET_ATTN = gptfast | local
-#       gptfast (DEFAULT) GPT-FAST stage1/stage2 flash decode, the kernel the throughput
-#               numbers were measured on.
+#       gptfast (DEFAULT) GPT-FAST stage1/stage2 flash decode.
 #       local   the repo-root copy in kernels/socket_triton_kernels.py.
 #       Unlike the three switches above, these two are NOT bitwise equal: the GPT-FAST kernel
 #       gathers 128 list slots per inner step where the local one gathers 16, so the online
@@ -95,8 +94,8 @@ def _get_soft_hash_ext():
 #
 #   SOCKET_DEDUP = 0 | 1
 #       Left at 0 DELIBERATELY: unlike the three switches above it changes WHICH tokens are
-#       attended, not which kernel computes them, so flipping it would move the accuracy
-#       numbers rather than the throughput ones.
+#       attended, not which kernel computes them: it is a policy switch, not a kernel
+#       switch.
 #       1 masks a heavy index that ALSO lies in sink or window to -1.  Without it the
 #       cat([base, heavy]) list feeds such a token to the online softmax TWICE (the reference
 #       masker unions dense masks with torch.maximum and cannot double-count).  Only
@@ -105,17 +104,14 @@ def _get_soft_hash_ext():
 #   SOCKET_TARGET_SPARSITY = R    total kept = round(T_k / R), i.e. M = round(T_k/R)-sink-window
 #   SOCKET_GATE = 1               run the in-forward equivalence gates (see socket_gate.py)
 # =============================================================================
-# DEFAULTS ARE THE GPT-FAST KERNELS.  The throughput SOCKET is quoted at for long context was
-# measured with the Triton scorer + radix select + Triton list assembly + the stage1/stage2
-# flash decode, so all four are what this path runs too -- otherwise the HF eval and the
-# GPT-FAST timing describe different code.  The older in-file implementations stay reachable
-# (SOCKET_SCORER=cuda, SOCKET_SELECT=topk, SOCKET_LIST=torch, SOCKET_ATTN=local) for A/B
-# against the numbers published before this change.
+# DEFAULTS ARE THE GPT-FAST KERNELS, so the HF eval and the GPT-FAST timing run the same
+# code.  The older in-file implementations stay reachable
+# (SOCKET_SCORER=cuda, SOCKET_SELECT=topk, SOCKET_LIST=torch, SOCKET_ATTN=local) for A/B.
 _ARM_SCORER = os.environ.get("SOCKET_SCORER", "triton").strip().lower()
 _ARM_SELECT = os.environ.get("SOCKET_SELECT", "radix").strip().lower()
 _ARM_LIST = os.environ.get("SOCKET_LIST", "triton").strip().lower()
-# The decode attention itself, the fourth and last stage. "gptfast" runs the same stage1/stage2
-# flash-decode the throughput numbers were measured on; "local" runs the repo-root copy in
+# The decode attention itself, the fourth and last stage. "gptfast" runs the GPT-FAST
+# stage1/stage2 flash-decode; "local" runs the repo-root copy in
 # kernels/socket_triton_kernels.py, which gathers 16 list slots per inner step instead of 128
 # and does not pin the online softmax to fp32. The two are numerically close but not bitwise
 # equal, so the arm exists to attribute any score change to this stage rather than to the
@@ -262,7 +258,9 @@ def build_sparse_list_decode(
             key_buckets = k_hard_bhlt
             if key_buckets.dtype != torch.int16:
                 key_buckets = key_buckets.to(torch.int16)
-            scores = torch.empty((B, H, T), device=device, dtype=torch.float32)
+            # fp16 scores: fp32-accumulated in-kernel, rounded once on store. The CUDA arm
+            # below keeps its historical fp32 output; comparisons across arms round it.
+            scores = torch.empty((B, H, T), device=device, dtype=torch.float16)
             _port().soft_hash_score_rt(
                 q_probs.contiguous(), key_buckets.contiguous(),
                 v_norm_bht.contiguous(), seq_len_t, scores,
@@ -1128,7 +1126,7 @@ class LlamaAttention(nn.Module):
         window = int(getattr(self.config, "window_size", 20))
         M_cfg = getattr(self.config, "heavy_const", getattr(self.config, "heavy_size", 0.1))
         # SOCKET_TARGET_SPARSITY=R makes the TOTAL kept budget exactly round(T_k/R), i.e.
-        # M = round(T_k/R) - sink - window, matching the convention every decode benchmark in
+        # M = round(T_k/R) - sink - window, matching the decode-harness convention in
         # this project uses. Without it, heavy_const is a FRACTION of T_k and sink+window are
         # added ON TOP, so the realized sparsity is denser than the nominal number and drifts
         # with T_k. Read once at import into _TARGET_SPARSITY.

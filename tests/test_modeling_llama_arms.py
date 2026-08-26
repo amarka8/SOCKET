@@ -145,27 +145,32 @@ def main():
           f"legacy={old['layout']} default={new['layout']}")
 
     so, sn = old["scores"], new["scores"]
+    # The default arm stores fp16 scores; the legacy CUDA arm keeps fp32. Rounding the fp32
+    # reference once (the same round-to-nearest the kernel applies) restores bit equality.
     check("E3 scores bitwise-equal on t < seq_len (the layout contract holds on real shapes)",
-          torch.equal(so[..., :SEQ_LEN].float(), sn[..., :SEQ_LEN].float()),
+          torch.equal(so[..., :SEQ_LEN].half(), sn[..., :SEQ_LEN].half()),
           f"max|diff| {(so[..., :SEQ_LEN].float() - sn[..., :SEQ_LEN].float()).abs().max().item():.3e}")
 
     lo, ln = old["list"], new["list"]
     check("E4 same list width", lo.shape == ln.shape, f"{tuple(lo.shape)} vs {tuple(ln.shape)}")
     check("E5 same sparse_len", torch.equal(old["len"], new["len"]))
 
-    # Compare the SELECTED SETS, not the slot order: torch.topk returns indices sorted by
-    # descending score while radix_topm emits in grid order, so element-wise equality of the
-    # heavy region is not a property either implementation claims.
+    # Compare the selected SCORE MULTISETS, not the index sets: the legacy arm selects by
+    # fp32 topk while the default arm selects exactly over the fp16 scores, and rounding is
+    # monotone, so the legacy selection is one valid fp16 top-M among possibly many tie
+    # choices. Slot order is also unspecified (topk sorts, radix emits in grid order).
     same = True
     for b in range(lo.shape[0]):
         for h in range(lo.shape[1]):
-            a = set(lo[b, h][lo[b, h] >= 0].tolist())
-            c = set(ln[b, h][ln[b, h] >= 0].tolist())
-            if a != c:
+            ia = lo[b, h][lo[b, h] >= 0].long()
+            ic = ln[b, h][ln[b, h] >= 0].long()
+            va = so[b, h].half()[ia].sort().values
+            vc = sn[b, h].half()[ic].sort().values
+            if ia.numel() != ic.numel() or not torch.equal(va, vc):
                 same = False
-                print(f"       (b={b},h={h}) legacy-only={sorted(a - c)[:8]} "
-                      f"default-only={sorted(c - a)[:8]}")
-    check("E6 the two arms select the SAME token set", same)
+                print(f"       (b={b},h={h}) counts {ia.numel()} vs {ic.numel()}, "
+                      f"multiset equal={torch.equal(va, vc) if ia.numel() == ic.numel() else 'n/a'}")
+    check("E6 the two arms select the same fp16 score multiset", same)
 
     check("E7 nothing past seq_len was selected", bool((ln[ln >= 0] < SEQ_LEN).all()))
 

@@ -1,8 +1,7 @@
 """Bridge that lets the HF eval path call the GPT-FAST decode kernels.
 
-WHY THIS FILE EXISTS AT ALL.  The throughput numbers this project quotes for SOCKET at long
-context were measured in GPT-FAST, using three kernels that live in
-`GPT-FAST/kernels/sparse.py`:
+WHY THIS FILE EXISTS AT ALL.  The GPT-FAST decode path and the HF eval path must run the
+same kernels, which live in `GPT-FAST/kernels/sparse.py`:
 
     the Triton soft-hash SCORER      socket::soft_hash_score   (GQA-group bucket sharing)
     the exact radix top-M SELECT     socket::radix_topm        (kernels/radix_select.cu)
@@ -10,10 +9,9 @@ context were measured in GPT-FAST, using three kernels that live in
 
 `modeling_llama.py` carries its own, older implementation of the same three steps (the
 load_inline CUDA scorer, torch.topk, and an arange/cat/gather op chain).  Its SOCKET_SCORER /
-SOCKET_SELECT / SOCKET_LIST switches select between the two, so that the HF eval numbers and
-the GPT-FAST timing numbers are produced by the SAME kernels rather than by two independent
-reimplementations that have to be kept in agreement by hand.  This module is what those
-switches call.
+SOCKET_SELECT / SOCKET_LIST switches select between the two, so both stacks run the SAME
+kernels rather than two independent reimplementations kept in agreement by hand.  This
+module is what those switches call.
 
 WHY IT IS NOT A PLAIN IMPORT.  There are two DIFFERENT top-level packages named `kernels` in
 this repo:
@@ -135,7 +133,12 @@ def _sparse():
 # simply shares nothing.
 # ---------------------------------------------------------------------------
 def soft_hash_score_rt(q_probs, key_buckets, v_norm, seq_len_t, out):
-    """Score [B,H,T] into `out` (fp32). seq_len_t is an int32 scalar tensor on device."""
+    """Score [B,H,T] into `out` (fp16). seq_len_t is an int32 scalar tensor on device.
+
+    Dispatches through sparse.py's soft_hash_score_auto, the one scorer entry point both
+    stacks share, so the transport choice (packed CUDA vs Triton) is identical in the
+    GPT-FAST decode path and here.
+    """
     B, Hkv, L, T = key_buckets.shape
     assert v_norm.shape == (B, Hkv, T), (
         f"v_norm {tuple(v_norm.shape)} must be [B,Hkv,T] = {(B, Hkv, T)}; the kernel reads T "
@@ -145,8 +148,8 @@ def soft_hash_score_rt(q_probs, key_buckets, v_norm, seq_len_t, out):
         f"padding included), not the true sequence length")
     assert q_probs.shape[0] == B and q_probs.shape[2] == L, (
         f"q_probs {tuple(q_probs.shape)} must be [B,H,L,R] with L = {L}")
-    return _sparse().soft_hash_score_op(
-        q_probs, key_buckets, v_norm, seq_len_t.reshape(()), out
+    return _sparse().soft_hash_score_auto(
+        q_probs, key_buckets, v_norm, seq_len_t, out
     )
 
 
@@ -157,7 +160,7 @@ def soft_hash_score_rt(q_probs, key_buckets, v_norm, seq_len_t, out):
 # and there is no environment knob that could make them diverge.
 # ---------------------------------------------------------------------------
 def radix_topm(scores, M):
-    """scores [B,H,T] fp32 (contiguous) -> [B,H,M] int32 indices."""
+    """scores [B,H,T] fp16 or fp32 (contiguous) -> [B,H,M] int32 indices."""
     _sparse()  # importing sparse.py is what registers the operator
     return torch.ops.socket.radix_topm(scores.contiguous(), int(M))
 
@@ -184,9 +187,8 @@ def build_list_rt(heavy, seq_len_t, out, sink, window, maxlen, dedup=True):
 # DECODE ATTENTION.  socket::sparse_decode_stage1 + stage2, wrapped by GPT-FAST's own
 # sparse_attention_fwd -- a flash-decode over the index list produced above.
 #
-# This is the last of the four decode stages to reach the HF path; before it, the eval path
-# ran the repo-root copy in kernels/socket_triton_kernels.py while the throughput numbers came
-# from this one.  The two are NOT interchangeable outputs: this kernel gathers 128 list slots
+# This is the last of the four decode stages to reach the HF path; the repo-root copy in
+# kernels/socket_triton_kernels.py remains as the reference arm.  The two are NOT interchangeable outputs: this kernel gathers 128 list slots
 # per inner step where the repo-root copy gathers 16, so the online softmax accumulates in a
 # different order, and it pins the running max and the exponentials to fp32 where the other
 # leaves them at the input dtype.  Expect agreement to a few ulps, not bit equality.

@@ -37,15 +37,15 @@ def _get_soft_hash_ext():
 # array, materialises no intermediate buffer, and resolves the exact top-M threshold in
 # seven kernels over four streaming passes.
 #
-# EXACTNESS. key(f) = (bits(f) & 0x80000000) ? ~bits(f) : (bits(f) | 0x80000000) is strictly
-# monotone over ALL floats, so the -inf written into unfilled cache columns sorts last exactly
-# as it does under topk. d = 0xFFFFFFFF - key is split MSB-first into 11/11/10 bits; digit 3
-# has UNIT resolution, so three digits resolve the threshold EXACTLY for any input
-# distribution -- no adaptive shifts, no data-dependent iteration count, no host sync, fixed
-# launch structure (hence CUDA-graph capturable). The selected SCORE MULTISET always equals
-# aten::topk's. The INDEX set need not: the threshold score can be tied, and which tied token
-# a top-k implementation keeps is arbitrary in topk as well. Ties are dense whenever the hash
-# planes are overwritten at load time, since selection then reduces to top-M by ||v||.
+# EXACTNESS. Scores are fp16; each is promoted exactly to fp32 on load and compared through
+# key(f) = (bits(f) & 0x80000000) ? ~bits(f) : (bits(f) | 0x80000000), strictly monotone over
+# ALL floats, so the -inf written into unfilled cache columns sorts last exactly as it does
+# under topk. d = 0xFFFFFFFF - key is split MSB-first into 11/11/10 bits; digit 3 has UNIT
+# resolution, so three digits resolve the threshold EXACTLY for any input distribution -- no
+# adaptive shifts, no data-dependent iteration count, no host sync, fixed launch structure
+# (hence CUDA-graph capturable). The selected SCORE MULTISET always equals aten::topk's on
+# the same fp16 scores. The INDEX set need not: the threshold score can be tied, and which
+# tied token a top-k implementation keeps is arbitrary in topk as well.
 #
 # TUNING. Ordinary runtime arguments to an opaque custom_op, NOT tl.constexpr values, so
 # hardcoding them here is a maintenance choice rather than a cache-correctness requirement:
@@ -54,16 +54,16 @@ def _get_soft_hash_ext():
 #   THR  = 1024 threads. Bytes in flight = blocks*THR*UNROLL*4, so THR governs how much of
 #          the streaming passes' latency is hidden. The most sensitive knob here.
 #   STHR = 512 for the three tiny scan kernels (2048 bins / 512 threads = 4 bins per thread).
-#   HMODE= 1, a plain per-lane shared atomicAdd. Warp aggregation via __match_any_sync is
-#          slower on the digit-2 histogram: MATCH.ANY.U32 is the expensive instruction, while
-#          shared-atomic conflict replays are cheap on Hopper.
+#   HMODE= 1, a plain per-lane shared atomicAdd (MATCH.ANY.U32 warp aggregation is the
+#          expensive alternative; shared-atomic conflict replays are cheap on Hopper).
 #   STAGES = 127, i.e. all seven real stages and not the read-only bandwidth probe (bit 128).
-#   DET  = 1. Makes the emit DETERMINISTIC: which tied-at-threshold tokens are kept, and the
-#          slot each selected index lands in, become pure functions of the grid. Costs one
-#          extra streaming pass and gives eager == compiled reproducibility, without which a
-#          "compiled matches eager" regression gate cannot exist. Kept ON for that reason.
+#   DET  = 0. The emit reserves output slots with atomics, so WHICH tied-at-threshold tokens
+#          are kept (and the slot order) depends on arrival order; the selected score
+#          multiset is exact either way. DET=1 makes both a pure function of the grid at the
+#          cost of one extra streaming pass -- set it when a bit-reproducible token stream is
+#          needed (e.g. the eager-vs-compiled regression gate).
 # ---------------------------------------------------------------------------
-_RS_NB, _RS_THR, _RS_STHR, _RS_HMODE, _RS_STAGES, _RS_DET = 4, 1024, 512, 1, 127, 1
+_RS_NB, _RS_THR, _RS_STHR, _RS_HMODE, _RS_STAGES, _RS_DET = 4, 1024, 512, 1, 127, 0
 
 _RADIX_EXT = None
 
@@ -99,6 +99,71 @@ def _radix_topm(scores: torch.Tensor, M: int) -> torch.Tensor:
 def _radix_topm_fake(scores: torch.Tensor, M: int) -> torch.Tensor:
     B, H, _ = scores.shape
     return scores.new_empty((B, H, M), dtype=torch.int32)
+
+
+# ---------------------------------------------------------------------------
+# HEAD-PACKED scorer (socket::soft_hash_score_packed, kernels/rowpack_scorer.cu).
+# Bit-equal to socket::soft_hash_score -- same operand bits, same fp32 add order, same fp16
+# rounding and -inf tail; only the q_probs transport differs: the GQA group's four query
+# heads are interleaved in the last dim of a packed [B,Hkv,L,R,4] copy, so one aligned 8-byte
+# load serves the whole group where the unpacked kernel issues four independent gathers into
+# four separate rows. Used for the large-R geometries, where the unpacked gather's L2-sector
+# amplification and L1 overflow dominate the scorer; at small R the rows are cache-resident
+# and the shipped Triton kernel is used unchanged.
+# ---------------------------------------------------------------------------
+_ROWPACK_EXT = None
+
+
+def _get_rowpack_ext():
+    global _ROWPACK_EXT
+    if _ROWPACK_EXT is None:
+        from kernels.rowpack_scorer_loader import load_rowpack_scorer
+        _ROWPACK_EXT = load_rowpack_scorer()
+    return _ROWPACK_EXT
+
+
+@torch.library.custom_op("socket::soft_hash_score_packed", mutates_args={"out"})
+def _soft_hash_score_packed(qp_pack: torch.Tensor, key_buckets: torch.Tensor,
+                            v_norm: torch.Tensor, seq_len_t: torch.Tensor,
+                            out: torch.Tensor) -> None:
+    _get_rowpack_ext().soft_hash_score_packed(qp_pack, key_buckets, v_norm, seq_len_t, out)
+
+
+@_soft_hash_score_packed.register_fake
+def _soft_hash_score_packed_fake(qp_pack: torch.Tensor, key_buckets: torch.Tensor,
+                                 v_norm: torch.Tensor, seq_len_t: torch.Tensor,
+                                 out: torch.Tensor) -> None:
+    return None
+
+
+soft_hash_score_packed_op = _soft_hash_score_packed
+
+# The packed transport pays a small permute per call and wins only where the row working set
+# defeats the caches, so it is enabled by R (a static shape-derived int, stable per run).
+_SCORER_PACKED_MIN_R = 1024
+
+
+def soft_hash_score_auto(q_probs, key_buckets, v_norm_bht, seq_len_t, scores):
+    """Run the soft-hash scorer, choosing the transport by geometry.
+
+    Writes fp16 scores into `scores` [B,H,T]. Both transports produce bit-equal output;
+    the packed CUDA kernel is used for large-R GQA geometries and the Triton kernel
+    otherwise. This is the ONE scorer entry point both the GPT-FAST decode path and the
+    HF eval path call, so the two pipelines always run the same kernels.
+    """
+    B, H, L, R = q_probs.shape
+    Hkv = key_buckets.shape[1]
+    rep = H // Hkv
+    if (R >= _SCORER_PACKED_MIN_R and rep == 4
+            and q_probs.dtype in (torch.float16, torch.bfloat16)):
+        qp_pack = (q_probs.contiguous().view(B, Hkv, 4, L, R)
+                   .permute(0, 1, 3, 4, 2).contiguous())
+        soft_hash_score_packed_op(qp_pack, key_buckets.contiguous(),
+                                  v_norm_bht.contiguous(), seq_len_t.reshape(()), scores)
+    else:
+        soft_hash_score_op(q_probs.contiguous(), key_buckets.contiguous(),
+                           v_norm_bht.contiguous(), seq_len_t.reshape(()), scores)
+    return scores
 
 
 # ---------------------------------------------------------------------------
@@ -153,12 +218,13 @@ def _soft_hash_collision_fake(
 # ---------------------------------------------------------------------------
 # TRITON SOFT-HASH SCORER  (socket::soft_hash_score)  -- the scorer the decode path uses.
 #
-# BIT-EXACT vs soft_hash_collision_kernel_3 above. The per-token score is
-#   acc = 0; for l in 0..L-1: acc += float(q_probs[b,h,l, buckets[b,kv,l,t]]); out = acc*float(v[t])
-# i.e. the SAME fp32 adds in the SAME l order, then the same single multiply. L is a constexpr
-# so the loop is unrolled but never reassociated. q_probs is read in its native dtype and
-# v_norm in its native dtype; float(bf16) and float(fp16) are EXACT, so the operands are the
-# same bit patterns the fp32-cast path fed the CUDA kernel.
+# The per-token score is
+#   acc = 0; for l in 0..L-1: acc += float(q_probs[b,h,l, buckets[b,kv,l,t]]); out = fp16(acc*float(v[t]))
+# fp32 adds in ascending l (L is a constexpr so the loop is unrolled but never reassociated),
+# one fp32 multiply, then ONE round-to-nearest-even conversion to the fp16 output. q_probs
+# and v_norm are read in their native dtypes; float(bf16) and float(fp16) are exact, so the
+# accumulated value is bit-identical to the fp32 reference kernel's (soft_hash_collision
+# above) and the stored score equals that reference rounded once to fp16.
 #
 # What it removes, with no arithmetic change:
 #   * the [B,H,maxlen] bool `allowed` tensor. The mask is exactly `t < seq_len`, a scalar
@@ -175,7 +241,7 @@ def _fwd_kernel_soft_hash_score(
     KeyBuckets,      # [B,Hkv,L,T]      int16
     VNorm,           # [B,Hkv,T]        (bf16 / fp16 / fp32)
     SeqLenPtr,       # int32 scalar on device
-    Out,             # [B,H,T]          fp32 (written)
+    Out,             # [B,H,T]          fp16 (written)
     H: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, R: tl.constexpr,
     T: tl.constexpr, BLOCK_T: tl.constexpr,
 ):
@@ -209,11 +275,10 @@ def _fwd_kernel_soft_hash_score(
 
     v = tl.load(VNorm + (b * HKV + kv) * T + offs_t, mask=mask_t, other=0.0).to(tl.float32)
     out = acc * v
-    # Unfilled cache columns (t >= seq_len) get -inf, exactly as the CUDA scorer wrote them
-    # for !allowed_ext: `allowed` IS `t < seq_len` (model.py builds it as
-    # arange(maxlen) <= pos.max(), with seq_len_t = pos.max()+1).
+    # Unfilled cache columns (t >= seq_len) get -inf: `allowed` IS `t < seq_len` (model.py
+    # builds it as arange(maxlen) <= pos.max(), with seq_len_t = pos.max()+1).
     out = tl.where(keep, out, -float("inf"))
-    tl.store(Out + (b * H + h) * T + offs_t, out, mask=mask_t)
+    tl.store(Out + (b * H + h) * T + offs_t, out.to(tl.float16), mask=mask_t)
 
 
 # ---------------------------------------------------------------------------
@@ -221,15 +286,14 @@ def _fwd_kernel_soft_hash_score(
 #
 # key_buckets is stored PER-KV-HEAD ([B,Hkv,L,T]) but the kernel above runs PER-QUERY-HEAD
 # (grid axis 1 = H), so the rep = H // Hkv query heads of one GQA group each stream the SAME
-# bucket row: the scorer ISSUES rep times the unique bucket bytes. At L=50, T=143411 the
-# unique tensor is 109.4 MiB.
+# bucket row: the scorer ISSUES rep times the unique bucket bytes.
 #
 # This kernel puts ONE block on each (kv head, tile) and serves the whole group from it: the
 # bucket vector is loaded ONCE per l and reused by four explicitly-unrolled 1D
 # gathers/accumulators. No 2D broadcast, so the address arithmetic per gather is identical to
-# the per-query-head kernel; a [rep, BLOCK_T] 2D accumulator is slower, because the broadcast
-# address arithmetic costs more than sharing the load saves. Bucket load instructions, and the
-# L1/L2 read requests they generate, drop exactly rep-fold.
+# the per-query-head kernel (a [rep, BLOCK_T] 2D accumulator would add broadcast address
+# arithmetic). Bucket load instructions, and the L1/L2 read requests they generate, drop
+# exactly rep-fold.
 #
 # BIT-IDENTICAL to the per-query-head kernel. The score is
 #     out[h,t] = (sum_l q_probs[h,l,bucket[kv(h),l,t]]) * ||v_t||
@@ -246,7 +310,7 @@ def _fwd_kernel_soft_hash_score_gqa4(
     KeyBuckets,      # [B,Hkv,L,T]      int16
     VNorm,           # [B,Hkv,T]        (bf16 / fp16 / fp32)
     SeqLenPtr,       # int32 scalar on device
-    Out,             # [B,H,T]          fp32 (written)
+    Out,             # [B,H,T]          fp16 (written)
     H: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, R: tl.constexpr,
     T: tl.constexpr, BLOCK_T: tl.constexpr,
 ):
@@ -281,10 +345,10 @@ def _fwd_kernel_soft_hash_score_gqa4(
 
     v = tl.load(VNorm + (b * HKV + kv) * T + offs_t, mask=mask_t, other=0.0).to(tl.float32)
     ob = Out + (b * H + kv * 4) * T + offs_t
-    tl.store(ob, tl.where(keep, a0 * v, -float("inf")), mask=mask_t)
-    tl.store(ob + T, tl.where(keep, a1 * v, -float("inf")), mask=mask_t)
-    tl.store(ob + 2 * T, tl.where(keep, a2 * v, -float("inf")), mask=mask_t)
-    tl.store(ob + 3 * T, tl.where(keep, a3 * v, -float("inf")), mask=mask_t)
+    tl.store(ob, tl.where(keep, a0 * v, -float("inf")).to(tl.float16), mask=mask_t)
+    tl.store(ob + T, tl.where(keep, a1 * v, -float("inf")).to(tl.float16), mask=mask_t)
+    tl.store(ob + 2 * T, tl.where(keep, a2 * v, -float("inf")).to(tl.float16), mask=mask_t)
+    tl.store(ob + 3 * T, tl.where(keep, a3 * v, -float("inf")).to(tl.float16), mask=mask_t)
 
 
 # LAUNCH CONFIG: HARDCODED LITERALS, deliberately not env-readable. These become tl.constexpr
@@ -322,7 +386,7 @@ def _soft_hash_score_impl(
     key_buckets: torch.Tensor,  # [B,Hkv,L,T] int16
     v_norm: torch.Tensor,       # [B,Hkv,T]
     seq_len_t: torch.Tensor,    # int32 scalar on device
-    out: torch.Tensor,          # [B,H,T] fp32 (written)
+    out: torch.Tensor,          # [B,H,T] fp16 (written)
 ) -> None:
     B, H, L, R = q_probs.shape
     HKV, T = key_buckets.shape[1], key_buckets.shape[3]
@@ -534,16 +598,13 @@ def build_sparse_list_decode(
         if key_buckets.dtype != torch.int16:
             key_buckets = key_buckets.to(torch.int16)
 
-        # Triton scorer (socket::soft_hash_score). Bit-identical to
-        # socket::soft_hash_collision -- the same fp32 adds in the same l order, the same
-        # single multiply -- but it needs no `allowed` tensor (the mask is the seq_len scalar
-        # compare), no fp32 q_probs copy and no v_norm.float(). See the kernel comment.
-        scores = torch.empty((B, H, maxlen), device=device, dtype=torch.float32)
-        soft_hash_score_op(q_probs.contiguous(), key_buckets.contiguous(),
-                           v_norm_bht.contiguous(), seq_len_t.reshape(()), scores)
+        # Scores are fp16: fp32-accumulated by every scorer arm and rounded once on store.
+        # The select is exact over these fp16 values (see the radix comment above).
+        scores = torch.empty((B, H, maxlen), device=device, dtype=torch.float16)
+        soft_hash_score_auto(q_probs, key_buckets, v_norm_bht, seq_len_t, scores)
 
-        # Exact 3-digit radix threshold select: 7 kernels / 4 streaming passes instead of
-        # aten::topk's 21 kernels. See the module-level comment for the exactness argument.
+        # Exact radix threshold select over the fp16 scores; see the module-level comment
+        # for the exactness argument.
         heavy_idx = torch.ops.socket.radix_topm(scores, M_eff)
     else:
         heavy_idx = torch.empty((B, H, 0), device=device, dtype=torch.int32)
@@ -790,12 +851,10 @@ def _fwd_kernel_sparse_decode_stage2(
 _NAN_GUARD = os.environ.get("SOCKET_NAN_GUARD", "1") != "0"
 
 _STAGE1_BLOCK_N = 128
-# num_warps stays at 4, DELIBERATELY. Of the two knobs, widening BLOCK_N is bitwise-neutral
-# while raising num_warps changes the reduction order and so perturbs stage1's output. Keeping
-# num_warps at 4 leaves the attention path bit-for-bit identical to the unmodified kernel, so
-# the only remaining difference from it is which tokens win an exact score tie during
-# selection. Raise it only if that property is worth trading away.
-_STAGE1_NUM_WARPS = 4
+# Widening BLOCK_N is bitwise-neutral; num_warps changes the block reduction order, so
+# stage1's output differs from the num_warps=4 kernel by reassociation only (same token set,
+# same online-softmax semantics).
+_STAGE1_NUM_WARPS = 8
 
 
 def _sparse_decode_stage1_impl(

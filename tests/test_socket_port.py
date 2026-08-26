@@ -90,7 +90,7 @@ def cuda_scores(q_probs, kb_q, vn_q, allowed):
 
 def t1_scorer(f):
     kb_kv, vn_kv, kb_q, vn_q, q_probs, allowed, seq_len_t = f
-    tri = torch.empty((B, H, T), device=dev, dtype=torch.float32)
+    tri = torch.empty((B, H, T), device=dev, dtype=torch.float16)
     socket_port.soft_hash_score_rt(q_probs.contiguous(), kb_kv.contiguous(),
                                    vn_kv.contiguous(), seq_len_t, tri)
     cud = cuda_scores(q_probs, kb_q, vn_q, allowed)
@@ -98,26 +98,43 @@ def t1_scorer(f):
     # Compare only t < SEQ_LEN. The two arms deliberately differ OUTSIDE it: the Triton kernel
     # writes -inf (so the select drops those columns), while the CUDA kernel leaves the
     # `allowed`-masked columns at the zeros its wrapper allocated. Both are "never selected",
-    # but they are not the same bits.
-    a, b = tri[..., :SEQ_LEN], cud[..., :SEQ_LEN].float()
-    check("T1 scorer bitwise-equal to the CUDA scorer on t < seq_len",
+    # but they are not the same bits. The production scorer stores fp16, so the fp32 reference
+    # is rounded once (the same round-to-nearest the kernel applies) before comparing.
+    a, b = tri[..., :SEQ_LEN], cud[..., :SEQ_LEN].half()
+    check("T1 scorer bitwise-equal to the CUDA scorer (rounded to fp16) on t < seq_len",
           torch.equal(a, b),
-          f"max|diff| {(a - b).abs().max().item():.3e}")
+          f"max|diff| {(a.float() - b.float()).abs().max().item():.3e}")
     check("T1 scorer writes -inf for t >= seq_len (so select cannot pick unfilled columns)",
           bool(torch.isinf(tri[..., SEQ_LEN:]).all() and (tri[..., SEQ_LEN:] < 0).all()))
     # GQA bucket sharing, stated directly: feeding the SAME kernel the per-query-head
     # expansion (Hkv == H, rep == 1, nothing shared) must give the same scores as feeding it
     # the Hkv unique rows. Two heads in one group share a bucket row but have DIFFERENT
     # q_probs, so their SCORES are not equal -- that is not the claim being made here.
-    tri_q = torch.empty((B, H, T), device=dev, dtype=torch.float32)
+    tri_q = torch.empty((B, H, T), device=dev, dtype=torch.float16)
     socket_port.soft_hash_score_rt(q_probs.contiguous(), kb_q.contiguous(),
                                    vn_q.contiguous(), seq_len_t, tri_q)
     # Diff reported over t < seq_len only: past it both are -inf and (-inf)-(-inf) is nan,
     # which would print as a failure-looking "nan" beside a passing torch.equal.
     check("T1 per-kv-head buckets score identically to the per-query-head expansion",
           torch.equal(tri, tri_q),
-          f"max|diff| {(tri[..., :SEQ_LEN] - tri_q[..., :SEQ_LEN]).abs().max().item():.3e}")
-    return cud
+          f"max|diff| {(tri[..., :SEQ_LEN].float() - tri_q[..., :SEQ_LEN].float()).abs().max().item():.3e}")
+
+    # Packed-transport coverage: at large R (and fp16/bf16 q_probs) the dispatcher runs the
+    # head-packed CUDA kernel; force the Triton kernel on the same inputs and require bit
+    # equality between the two transports.
+    R2 = 1024
+    kb2 = torch.randint(0, R2, (B, HKV, L, T), device=dev, dtype=torch.int16)
+    q2 = torch.softmax(torch.randn(B, H, L, R2, device=dev, dtype=torch.float32), -1).half()
+    auto_out = torch.empty((B, H, T), device=dev, dtype=torch.float16)
+    socket_port.soft_hash_score_rt(q2.contiguous(), kb2.contiguous(),
+                                   vn_kv.contiguous(), seq_len_t, auto_out)
+    tri_out = torch.empty_like(auto_out)
+    socket_port._sparse().soft_hash_score_op(q2.contiguous(), kb2.contiguous(),
+                                             vn_kv.contiguous(), seq_len_t.reshape(()),
+                                             tri_out)
+    check("T1 packed transport (large R) is bitwise-equal to the Triton kernel",
+          torch.equal(auto_out, tri_out))
+    return tri
 
 
 def t2_select(scores):
@@ -272,18 +289,18 @@ def t6_padded_capacity(f):
 
     exact_kb = kb_kv[..., :T_true].contiguous()
     exact_vn = vn_kv[..., :T_true].contiguous()
-    s_exact = torch.empty((B, H, T_true), device=dev, dtype=torch.float32)
+    s_exact = torch.empty((B, H, T_true), device=dev, dtype=torch.float16)
     socket_port.soft_hash_score_rt(q_probs.contiguous(), exact_kb, exact_vn, seq_len_t, s_exact)
 
     pad_kb = torch.zeros((B, HKV, L, T_cap), device=dev, dtype=torch.int16)
     pad_kb[..., :T_true] = exact_kb
     pad_vn = torch.zeros((B, HKV, T_cap), device=dev, dtype=torch.float16)
     pad_vn[..., :T_true] = exact_vn
-    s_pad = torch.empty((B, H, T_cap), device=dev, dtype=torch.float32)
+    s_pad = torch.empty((B, H, T_cap), device=dev, dtype=torch.float16)
     socket_port.soft_hash_score_rt(q_probs.contiguous(), pad_kb, pad_vn, seq_len_t, s_pad)
 
     check("T6 padded scores are BITWISE equal to exact-width scores over the live columns",
-          torch.equal(s_pad[..., :T_true].view(torch.int32), s_exact.view(torch.int32)))
+          torch.equal(s_pad[..., :T_true].view(torch.int16), s_exact.view(torch.int16)))
     check("T6 every padded score column is -inf",
           bool((s_pad[..., T_true:] == -float("inf")).all()))
     check("T6 the padded columns hold in-range buckets",
