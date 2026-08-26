@@ -12,13 +12,12 @@
 #   legacy_P8L50    cuda scorer + torch.topk + torch list + local attn   -- the old kernels
 #   legacy_P10L10   same, at the other hash geometry
 #   gptfast_P8L50   triton + radix + triton list + gptfast attn          -- THE DELIVERABLE
-#   gptfast_P10L10  same, at the faster hash geometry
+#   gptfast_P10L10  same, at the second geometry
 #   gptfast_P10L60  the new kernels at the P/L the shipped RULER config uses
 #
 # legacy vs gptfast at a fixed (P, L) is the EQUIVALENCE check: the two implementations are
 # meant to compute the same thing, so a large gap there is a bug and not a result. gptfast at
-# different (P, L) is the actual finding: whether the geometry that decodes fastest also
-# scores.
+# different (P, L) is the actual finding: how the hash geometry moves the scores.
 #
 # SOCKET_DEDUP stays 0 in every arm. It changes WHICH tokens are attended rather than which
 # kernel computes them, so letting it vary would confound a kernel comparison with a policy one.

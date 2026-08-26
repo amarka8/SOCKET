@@ -9,8 +9,8 @@ reading an equivalence check as a result:
                    gap is a bug, not a finding. Selection ties break differently between
                    torch.topk and the radix select, and the two attention kernels accumulate
                    the online softmax in a different order, so exact equality is not expected.
-  3. GEOMETRY      the new kernels at each (P, L). This is the actual question: whether the
-                   geometry that decodes fastest also scores.
+  3. GEOMETRY      the new kernels at each (P, L). This is the actual question: how the
+                   hash geometry moves the scores.
 
 usage:  python scripts/socket_accuracy/collect.py [out_dir]
 """
