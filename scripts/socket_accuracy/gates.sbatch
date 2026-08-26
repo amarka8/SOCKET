@@ -64,9 +64,9 @@ fi
 
 # The throughput path's own gates, at the two hash geometries the accuracy sweep uses. They
 # import from GPT-FAST/kernels, so they must run with GPT-FAST as the working directory.
-( cd GPT-FAST && SOCKET_K=8  SOCKET_R=256  python test_socket_compile_equiv.py ) \
+( cd GPT-FAST && SOCKET_K=8  SOCKET_R=256  SOCKET_RS_DET=1 python test_socket_compile_equiv.py ) \
   && echo "---- compile_equiv K=8 ok" || { echo "---- compile_equiv K=8 FAILED"; RC=1; }
-( cd GPT-FAST && SOCKET_K=10 SOCKET_R=1024 python test_socket_compile_equiv.py ) \
+( cd GPT-FAST && SOCKET_K=10 SOCKET_R=1024 SOCKET_RS_DET=1 python test_socket_compile_equiv.py ) \
   && echo "---- compile_equiv K=10 ok" || { echo "---- compile_equiv K=10 FAILED"; RC=1; }
 
 echo "GATES_DONE rc=$RC $(date -Is)"

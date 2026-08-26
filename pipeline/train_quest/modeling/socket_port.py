@@ -96,6 +96,7 @@ def _sparse():
     for sub, fname in (
         ("radix_select_loader", "radix_select_loader.py"),
         ("soft_hash_collision_loader", "soft_hash_collision_loader.py"),
+        ("rowpack_scorer_loader", "rowpack_scorer_loader.py"),
     ):
         qualified = f"kernels.{sub}"
         if qualified not in sys.modules:

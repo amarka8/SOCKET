@@ -137,24 +137,24 @@ def t1_scorer(f):
     return tri
 
 
-def t2_select(scores):
+def t2_select(scores, tag=""):
     for M in (64, 512):
         heavy = socket_port.radix_topm(scores, M)
         ref = torch.topk(scores, k=M, dim=-1).indices.to(torch.int32)
 
-        check(f"T2 radix_topm shape/dtype (M={M})",
+        check(f"T2{tag} radix_topm shape/dtype (M={M})",
               heavy.shape == (B, H, M) and heavy.dtype == torch.int32)
-        check(f"T2 radix_topm indices are in range (M={M})",
+        check(f"T2{tag} radix_topm indices are in range (M={M})",
               bool(((heavy >= 0) & (heavy < T)).all()))
         # EXACTNESS is a claim about the selected SCORE MULTISET, not the index set: which
         # tokens tie AT the threshold is arbitrary in aten::topk too.
         got = torch.gather(scores, -1, heavy.long()).sort(dim=-1, descending=True).values
         exp = torch.gather(scores, -1, ref.long()).sort(dim=-1, descending=True).values
-        check(f"T2 radix_topm selects the same score multiset as topk (M={M})",
+        check(f"T2{tag} radix_topm selects the same score multiset as topk (M={M})",
               torch.equal(got, exp),
               f"max|diff| {(got - exp).abs().max().item():.3e}")
         # No unfilled column may be selected: they scored -inf.
-        check(f"T2 radix_topm never selects t >= seq_len (M={M})",
+        check(f"T2{tag} radix_topm never selects t >= seq_len (M={M})",
               bool((heavy < SEQ_LEN).all()))
 
 
@@ -334,6 +334,11 @@ def main():
     f = fixtures()
     print("T1 scorer");   scores = t1_scorer(f)
     print("T2 select");   t2_select(scores)
+    # the legacy cuda arm still emits fp32 scores; the radix fp32 instantiation must keep
+    # matching topk on them
+    cud32 = cuda_scores(f[4], f[2], f[3], f[5]).contiguous()
+    cud32[..., SEQ_LEN:] = -float("inf")
+    t2_select(cud32, tag="-fp32")
     print("T3 list");     lst = t3_list(scores, f[5], f[6])
     print("T4 imports");  t4_import()
     print("T5 attention"); t5_attention(lst)

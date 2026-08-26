@@ -294,6 +294,7 @@ SOCKET config is passed via env vars read by `GPT-FAST/model.py`:
 | `SOCKET_FORCE_FA2` | `1` forces the FA2 dense backend even when FA3 is importable | 0 |
 | `USE_FLASHATTN3` | `1` uses the flash path (FA2 or FA3, whichever imported); `0` is the SDPA control | 1 |
 | `SOCKET_REQUIRE_BACKEND` | `{fa2,fa3,flash,sdpa}` — asserts the kernel that actually ran matches, and turns the SDPA fallback into a hard error (refuses to report a mislabeled backend) | (none) |
+| `SOCKET_FUSED_SOFTHASH` | `1` builds q_probs with the fused Triton kernel (`kernels/fused_meta.py`); `0` restores the four-kernel ATen chain for A/B | 1 |
 
 > Note: FA3 is preferred at import (`flash_attn_interface`); `SOCKET_FORCE_FA2=1`
 > short-circuits to FA2 (`flash_attn`). `USE_FLASHATTN3` only gates flash-vs-SDPA; it does

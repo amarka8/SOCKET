@@ -213,7 +213,8 @@ def build_sparse_list_decode(
     seq_len_t: torch.Tensor = None,  # int32 scalar on device; defaults to T
     T_true: int = None,              # live sequence length; defaults to the buffer width T
 ):
-    """Returns (sparse_list [B,H,W] int32, sparse_len [B,H] int32, scores [B,H,T] fp32|None).
+    """Returns (sparse_list [B,H,W] int32, sparse_len [B,H] int32, scores [B,H,T] fp16|None
+    (fp32 on the legacy cuda scorer arm)).
 
     TWO LENGTHS.  `T` is the WIDTH of the bucket / ||v|| buffers, which the caller pads to a
     capacity so the kernels see a shape that changes only when the capacity does.  `T_true` is

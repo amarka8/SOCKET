@@ -63,7 +63,10 @@ def _get_soft_hash_ext():
 #          cost of one extra streaming pass -- set it when a bit-reproducible token stream is
 #          needed (e.g. the eager-vs-compiled regression gate).
 # ---------------------------------------------------------------------------
-_RS_NB, _RS_THR, _RS_STHR, _RS_HMODE, _RS_STAGES, _RS_DET = 4, 1024, 512, 1, 127, 0
+_RS_NB, _RS_THR, _RS_STHR, _RS_HMODE, _RS_STAGES = 4, 1024, 512, 1, 127
+# DET is an ordinary runtime argument to the extension (never a tl.constexpr), so an env
+# override is cache-safe; the equivalence gates set it to 1 to make two runs comparable.
+_RS_DET = 1 if os.environ.get("SOCKET_RS_DET", "0") == "1" else 0
 
 _RADIX_EXT = None
 
@@ -151,6 +154,9 @@ def soft_hash_score_auto(q_probs, key_buckets, v_norm_bht, seq_len_t, scores):
     otherwise. This is the ONE scorer entry point both the GPT-FAST decode path and the
     HF eval path call, so the two pipelines always run the same kernels.
     """
+    assert scores.dtype == torch.float16, (
+        f"scores must be fp16 (got {scores.dtype}); every scorer arm rounds its fp32 "
+        f"accumulator once on store, and a wider buffer would hide that rounding")
     B, H, L, R = q_probs.shape
     Hkv = key_buckets.shape[1]
     rep = H // Hkv
