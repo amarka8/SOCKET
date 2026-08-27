@@ -1,8 +1,8 @@
 """Equivalence gates for the GPT-FAST kernel port, run INSIDE a live LongBench forward pass.
 
 Everything here runs on tensors the model actually produced at decode step k of a real
-LongBench prompt -- never on torch.randn stand-ins.  Synthetic tensors have already produced
-a wrong conclusion (a scorer microbenchmark), and for the SELECT gate they
+LongBench prompt -- never on torch.randn stand-ins.  Synthetic tensors can mislead
+here, and for the SELECT gate they
 would be actively misleading: whether the top-M boundary score is TIED depends entirely on the
 real score distribution.
 
@@ -79,7 +79,7 @@ class GateState:
         )
         ov = (self.overlap_sum / self.overlap_n * 100.0) if self.overlap_n else float("nan")
         lines.append(f"G3 head-overlap (top-256, two query heads sharing a KV head): {_fmt(ov)}%"
-                     f"  over {self.overlap_n} pairs   [~30% = LIVE, ~100% = DEAD]")
+                     f"  over {self.overlap_n} pairs   [low = LIVE, ~100% = DEAD]")
         lines.append(
             f"G4 finite  nonfinite_logit_rows={self.nonfinite_logits}  "
             f"negative_index_slots_seen={self.neg_index_slots} (must be tolerated, not crash)"

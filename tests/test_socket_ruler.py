@@ -15,7 +15,7 @@ GPU-only (deferred to Phase C, skipped without CUDA):
   - JIT smoke: first decode compiles soft_hash_collision.cu
 
 Run with:
-  HF_HOME=/scratch/sj157/hf_home /scratch/sj157/swa_env/bin/python -m pytest \
+  HF_HOME=/path/to/hf_home python -m pytest \
       tests/test_socket_ruler.py -v
 """
 

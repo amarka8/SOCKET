@@ -15,8 +15,8 @@ torch.manual_seed(0)
 # --- Parameterize the soft-hash code width from env (SOCKET_K / SOCKET_R) so the
 #     SAME suite gates BOTH K=8/R=256 (regression) and K=10/R=1024 (new path). R is
 #     structurally pinned to 2**K (protos_T = {-1,+1}^K corners, pack_bits in [0,2**K));
-#     ENFORCE that here so a stray SOCKET_R can never desync from K. Defaults K=8/R=256
-#     reproduce the known-green run byte-for-byte. The R that matters for the scorer is
+#     ENFORCE that here so a stray SOCKET_R can never desync from K. Defaults are
+#     K=8/R=256. The R that matters for the scorer is
 #     the REAL bucket count fed to soft_hash_collision (T6) and the ModelArgs K/R built in
 #     T8; the tiny synthetic R in the adversarial composition fixtures (T4/T9) is also
 #     driven from env for consistency but is correctness-irrelevant to the K width.

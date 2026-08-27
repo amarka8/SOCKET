@@ -3,7 +3,7 @@
                 "method": "socket",
                 "kv_cache_method": "stream-llm",
                 "model_name": "meta-llama/Llama-3.1-8B-Instruct",
-                "save_path": "/scratch/sj157/SOCKET_orig/socket_bench/ckpt_eval",
+                "save_path": "runs/ckpt_eval",
                 "load_model_path": null,
                 "train_mode": "inference_only",
                 "n_init": 0.2,

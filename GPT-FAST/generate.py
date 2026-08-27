@@ -193,7 +193,7 @@ def generate(
                                      decode_type="dense")
 
     # Kernel warmup is handled EXCLUSIVELY by the SOCKET_DECODE_WARMUP untimed compiled decode
-    # steps below (mirrors the proven FORK, which has no standalone pre-warm). A standalone
+    # steps below (mirrors the reference fork, which has no standalone pre-warm). A standalone
     # dummy-shape pre-warm autotuned the triton grids at the WRONG static size (it used T=prompt_len
     # instead of the real cache maxlen=find_multiple(T_new,8)), so it warmed kernels the timed run
     # never executes; removed.

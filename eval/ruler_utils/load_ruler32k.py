@@ -83,8 +83,8 @@ def load_ruler32k_subset(subset: str, n: int = 100) -> pd.DataFrame:
 def ruler_num_samples(default: int = 100) -> int:
     """Per-task sample cap, overridable via the ``RULER_NUM_SAMPLES`` env var.
 
-    Lets the smoke test run a handful of rows without editing config/code; the
-    full accuracy campaign leaves the var unset and gets the 100-row default.
+    Lets the smoke test run a handful of rows without editing config/code;
+    leaving the var unset gets the 100-row default.
     """
     val = os.environ.get("RULER_NUM_SAMPLES")
     if val is None or val.strip() == "":

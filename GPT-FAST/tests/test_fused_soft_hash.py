@@ -13,7 +13,7 @@ What is asserted:
   * the ranking it induces is the same, which is the only property the scorer downstream
     actually consumes -- q_probs is read as a per-bucket weight and summed.
 
-Run at both hash geometries the accuracy sweep uses, since R and K set the kernel's tile shape
+Run at both hash geometries the shipped configs use, since R and K set the kernel's tile shape
 and hence its launch config:
 
     python GPT-FAST/tests/test_empty_chunk_nan.py    # (the sibling regression test)
@@ -88,7 +88,7 @@ def _main():
     if not torch.cuda.is_available():
         print("SKIP (no CUDA)")
         return 0
-    # The two geometries the accuracy sweep uses, plus the repo default.
+    # The two geometries the shipped configs use, plus the repo default.
     for K, L in ((10, 10), (8, 50), (8, 60)):
         print(f"P={K} L={L}")
         one_geometry(K, L)

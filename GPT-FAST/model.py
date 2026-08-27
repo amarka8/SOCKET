@@ -677,8 +677,8 @@ class Attention(nn.Module):
         self.tau = float(config.tau)
         # ABLATION ONLY (bit-exact, T6-proven): SOCKET_FORCE_REPEAT=1 re-enables the OLD
         # pre-optimization relayout that repeat_interleave's k_hard/v_norm 8->32 before the
-        # scorer (rep=1 in-kernel). Default 0 = per-kv-head (Hkv=8). Used to attribute the
-        # throughput delta of the per-kv-head optimization. Read once here (constant under
+        # scorer (rep=1 in-kernel). Default 0 = per-kv-head (Hkv=8). Used to A/B the
+        # per-kv-head path against the old relayout. Read once here (constant under
         # torch.compile -> a guard, not a graph break).
         self._force_repeat = bool(int(os.environ.get("SOCKET_FORCE_REPEAT", "0")))
 
@@ -791,7 +791,7 @@ class Attention(nn.Module):
 
         # Prefill: dense attention (routed through _dense_attention so the dense baseline's
         # FA2/FA3 backend selection is shared; sparse-path prefill is excluded from steady
-        # decode timing so the backend used here does not affect the SOCKET decode numbers).
+        # decode timing so the backend used here does not affect steady-state decode timing).
         if seqlen != 1:
             if rep == 1:
                 k_sdpa = k_cache

@@ -10,5 +10,9 @@ processed_dataset/
 # benchmark run outputs / logs / scratch (reproducible artifacts)
 socket_bench/
 
-# agent worktrees / local tooling state (1.8G, not source)
+# agent worktrees / local tooling state (not source)
 .claude/
+
+# compiled extension artifacts (rebuild via GPT-FAST/kernels/soft_hash_score/setup.py)
+GPT-FAST/kernels/soft_hash_score/build/
+GPT-FAST/kernels/soft_hash_score/*.so
