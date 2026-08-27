@@ -1156,8 +1156,9 @@ class LlamaAttention(nn.Module):
         # _BUCKET_LAYOUT) so both layouts exist at once, and derives the per-kv-head view here
         # -- which also checks, on real data, that the rep rows of a GQA group really are
         # byte-identical (the assumption the whole [:, ::rep] slice rests on).
-        if _ARM_GATE and self.layer_idx in _GATE_LAYERS and \
-                getattr(self, "_gate_steps", 0) < _GATE_STEPS:
+        gate_this_step = _ARM_GATE and self.layer_idx in _GATE_LAYERS and \
+                getattr(self, "_gate_steps", 0) < _GATE_STEPS
+        if gate_this_step:
             self._gate_steps = getattr(self, "_gate_steps", 0) + 1
             self._run_gate(k_hard_bhlt, v_norm_bht, q_probs, allowed_bht, seq_len_t,
                            planes, protosT, rep, M, sink, window, T_k, T_cap)
@@ -1180,7 +1181,7 @@ class LlamaAttention(nn.Module):
 
         # [SOCKET-SMOKE] one-time achieved-sparsity log (layer 0, first decode):
         # proves the sparse path is actually pruning (kept << T_k), not silently
-        # falling back to dense. Gated by env var so it never fires in campaign runs.
+        # falling back to dense. Gated by env var so it never fires in normal runs.
         if os.environ.get("SOCKET_SMOKE_LOG") and self.layer_idx == 0 and not getattr(self, "_smoke_logged", False):
             self._smoke_logged = True
             kept = int(sparse_len[0, 0].item())
@@ -1207,7 +1208,7 @@ class LlamaAttention(nn.Module):
             sparse_len,
             block_seq=256,
         )
-        if _ARM_GATE and self.layer_idx in _GATE_LAYERS and getattr(self, "_gate_steps", 0) <= _GATE_STEPS:
+        if gate_this_step:
             # G4: the guards from 9dc668b are on THIS kernel (repo-root
             # kernels/socket_triton_kernels.py). Confirm no NaN/inf escaped and that -1
             # padding slots were tolerated rather than turned into an OOB gather.
