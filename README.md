@@ -10,16 +10,6 @@ this soft collision evidence across tables yields a stable ranking that selects 
 top-*k* keys per query using only compact bucket codes (≈600 bits/token) plus a per-key
 value norm — no full key/value reads.
 
-See the paper: *SOCKET: SOft Collision Kernel EsTimator for Sparse Attention*
-(arXiv:2602.06283).
-
-> **Scope.** The purpose of this repository is to develop **efficient kernels for
-> SOCKET** — the CUDA/Triton scoring, selection, list-assembly and sparse-decode
-> kernels, and the model code that drives them. It is **not** intended to provide the
-> complete accuracy-benchmark evaluations shown in the paper; the accuracy entry point
-> here is for spot-checking the kernels. To reproduce the paper's accuracy values, use
-> the evaluation harness at <https://github.com/skylight-org/sparse-attention-hub>.
-
 This repository has **two independent parts**:
 
 - **(a) Accuracy / evaluation path** — an HF (`transformers`) Llama model with a soft-LSH
