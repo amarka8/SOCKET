@@ -8,18 +8,23 @@ hypercube-bucket logits**: each query distributes probability mass across all bu
 each hash table, turning LSH into a graded, query-aware **scoring kernel**. Aggregating
 this soft collision evidence across tables yields a stable ranking that selects the
 top-*k* keys per query using only compact bucket codes (≈600 bits/token) plus a per-key
-value norm — no full key/value reads. SOCKET matches or surpasses prior sparse-attention
-methods on long-context benchmarks and, with a custom CUDA scoring kernel plus a
-Flash-Decode Triton backend, reaches up to ~1.5× the decode throughput of FlashAttention.
+value norm — no full key/value reads.
 
 See the paper: *SOCKET: SOft Collision Kernel EsTimator for Sparse Attention*
 (arXiv:2602.06283).
+
+> **Scope.** The purpose of this repository is to develop **efficient kernels for
+> SOCKET** — the CUDA/Triton scoring, selection, list-assembly and sparse-decode
+> kernels, and the model code that drives them. It is **not** intended to provide the
+> complete accuracy-benchmark evaluations shown in the paper; the accuracy entry point
+> here is for spot-checking the kernels. To reproduce the paper's accuracy values, use
+> the evaluation harness at <https://github.com/skylight-org/sparse-attention-hub>.
 
 This repository has **two independent parts**:
 
 - **(a) Accuracy / evaluation path** — an HF (`transformers`) Llama model with a soft-LSH
   masker (`pipeline/train_quest/`, `modeling/modeling_llama.py`), evaluated on RULER-32K
-  and LongBench. This is the path that produces accuracy numbers.
+  and LongBench. This is the path used for accuracy spot-checks.
 - **(b) Throughput path** — a `GPT-FAST` fork (`GPT-FAST/`) with compiled, CUDA-graph
   decode kernels (a custom CUDA soft-hash scorer + Triton sparse-decode kernels) used only
   to measure decode throughput vs. FlashAttention-2/3. It is **not** used for accuracy.
@@ -39,30 +44,35 @@ This repository has **two independent parts**:
 | `eval/ruler_utils/` | RULER-32K loader + scoring (`load_ruler32k.py`, `calculate_metrics.py`, `scorer.py`). |
 | `eval/longbench_utils/` | LongBench scoring (`eval_long_bench.py`, `dataset2metric`). |
 | `GPT-FAST/generate.py`, `GPT-FAST/model.py` | Throughput benchmark + sparse/dense decode model. |
-| `GPT-FAST/kernels/` | CUDA soft-hash scorer (`soft_hash_collision.cu` + loader) and Triton sparse kernels (`sparse.py`). |
-| `tests/test_socket_ruler.py` | Masker / loader / scoring / dense-equivalence tests. |
+| `GPT-FAST/kernels/` | CUDA soft-hash scorer (`soft_hash_collision.cu` + loader), radix select and packed-scorer kernels, and Triton sparse kernels (`sparse.py`). |
+| `tests/`, `GPT-FAST/tests/` | Kernel-equivalence gate tests (see section 5). |
 | `GPT-FAST/test_socket_compile_equiv.py` | Kernel compile/optimization equivalence script. |
-| `RULER_RESULTS.md` | Recorded RULER-32K + LongBench accuracy campaign. |
 
 ---
 
 ## 2. Environment setup
 
 The two paths use **separate Python environments** (different torch/CUDA wheels). Both are
-Python 3.13 venvs; CUDA toolkit `12.9.1` is loaded as a module.
+Python 3.13 venvs; CUDA toolkit `12.9.1` is required (e.g. loaded as a module).
 
-### Accuracy path (e.g. `swa_env`)
+### Accuracy path (e.g. `socket_env`)
 
-- Python 3.13, `torch 2.8.0+cu128`, `transformers==4.57.6`, `triton 3.4.0`, `datasets`.
+- Python 3.13, `torch 2.8.0+cu128`, `transformers==4.57.6`, `triton 3.4.0`, `datasets`,
+  `deepspeed`.
 - Install from `requirements.txt` (it pins `transformers==4.57.6`; `torch`/CUDA wheels are
   left to you, hence the commented `# torch` / `# nvidia-*` lines).
 
 ```bash
-module load GCCcore/13.3.0 CUDA/12.9.1
-python -m venv swa_env && source swa_env/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cu128   # or your CUDA wheel
+# on a modules-based cluster, e.g.:
+module load GCCcore/14.3.0 Python/3.13.5 CUDA/12.9.1
+python -m venv socket_env && source socket_env/bin/activate
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128   # or your CUDA wheel
 pip install -r requirements.txt
 ```
+
+> The `transformers` pin is a hard requirement, not a preference:
+> `pipeline/train_quest/modeling/modeling_llama.py` is a fork of that release's Llama
+> implementation and does not import against `transformers` 5.x.
 
 ### Throughput path (`GPT-FAST/`, e.g. `prism_env`)
 
@@ -71,6 +81,7 @@ pip install -r requirements.txt
   `flash_attn_interface` for FA3) for the dense baselines.
 
 ```bash
+# on a modules-based cluster, e.g.:
 module load GCCcore/13.3.0 CUDA/12.9.1
 source prism_env/bin/activate
 export TORCH_CUDA_ARCH_LIST="9.0"     # Hopper / H200
@@ -80,8 +91,8 @@ export TORCH_CUDA_ARCH_LIST="9.0"     # Hopper / H200
 
 - **CUDA `12.9.1`** with a working `nvcc` (the soft-hash kernel is JIT-built at runtime).
 - **`HF_HOME`** pointed at a cache that already holds `meta-llama/Llama-3.1-8B-Instruct`
-  (the campaign used `HF_HOME=/scratch/sj157/hf_home`). The model is gated; either rely on
-  cached weights or put a token in `config/access_tokens.py`:
+  (e.g. `export HF_HOME=/path/to/hf_home  # ADD PATH TO HF CACHE HERE`). The model is
+  gated; either rely on cached weights or put a token in `config/access_tokens.py`:
 
   ```python
   hf_access_token = "hf_..."   # main.py only calls login() when this is non-empty
@@ -95,14 +106,14 @@ export TORCH_CUDA_ARCH_LIST="9.0"     # Hopper / H200
   need a writable **`TRITON_CACHE_DIR`**. Set both before running:
 
   ```bash
-  export TRITON_CACHE_DIR=/scratch/$USER/.cache/triton
-  export TORCH_EXTENSIONS_DIR=/scratch/$USER/.cache/torch_ext
+  export TRITON_CACHE_DIR=/path/to/cache/triton      # ADD PATH TO TRITON CACHE HERE
+  export TORCH_EXTENSIONS_DIR=/path/to/cache/torch_ext   # ADD PATH TO TORCH EXTENSIONS HERE
   mkdir -p "$TRITON_CACHE_DIR" "$TORCH_EXTENSIONS_DIR"
   ```
 
 ---
 
-## 3. Testing accuracy (model + a specific dataset)
+## 3. Running the accuracy eval (model + a specific dataset)
 
 The accuracy entry point is `pipeline/train_quest/main.py`. It takes:
 
@@ -120,8 +131,7 @@ export RANK=0 LOCAL_RANK=0 WORLD_SIZE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=27501
 
 > The repository's original launcher, `scripts/socket_inference/Llama-3.1-8B-Instruct/inference.sh`,
 > uses `deepspeed --master_port 27501 pipeline/train_quest/main.py ...` (which sets those
-> vars for you). The recorded accuracy campaign in `RULER_RESULTS.md` ran the plain
-> `python pipeline/train_quest/main.py` form below.
+> vars for you). The plain `python` form below works for a single GPU.
 
 ### RULER-32K
 
@@ -129,12 +139,12 @@ Six tasks are wired: `qa_1`, `qa_2`, `fwe`, `vt`, `niah_multikey_2`, `niah_multi
 (configs in `config/eval_config/ruler32k/`).
 
 ```bash
-cd /scratch/sj157/SOCKET_orig
-HF_HOME=/scratch/sj157/hf_home python pipeline/train_quest/main.py \
+cd /path/to/SOCKET
+HF_HOME=/path/to/hf_home python pipeline/train_quest/main.py \
   --pipeline_config_dir config/pipeline_config/SOCKET/Llama-3.1-8B-Instruct/Llama-3.1-8B-Instruct-inference-ruler.json \
   --eval_config_dir     config/eval_config/ruler32k/niah_multikey_2.json \
   --output_folder_dir   runs/ruler32k/Llama-3.1-8B-Instruct/niah_multikey_2 \
-  --exp_desc            ruler32k_nm2_20x_K10_L60
+  --exp_desc            ruler32k_nm2_K10_L60
 ```
 
 Repeat for each of the six tasks (swap the `--eval_config_dir`). The RULER dataset
@@ -149,11 +159,11 @@ prediction), `string_match_all` otherwise (mean fraction of references found).
 Same entry point, pointing at a `config/eval_config/longbench/<task>.json`:
 
 ```bash
-HF_HOME=/scratch/sj157/hf_home python pipeline/train_quest/main.py \
+HF_HOME=/path/to/hf_home python pipeline/train_quest/main.py \
   --pipeline_config_dir config/pipeline_config/SOCKET/Llama-3.1-8B-Instruct/Llama-3.1-8B-Instruct-inference-ruler.json \
   --eval_config_dir     config/eval_config/longbench/qasper.json \
   --output_folder_dir   runs/longbench/Llama-3.1-8B-Instruct/qasper \
-  --exp_desc            longbench_qasper_20x
+  --exp_desc            longbench_qasper
 ```
 
 LongBench tasks read from on-disk splits under `dataset/longbench/` and are scored by
@@ -177,7 +187,7 @@ The masker reads these from the pipeline config (`modeling_llama.py`); the shipp
 
 Total tokens kept per query = `sink + window + round(heavy_const × T)`. With
 `sink=window=128` and `heavy_const=0.0422` at 32K context this is ~5% kept (20×
-compression, confirmed in `RULER_RESULTS.md`).
+compression).
 
 To change:
 
@@ -195,7 +205,60 @@ Outputs land under `--output_folder_dir`: `raw_results.json` (scores) and
 
 ---
 
-## 4. Testing throughput (GPT-FAST decode benchmark)
+### One kernel composition for accuracy *and* throughput
+
+The decode path is built from four kernels — a Triton soft-hash scorer with GQA-group
+bucket sharing, an exact radix top-M select, a one-kernel sparse-list assembly, and a
+stage1/stage2 flash decode — all living in `GPT-FAST/kernels/`. The accuracy path used to
+carry its own older implementation of all four, so the accuracy and throughput paths never
+described the same system. It now calls the GPT-FAST kernels directly, through
+`pipeline/train_quest/modeling/socket_port.py`, and each stage is individually switchable
+so the older implementation stays available as a reference:
+
+| Env var | Default | Alternative |
+|---|---|---|
+| `SOCKET_SCORER` | `triton` — GPT-FAST scorer, per-KV-head buckets | `cuda` — the `load_inline` scorer, per-query-head buckets |
+| `SOCKET_SELECT` | `radix` — exact 3-digit radix threshold select | `topk` — `torch.topk` |
+| `SOCKET_LIST` | `triton` — one-kernel list assembly | `torch` — the arange/cat/gather op chain |
+| `SOCKET_ATTN` | `gptfast` — GPT-FAST stage1/stage2 flash decode | `local` — `kernels/socket_triton_kernels.py` |
+| `SOCKET_DEDUP` | `0` — a heavy token in sink/window is attended twice | `1` — masked to `-1`, matching GPT-FAST |
+| `SOCKET_TARGET_SPARSITY` | unset — `heavy_const` is a fraction of `T` | `R` — total kept is exactly `round(T/R)` |
+| `SOCKET_LB_LIMIT` | unset — evaluate every sample | `N` — the first N only, `shuffle=False` |
+| `SOCKET_MODEL_PATH` | unset — use the config's `model_name` | a local weight directory |
+| `SOCKET_GATE` | `0` | `1` — run the in-forward equivalence gates (`socket_gate.py`) |
+
+The first three arms are exact swaps; `SOCKET_ATTN` is not. The GPT-FAST decode kernel gathers
+128 list slots per inner step where the local copy gathers 16, and pins the online softmax to
+fp32, so the two agree to a few ulps rather than bitwise.
+
+**Buffer capacity.** GPT-FAST decodes against a static KV cache, so the score-array width is a
+run constant and the kernels declare it `tl.constexpr`. The HF cache grows a column per step, so
+the masker allocates the bucket and `||v||` buffers at a padded capacity — the next half-octave
+above the prompt plus the generation reserve — and lets the on-device `seq_len` scalar carry the
+truth. Padding is inert: the scorer writes `-inf` past `seq_len`, the select sorts `-inf` last,
+and the list builder drops any index at or beyond it. The buffers are **zero-filled**, which is
+load-bearing rather than tidy: the scorer masks its gathers on the buffer width, so a padded
+column holding an out-of-range bucket code would index outside `q_probs`.
+
+### Example hash-geometry configs
+
+Three example pipeline configs vary only the hash geometry — P (`bucket_K`) and L
+(`bucket_L`):
+
+| Config | P (`bucket_K`) | L (`bucket_L`) |
+|---|---|---|
+| `config/pipeline_config/SOCKET/Llama-3.1-8B-Instruct/lb-P10L10.json` | 10 | 10 |
+| `config/pipeline_config/SOCKET/Llama-3.1-8B-Instruct/lb-P8L50.json` | 8 | 50 |
+| `config/pipeline_config/SOCKET/Llama-3.1-8B-Instruct/lb-P10L60.json` | 10 | 60 |
+
+All three hold `tau=0.3`, `sink_size=window_size=128` and `heavy_const=0.05` fixed, so a score
+difference between them is attributable to the hash geometry alone. Sparsity is set at run time
+with `SOCKET_TARGET_SPARSITY`, because `heavy_const` is a fraction and cannot express a total
+kept count.
+
+---
+
+## 4. Running the throughput benchmark (GPT-FAST decode)
 
 `GPT-FAST/generate.py` measures **decode-only** tokens/sec. The SOCKET sparse path is
 selected with `--decode_type sparse`; the dense FlashAttention baselines with
@@ -215,6 +278,7 @@ SOCKET config is passed via env vars read by `GPT-FAST/model.py`:
 | `SOCKET_FORCE_FA2` | `1` forces the FA2 dense backend even when FA3 is importable | 0 |
 | `USE_FLASHATTN3` | `1` uses the flash path (FA2 or FA3, whichever imported); `0` is the SDPA control | 1 |
 | `SOCKET_REQUIRE_BACKEND` | `{fa2,fa3,flash,sdpa}` — asserts the kernel that actually ran matches, and turns the SDPA fallback into a hard error (refuses to report a mislabeled backend) | (none) |
+| `SOCKET_FUSED_SOFTHASH` | `1` builds q_probs with the fused Triton kernel (`kernels/fused_meta.py`); `0` restores the four-kernel ATen chain for A/B | 1 |
 
 > Note: FA3 is preferred at import (`flash_attn_interface`); `SOCKET_FORCE_FA2=1`
 > short-circuits to FA2 (`flash_attn`). `USE_FLASHATTN3` only gates flash-vs-SDPA; it does
@@ -223,28 +287,28 @@ SOCKET config is passed via env vars read by `GPT-FAST/model.py`:
 ### Sparsity / HEAVY convention
 
 Context length **N** is set entirely by the prompt token count (via `--prompt_file`); there
-is no context-length flag. The benchmark harness picks the heavy budget per (N, ratio) as
+is no context-length flag. One convenient convention for picking the heavy budget per
+(N, ratio) is
 
 ```
 HEAVY = round(N / ratio) − 240        (240 = sink_size + window_size = 120 + 120)
 ```
 
 so the total kept set is `HEAVY + 240` and the realized sparsity is
-`prompt_len / (HEAVY + 240)`. This convention lives in the harness
-(`socket_bench/launch_matrix.sh`, `socket_bench/agg_matrix_K8K10.py`); the runtime itself
-just reads the absolute `SOCKET_HEAVY_CONST`.
+`prompt_len / (HEAVY + 240)`. This is only a convention for choosing the value — the
+runtime itself just reads the absolute `SOCKET_HEAVY_CONST`.
 
 ### Concrete example
 
 ```bash
-cd /scratch/sj157/SOCKET_orig/GPT-FAST
+cd /path/to/SOCKET/GPT-FAST
 export SOCKET_L=60 SOCKET_DECODE_WARMUP=8 TORCH_CUDA_ARCH_LIST="9.0"
 
 # SOCKET sparse (e.g. N≈72K, 40× sparsity → HEAVY = round(72000/40) − 240 = 1560)
 SOCKET_K=8 SOCKET_R=256 SOCKET_HEAVY_CONST=1560 \
 python generate.py \
   --checkpoint_path /path/to/checkpoints/meta-llama/llama-3.1-8b/model.pth \
-  --prompt_file /scratch/sj157/socket_bench/prompts/sw_72000.txt \
+  --prompt_file /path/to/prompts/prompt_72000.txt \
   --batch_size 1 --top_k 1 --temperature 1.0 \
   --decode_type sparse --compile --num_samples 5 --max_new_tokens 50
 
@@ -257,8 +321,10 @@ USE_FLASHATTN3=1 SOCKET_REQUIRE_BACKEND=fa3 \
 python generate.py ...same flags... --decode_type dense --compile --num_samples 5 --max_new_tokens 50
 ```
 
-The checkpoint is the standard gpt-fast `model.pth` (the config is inferred from the parent
-directory name, e.g. `llama-3.1-8b`); the tokenizer is `tokenizer.model` next to it.
+The `--prompt_file` is a plain-text prompt whose token count sets the context length
+(~72K tokens in this example). The checkpoint is the standard gpt-fast `model.pth` (the
+config is inferred from the parent directory name, e.g. `llama-3.1-8b`); the tokenizer is
+`tokenizer.model` next to it.
 
 **Reading the output:** look for the line
 
@@ -270,27 +336,54 @@ Decode-only: <sec> sec, <tok/s> tokens/sec
 `[ATTN-BACKEND] required=... effective=... ran=...` line (stderr) confirms which kernel ran,
 and `[PROMPT-LEN] prompt_len=...` reports the realized context length.
 
-### The `socket_bench` harness
-
-`/scratch/sj157/socket_bench/` runs the full SOCKET-vs-FA2-vs-FA3 matrix on **H200**:
-
-- `matrix_K8K10.sbatch` — one SLURM job per context (`N`, `H333`, `H35`, `H40`), running
-  the FA2 and FA3 dense baselines (measured once per context, since dense is
-  config-independent) plus **six** SOCKET cells: `{K=8/R=256, K=10/R=1024} × {33.3×, 35×,
-  40×}`. It loads `CUDA/12.9.1`, activates `prism_env`, sets fresh per-job
-  `TRITON_CACHE_DIR`/`TORCH_EXTENSIONS_DIR`, `SOCKET_L=60`, `SOCKET_DECODE_WARMUP=8`.
-- `launch_matrix.sh` — submits the 4 context jobs (N = 18K/36K/72K/140K) with the
-  precomputed HEAVY triples.
-- `orig_correct_40x.sbatch` — a single (N, HEAVY) SOCKET cell + FA2/FA3 baselines.
-- `agg_matrix_K8K10.py` — parses the SLURM logs (`logs/*.out` for throughput / `[PROMPT-LEN]`,
-  `logs/*.err` for `[ATTN-BACKEND]`), takes the **median** of the warm decode-only samples,
-  and emits `RESULTS_matrix_K8K10_L60.md` (six throughput tables, columns: `ctx | SOCKET
-  tok/s | FA2 tok/s | FA3 tok/s | SOCKET/FA2 | SOCKET/FA3 | prompt_len | backend | NaN?`)
-  plus a ratio plot. SOCKET reaches ~1.3–1.4× FA2/FA3 at 140K context in those tables.
-
 ---
 
 ## 5. Tests
+
+The gate suite below is cluster-agnostic: every command is a plain `python` invocation
+from the repo root. Most gates need a CUDA GPU; `tests/test_modeling_llama_arms.py` and
+`tests/test_socket_ruler.py` additionally need `transformers` 4.x (they import
+`modeling_llama.py`), and the ruler suite reads the RULER dataset from the HF cache (set
+`HF_HOME=/path/to/hf_home` if it is not already cached).
+
+```bash
+cd /path/to/SOCKET
+
+# Capacity + budget arithmetic (CPU-only, cheap — run first)
+python tests/test_socket_capacity.py
+
+# Each ported kernel vs the implementation it replaces (GPU)
+python tests/test_socket_port.py
+
+# Empty-partition NaN regression: once with the guard, once proving the bug reproduces without it
+python GPT-FAST/tests/test_empty_chunk_nan.py
+SOCKET_NAN_GUARD=0 python GPT-FAST/tests/test_empty_chunk_nan.py
+
+# Fused soft-hash q_probs kernel vs the ATen chain (GPU)
+SOCKET_FUSED_SOFTHASH=1 python GPT-FAST/tests/test_fused_soft_hash.py
+
+# The whole selection pipeline, legacy arm vs default (GPU; needs transformers 4.x)
+python tests/test_modeling_llama_arms.py
+
+# Masker / loader / scoring suite: 17 CPU tests + 3 GPU tests that auto-skip without CUDA
+python -m pytest tests/test_socket_ruler.py -v
+
+# The throughput path's own T1..T9 gates, at both hash geometries
+(cd GPT-FAST && SOCKET_K=8  SOCKET_R=256  SOCKET_RS_DET=1 python test_socket_compile_equiv.py)
+(cd GPT-FAST && SOCKET_K=10 SOCKET_R=1024 SOCKET_RS_DET=1 python test_socket_compile_equiv.py)
+```
+
+**Success markers.** The standalone tests print `ALL PASS` (`test_empty_chunk_nan.py`
+prints `OK`); the pytest suite reports `20 passed` on a GPU machine (without CUDA the
+3 GPU tests skip: `17 passed, 3 skipped`). `test_socket_compile_equiv.py` is a diagnostic
+report rather than a pass/fail script: it prints per-gate `[T1]…[T9]` lines and `ALL_DONE`,
+and exits 0 regardless of outcome, so read the gate lines instead of the exit code — a
+healthy run shows small `max|diff|` values, `True` verdict fields, `leak_count=0`, and no
+`FAIL`/`FAILED` lines (`[T2]` reporting `bit_exact=False` alongside a small `max|diff|` is
+the designed tolerance check, not a failure). Without a GPU, `test_empty_chunk_nan.py` and
+`test_fused_soft_hash.py` print `SKIP (no CUDA)` and exit 0.
+
+**What they cover.**
 
 - `tests/test_socket_ruler.py` — pytest suite for the **accuracy path**. CPU tests cover the
   hard hash (sign-of-projection, int16 bucket-code round-trip, determinism), the soft hash
@@ -302,18 +395,7 @@ and `[PROMPT-LEN] prompt_len=...` reports the realized context length.
   check (SOCKET sparse decode ≈ dense SDPA within fp tolerance, proving the kernels are
   numerically correct), and the JIT-compile smoke test for `soft_hash_collision.cu`.
 
-  ```bash
-  cd /scratch/sj157/SOCKET_orig
-  HF_HOME=/scratch/sj157/hf_home python -m pytest tests/test_socket_ruler.py -v
-  ```
-
 - `GPT-FAST/test_socket_compile_equiv.py` — a standalone CUDA script (not pytest) verifying
-  the **throughput kernels'** internal equivalences: compiled vs. eager sparse attention
-  (bit-exact under CUDA graphs), the per-kv-head scorer vs. the `repeat_interleave` path,
-  static-cache top-k selection, and heavy/base dedup. It prints `[T1]…[T9]` and `ALL_DONE`.
-
-  ```bash
-  cd /scratch/sj157/SOCKET_orig/GPT-FAST
-  python test_socket_compile_equiv.py                            # K=8 / R=256
-  SOCKET_K=10 SOCKET_R=1024 python test_socket_compile_equiv.py  # K=10 / R=1024
-  ```
+  the **throughput kernels'** internal equivalences: compiled vs. eager sparse attention,
+  the per-kv-head scorer vs. the `repeat_interleave` path, static-cache top-k selection,
+  and heavy/base dedup.

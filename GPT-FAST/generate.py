@@ -183,12 +183,17 @@ def generate(
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
-        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+        # decode_type selects the KV storage layout (see Transformer.setup_caches): dense gets
+        # FA's native [B,T,Hkv,D] so decode needs no per-step relayout; sparse keeps
+        # [B,Hkv,T,D] and is untouched. The draft model always runs the dense path.
+        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length,
+                           decode_type=decode_type)
         if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length,
+                                     decode_type="dense")
 
     # Kernel warmup is handled EXCLUSIVELY by the SOCKET_DECODE_WARMUP untimed compiled decode
-    # steps below (mirrors the proven FORK, which has no standalone pre-warm). A standalone
+    # steps below (mirrors the reference fork, which has no standalone pre-warm). A standalone
     # dummy-shape pre-warm autotuned the triton grids at the WRONG static size (it used T=prompt_len
     # instead of the real cache maxlen=find_multiple(T_new,8)), so it warmed kernels the timed run
     # never executes; removed.

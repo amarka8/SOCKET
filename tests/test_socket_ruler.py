@@ -15,7 +15,7 @@ GPU-only (deferred to Phase C, skipped without CUDA):
   - JIT smoke: first decode compiles soft_hash_collision.cu
 
 Run with:
-  HF_HOME=/scratch/sj157/hf_home /scratch/sj157/swa_env/bin/python -m pytest \
+  HF_HOME=/path/to/hf_home python -m pytest \
       tests/test_socket_ruler.py -v
 """
 
@@ -261,7 +261,8 @@ def test_build_sparse_list_decode_gpu():
     k_hard = torch.randint(0, R, (B, H, L, T), device=dev, dtype=torch.int16)
     v_norm = torch.rand(B, H, T, device=dev)
     allowed = torch.ones(B, H, T, device=dev, dtype=torch.bool)
-    sparse_list, sparse_len = build_sparse_list_decode(
+    # third return value is the [B,H,T] score array (None when M == 0)
+    sparse_list, sparse_len, _ = build_sparse_list_decode(
         q_probs, k_hard, v_norm, allowed, sink=sink, window=window, M=M)
     expected = sink + window + min(M, T)
     assert int(sparse_len[0, 0]) == expected

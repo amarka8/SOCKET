@@ -60,6 +60,7 @@ py-cpuinfo
 pyarrow
 pydantic
 pydantic_core
+pytest
 python-dateutil
 pytz
 PyYAML

@@ -21,6 +21,13 @@ from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
 # SOCKET sparse path). Copied verbatim from the reference fork so the dense
 # baseline can be timed under BOTH FA2 and FA3 in the same env.
 # ---------------------------------------------------------------------------
+# The four-kernel q_probs chain is folded into one Triton kernel (kernels/fused_meta.py).
+# ON by default; the fused reduction is not bitwise equal to the ATen chain (see the design
+# note in fused_meta.py), so SOCKET_FUSED_SOFTHASH=0 restores the ATen chain for A/B runs.
+_FUSED_SOFTHASH = os.environ.get("SOCKET_FUSED_SOFTHASH", "1") == "1"
+if _FUSED_SOFTHASH:
+    from kernels.fused_meta import fused_soft_hash
+
 _flash_attn_func = None
 _flash_attn_with_kvcache = None       # decode kernel (static cache + cache_seqlens); None if absent
 _FLASH_IS_FA3 = False
@@ -170,6 +177,16 @@ def _dense_attention(
 
     if not torch.compiler.is_compiling():
         _assert_backend("sdpa")
+    if attn_mask is None and input_pos is not None and input_pos.numel() > 0:
+        # setup_caches skips the O(T^2) causal buffer whenever a flash backend is live, so a
+        # fall-through to SDPA (flash unavailable, or the flash path above raised) would
+        # otherwise run NON-CAUSAL and be silently wrong -- a worse bug than the memory one.
+        # Rebuild exactly the slice that was dropped: row i of tril(ones)[input_pos] is
+        # (j <= input_pos[i]), i.e. [S,T] -> [1,1,S,T].
+        _T = k_bhtd.size(2)
+        attn_mask = (
+            torch.arange(_T, device=q_bhsd.device) <= input_pos.reshape(-1, 1)
+        )[None, None]
     return F.scaled_dot_product_attention(
         q_bhsd, k_bhtd, v_bhtd, attn_mask=attn_mask, dropout_p=0.0,
     )
@@ -278,14 +295,25 @@ class ModelArgs:
     heavy_const: int = 860  # budget
     tau: float = 0.3  # soft-hash softmax temperature (matches sparse-attention-hub default)
     # sink/window streaming-attention base. These were previously read only via
-    # getattr(config, 'sink_size', 120) with NO field, so the benchmark's 33.3x sparsity
+    # getattr(config, 'sink_size', 120) with NO field, so the realized sparsity
     # (budget = sink + window + heavy_const = 120 + 120 + HEAVY) silently depended on the
     # getattr fallback. Made explicit (same 120/120 -> identical selection/sparsity) so the
-    # contract is visible. Do NOT change these values: they set the measured sparsity.
+    # contract is visible. Do NOT change these values: they set the realized sparsity.
     sink_size: int = 120
     window_size: int = 120
 
     def __post_init__(self):
+        # n_layer is env-overridable because transformer_configs hardcodes n_layer=1 for EVERY
+        # model, including llama-3.1-8b: the checkpoint's remaining 31 layers are simply not
+        # instantiated, and load_state_dict(strict=False) drops them silently. Without this
+        # override the real 32-layer model cannot be run from this tree at all, and the 1-layer
+        # microbench config cannot be run from the same tree as the full model -- the previous
+        # setup used a hand-edited COPY of GPT-FAST, which drifts from any kernel change.
+        # Absent SOCKET_N_LAYER the transformer_configs value is used unchanged, so no existing
+        # caller changes behaviour.
+        _nl_env = os.environ.get("SOCKET_N_LAYER")
+        if _nl_env is not None:
+            self.n_layer = int(_nl_env)
         # L and heavy_const are env-overridable so a single build can sweep configs (the
         # original repo hard-codes them; we expose SOCKET_L / SOCKET_HEAVY_CONST to match
         # the reference fork's sweep harness without changing any SOCKET math).
@@ -369,7 +397,19 @@ transformer_configs = {
 
 class KVCache(nn.Module):
     """
-    KV is stored as (B, H, T, D).
+    KV storage layout is SELECTABLE (`layout`):
+
+      "bhtd" (default): k_cache/v_cache are (B, Hkv, T, D). This is the layout the SOCKET
+             sparse path's gather kernels require, so the sparse path always uses it and is
+             bit-identical to before this change.
+
+      "bthd" (dense decode): k_cache/v_cache are (B, T, Hkv, D) -- exactly what
+             flash_attn_with_kvcache consumes, so dense decode hands FA the cache buffer with
+             no per-step relayout. Previously dense decode ran k.transpose(1,2).contiguous()
+             on the WHOLE cache every layer every step.
+
+    Only k_cache/v_cache are affected; k_hard / v_norm / attn_out are SOCKET-only and
+    unchanged.
     """
 
     def __init__(
@@ -381,19 +421,23 @@ class KVCache(nn.Module):
         L: int,
         R: int,
         dtype=torch.bfloat16,
+        layout: str = "bhtd",
     ):
         super().__init__()
         B, H, T, D = max_batch_size, n_heads, max_seq_length, head_dim
 
-        self.register_buffer("k_cache", torch.zeros((B, H, T, D), dtype=dtype))
-        self.register_buffer("v_cache", torch.zeros((B, H, T, D), dtype=dtype))
+        assert layout in ("bhtd", "bthd"), f"unknown KV layout {layout!r}"
+        self.layout = layout
+        kv_shape = (B, T, H, D) if layout == "bthd" else (B, H, T, D)
+        self.register_buffer("k_cache", torch.zeros(kv_shape, dtype=dtype))
+        self.register_buffer("v_cache", torch.zeros(kv_shape, dtype=dtype))
 
         self.L = L
         self.R = R
 
         # RANK-1: store k_hard NATIVELY transposed as [B, Hkv, L, T] (the scorer's read layout)
-        # so the per-decode-token full-buffer permute().contiguous() relayout (~210MB round-trip
-        # @128K, the #1 T-scaling DRAM op) is eliminated — KVCache.update writes only the new
+        # so the per-decode-token full-buffer permute().contiguous() relayout is eliminated —
+        # KVCache.update writes only the new
         # column along the last (T) axis. Byte-equal to the old [B,Hkv,T,L]+relayout (gate: T7).
         self.register_buffer("k_hard", torch.zeros((B, H, L, T), dtype=torch.int16))
         self.register_buffer("v_norm", torch.zeros((B, H, T), dtype=torch.float16))
@@ -424,7 +468,7 @@ class KVCache(nn.Module):
         assert k_val.ndim == 4 and v_val.ndim == 4
         assert k_val.shape[1] == S and v_val.shape[1] == S, "k/v S dim must match input_pos length"
 
-        Tcap = self.k_cache.size(2)
+        Tcap = self.k_cache.size(1) if self.layout == "bthd" else self.k_cache.size(2)
         # data-dependent bounds check: eager-only (skipped under compile/cudagraph; the caller
         # sizes the cache to T_new so it cannot overflow during the timed run).
         if not torch.compiler.is_compiling():
@@ -436,9 +480,15 @@ class KVCache(nn.Module):
                     f"Did you call setup_caches(max_seq_length >= max(input_pos)+1)?"
                 )
 
-        # [B,S,H,D] -> [B,H,S,D] and write into the T axis.
-        self.k_cache[:, :, input_pos, :] = k_val.permute(0, 2, 1, 3).contiguous()
-        self.v_cache[:, :, input_pos, :] = v_val.permute(0, 2, 1, 3).contiguous()
+        if self.layout == "bthd":
+            # The cache is ALREADY [B,T,H,D], the same layout as the incoming k_val: write the
+            # S new rows straight into the T axis, no permute, no relayout downstream.
+            self.k_cache[:, input_pos, :, :] = k_val
+            self.v_cache[:, input_pos, :, :] = v_val
+        else:
+            # [B,S,H,D] -> [B,H,S,D] and write into the T axis.
+            self.k_cache[:, :, input_pos, :] = k_val.permute(0, 2, 1, 3).contiguous()
+            self.v_cache[:, :, input_pos, :] = v_val.permute(0, 2, 1, 3).contiguous()
 
         if v_norm is not None:
             self.v_norm[:, :, input_pos] = v_norm.permute(0, 2, 1).contiguous()
@@ -471,7 +521,10 @@ class Transformer(nn.Module):
         self.max_batch_size = -1
         self.max_seq_length = -1
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, decode_type: str = "sparse"):
+        """decode_type selects the KV storage layout: "dense" gets FA's native
+        [B,T,Hkv,D] so dense decode needs no per-step relayout; anything else keeps
+        [B,Hkv,T,D], which the SOCKET gather kernels require."""
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
 
@@ -482,6 +535,7 @@ class Transformer(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
 
+        kv_layout = "bthd" if decode_type == "dense" else "bhtd"
         for b in self.layers:
             b.attention.kv_cache = KVCache(
                 max_batch_size,
@@ -490,6 +544,7 @@ class Transformer(nn.Module):
                 head_dim,
                 L=self.config.L,
                 R=self.config.R,
+                layout=kv_layout,
             ).to(device=device)
 
         self.freqs_cis = precompute_freqs_cis(
@@ -498,9 +553,24 @@ class Transformer(nn.Module):
             self.config.rope_base,
         ).to(device=device)
 
-        self.causal_mask = torch.tril(
-            torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool, device=device)
-        )
+        # The [T,T] causal mask is O(T^2) bool, and torch.ones plus the
+        # tril output are both live, so the transient peak is twice that. It is consumed ONLY
+        # as the attn_mask argument of _dense_attention's SDPA fallback -- every
+        # FlashAttention path (prefill flash_attn_func, the flash_dense_decode op) derives
+        # causality from causal=True and never reads it, and SOCKET decode masks with
+        # `t < seq_len`. Allocating it unconditionally would spend context-scaling memory for
+        # a buffer no kernel dereferences. Allocate it only when there is no flash backend;
+        # otherwise leave it None and let the SDPA fallback rebuild the [S,T] slice it needs
+        # from input_pos, so a flash exception still gets a CORRECT causal mask instead of
+        # silently attending non-causally.
+        _flash_live = (os.getenv("USE_FLASHATTN3", "1") == "1" and _flash_attn_func is not None)
+        if _flash_live:
+            self.causal_mask = None
+        else:
+            self.causal_mask = torch.tril(
+                torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool,
+                           device=device)
+            )
 
     def _check_input_pos(self, input_pos: Tensor):
         if input_pos.dtype != torch.long:
@@ -518,7 +588,7 @@ class Transformer(nn.Module):
         return input_pos
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
-        assert self.freqs_cis is not None and self.causal_mask is not None, "Caches must be initialized first"
+        assert self.freqs_cis is not None, "Caches must be initialized first"
         input_pos = self._check_input_pos(input_pos)
 
         # Optional extra safety:
@@ -530,7 +600,8 @@ class Transformer(nn.Module):
             if mn < 0 or mx >= self.config.vocab_size:
                 raise RuntimeError(f"Token id out of vocab: [{mn},{mx}] vs vocab_size={self.config.vocab_size}")
 
-        mask = self.causal_mask[None, None, input_pos]  # [1,1,S,T]
+        # None when a flash backend is live (see setup_caches); the SDPA fallback rebuilds it.
+        mask = None if self.causal_mask is None else self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]           # [S, ...]
         x = self.tok_embeddings(idx)
 
@@ -540,13 +611,13 @@ class Transformer(nn.Module):
         return self.output(x)
 
     def sparse_forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
-        assert self.freqs_cis is not None and self.causal_mask is not None, "Caches must be initialized first"
+        assert self.freqs_cis is not None, "Caches must be initialized first"
         input_pos = self._check_input_pos(input_pos)
 
         if idx.dtype != torch.long:
             idx = idx.long()
 
-        mask = self.causal_mask[None, None, input_pos]
+        mask = None if self.causal_mask is None else self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
@@ -606,8 +677,8 @@ class Attention(nn.Module):
         self.tau = float(config.tau)
         # ABLATION ONLY (bit-exact, T6-proven): SOCKET_FORCE_REPEAT=1 re-enables the OLD
         # pre-optimization relayout that repeat_interleave's k_hard/v_norm 8->32 before the
-        # scorer (rep=1 in-kernel). Default 0 = per-kv-head (Hkv=8). Used to attribute the
-        # throughput delta of the per-kv-head optimization. Read once here (constant under
+        # scorer (rep=1 in-kernel). Default 0 = per-kv-head (Hkv=8). Used to A/B the
+        # per-kv-head path against the old relayout. Read once here (constant under
         # torch.compile -> a guard, not a graph break).
         self._force_repeat = bool(int(os.environ.get("SOCKET_FORCE_REPEAT", "0")))
 
@@ -671,11 +742,15 @@ class Attention(nn.Module):
 
         bsz, seqlen, _ = x.shape
         assert self.kv_cache is not None, "Call setup_caches() first so kv_cache exists"
+        # SOCKET's gather kernels read [B,Hkv,T,D]; the dense [B,T,Hkv,D] layout must never
+        # reach this path (setup_caches only hands "bthd" to decode_type="dense").
+        assert self.kv_cache.layout == "bhtd", (
+            f"sparse decode requires the [B,Hkv,T,D] KV layout, got {self.kv_cache.layout!r}")
 
         p = self._prof
         # Profiling timers do device .synchronize() per stage per decode token, which would
         # serialize the launch-bound decode path AND inject syncs into the compiled region.
-        # Default OFF (no _prof_enabled flag) so throughput is measured fairly and the graph
+        # Default OFF (no _prof_enabled flag) so the timed path is unperturbed and the graph
         # stays cudagraph-capturable. Bit-exact either way.
         cuda_timing = x.is_cuda and bool(getattr(self, "_prof_enabled", False))
 
@@ -716,7 +791,7 @@ class Attention(nn.Module):
 
         # Prefill: dense attention (routed through _dense_attention so the dense baseline's
         # FA2/FA3 backend selection is shared; sparse-path prefill is excluded from steady
-        # decode timing so the backend used here does not affect the SOCKET decode numbers).
+        # decode timing so the backend used here does not affect steady-state decode timing).
         if seqlen != 1:
             if rep == 1:
                 k_sdpa = k_cache
@@ -739,16 +814,20 @@ class Attention(nn.Module):
         # maxlen = k_cache.shape[2] is the cache's static T dim, fixed at setup_caches() to
         # prompt_len + max_new_tokens -> COMPILE-TIME CONSTANT, so every shape below is static
         # and no host sync (prefill_len.item()) is needed. We score the FULL cache and rely on
-        # the `allowed` mask (index > pos.max() -> -inf in the scorer / dropped by the kernel)
-        # so the selected token set + attention output are identical to the eager `:T` path.
+        # the `t < seq_len` mask (unfilled columns -> -inf in the scorer / dropped by the index
+        # kernel) so the selected token set + attention output are identical to the eager
+        # `:T` path.
         maxlen = k_cache.shape[2]
 
         pos = input_pos.view(-1)
         # seq_len_t = pos.max()+1 = true filled length, kept as an on-device scalar tensor (no
         # .item()) so it drives index ARITHMETIC (window start) without changing any SHAPE.
         seq_len_t = pos.max().to(torch.int32) + 1
-        allowed = torch.arange(maxlen, device=pos.device) <= pos.max()
-        allowed_bht = allowed.view(1, 1, maxlen).expand(bsz, self.n_head, maxlen).contiguous()
+        # NO `allowed` TENSOR. It was `arange(maxlen) <= pos.max()` expanded to
+        # [B,n_head,maxlen] and made contiguous -- a full-buffer write, read back once per
+        # layer per decode step, carrying a value identical across every head and all 32
+        # layers. The scorer and the index-list kernel both take the seq_len scalar and apply
+        # `t < seq_len` directly, which is the same predicate.
 
         with CUDATimer(cuda_timing) as t_relayout:
             # PER-KV-HEAD scorer: do NOT repeat_interleave the (identical-per-GQA-group) key
@@ -760,12 +839,12 @@ class Attention(nn.Module):
             #
             # RANK-1: k_hard is now STORED natively as [B,Hkv,L,maxlen] (KVCache.update writes one
             # column/step), so the per-token full-buffer permute(0,1,3,2).contiguous() relayout
-            # (~210MB round-trip @128K, the #1 T-scaling DRAM op) is DELETED — read it directly.
+            # is DELETED — read it directly.
             k_hard_bhlt = self.kv_cache.k_hard  # [B,Hkv,L,maxlen] (native; no relayout)
             v_norm_bht = self.kv_cache.v_norm   # [B,Hkv,maxlen]
             if self._force_repeat and rep != 1:
                 # ABLATION (default OFF): reproduce the pre-opt 4x repeat (kernel sees Hkv==H,
-                # rep=1). Bit-identical selection/output (T6), only slower.
+                # rep=1). Bit-identical selection/output (T6).
                 k_hard_bhlt = k_hard_bhlt.repeat_interleave(rep, dim=1)  # [B,H,L,maxlen]
                 v_norm_bht = v_norm_bht.repeat_interleave(rep, dim=1)    # [B,H,maxlen]
 
@@ -782,14 +861,21 @@ class Attention(nn.Module):
         window = max(0, min(window, maxlen))
         M = max(0, min(M, maxlen))
 
-        q_probs = self.soft_hash(q_bhd)  # [B,H,L,R]
+        if _FUSED_SOFTHASH:
+            # temp matches soft_hash's math.sqrt(D) exactly; the fused kernel multiplies by
+            # its reciprocal rather than dividing, which is where its sub-ulp difference from
+            # the ATen chain comes from.
+            q_probs = fused_soft_hash(q_bhd, self.planes, self.protos_T,
+                                      math.sqrt(self.head_dim), self.tau, q_bhd.dtype)
+        else:
+            q_probs = self.soft_hash(q_bhd)  # [B,H,L,R]
 
         with CUDATimer(cuda_timing) as t_index:
             sparse_list, sparse_len = build_sparse_list_decode(
                 q_probs,
                 k_hard_bhlt,
                 v_norm_bht,
-                allowed_bht,
+                None,          # allowed mask: no longer built, see above
                 sink=sink,
                 window=window,
                 M=M,
@@ -844,10 +930,22 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
+        # With layout="bthd" the cache is stored [B,T,Hkv,D] -- FA's native decode layout --
+        # so k_bthd/v_bthd below ARE the cache buffers and the per-step full-cache
+        # transpose().contiguous() disappears. k/v keep their historical [B,Hkv,T,D] meaning
+        # via a zero-copy transpose VIEW, so the prefill / SDPA path below is untouched (its
+        # own .contiguous() materializes exactly the bytes it always did). With layout="bhtd"
+        # nothing changes at all.
+        k_bthd_cache = v_bthd_cache = None
         if self.kv_cache is not None:
-            k_cache, v_cache = self.kv_cache.update(input_pos, k, v)  # [B,Hl,T,D]
-            k = k_cache
-            v = v_cache
+            k_cache, v_cache = self.kv_cache.update(input_pos, k, v)
+            if self.kv_cache.layout == "bthd":
+                k_bthd_cache, v_bthd_cache = k_cache, v_cache   # [B,T,Hkv,D] (native)
+                k = k_cache.transpose(1, 2)                     # [B,Hkv,T,D] VIEW (no copy)
+                v = v_cache.transpose(1, 2)
+            else:
+                k = k_cache                                     # [B,Hkv,T,D]
+                v = v_cache
 
         q = q.transpose(1, 2)  # [B,Hq,S,D]
 
@@ -865,8 +963,14 @@ class Attention(nn.Module):
         )
         if seqlen == 1 and _use_flash and input_pos is not None and input_pos.numel() > 0:
             q_bshd = q.transpose(1, 2).contiguous()        # [B,1,Hq,D]
-            k_bthd = k.transpose(1, 2).contiguous()        # [B,maxlen,Hkv,D] (un-repeated; GQA-native)
-            v_bthd = v.transpose(1, 2).contiguous()
+            if k_bthd_cache is not None:
+                # ZERO-COPY: the cache is already [B,maxlen,Hkv,D]. This is the whole point of
+                # layout="bthd" -- no per-step relayout.
+                k_bthd = k_bthd_cache
+                v_bthd = v_bthd_cache
+            else:
+                k_bthd = k.transpose(1, 2).contiguous()    # [B,maxlen,Hkv,D] (un-repeated)
+                v_bthd = v.transpose(1, 2).contiguous()
             cache_seqlens = (input_pos.max().to(torch.int32) + 1).reshape(1).expand(bsz).contiguous()
             out_bshd = torch.ops.socket.flash_dense_decode(q_bshd, k_bthd, v_bthd, cache_seqlens)
             if not torch.compiler.is_compiling():

@@ -8,6 +8,13 @@ CUDA_HEADERS = """
     #include <cuda.h>
     #include <cuda_runtime.h>
     #include <torch/extension.h>
+    // Required by the kernel launch in soft_hash_collision.cu: the launch names
+    // at::cuda::getCurrentCUDAStream() so that it is captured as a CUDA-graph node
+    // (a legacy-default-stream launch is not), and C10_CUDA_KERNEL_LAUNCH_CHECK()
+    // so a failed launch is not mistaken for a fast one.
+    #include <ATen/cuda/CUDAContext.h>
+    #include <c10/cuda/CUDAStream.h>
+    #include <c10/cuda/CUDAException.h>
     #include <stdint.h>
 """
 
